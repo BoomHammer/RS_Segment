@@ -1,0 +1,22 @@
+dataset:
+  # 动态数据配置 (MODIS)
+  dynamic:
+    root: "data/raw/dynamic"      # 数据根目录
+    glob_pattern: "*.tif"         # 匹配模式
+    nodata: -9999                 # NoData值
+    num_samples: 1000             # 计算统计量时的采样数
+    bands: ["EVI", "NDVI", "FPAR", "LAI", "GPP", "LST", "PR", "SOIL", "SR_B1", "SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7"] # 仅作记录，需与实际波段对应
+    stats:
+      means: [1489.0507]                   # 待脚本计算后回填
+      stds: [2723.3542]                    # 待脚本计算后回填
+
+  # 静态数据配置 (DEM/Rainfall)
+  static:
+    root: "data/raw/static"
+    glob_pattern: "*.tif"
+    nodata: -9999
+    num_samples: 2000             # 静态数据较少，建议加大采样或全量
+    bands: ["DEM", "aspect", "slope", "PR2020", "PR2021", "SOIL2020", "SOIL2021"]
+    stats:
+      means: [799.5843]                   # 待脚本计算后回填
+      stds: [1371.5900]                   # 待脚本计算后回填
