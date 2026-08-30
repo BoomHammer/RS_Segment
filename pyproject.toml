@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rs-segment"
+version = "0.1.0"
+description = "Weakly supervised continental-scale remote-sensing vegetation segmentation"
+readme = "DEVELOPMENT.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "numpy>=2.1",
+    "pyyaml>=6.0.2",
+    "torch>=2.5",
+    "torchgeo>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "ruff>=0.9",
+]
+
+[project.scripts]
+rs-check-data = "rs_segment.data_check:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rs_segment"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+src = ["src", "scripts", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -p no:cacheprovider --basetemp=.pytest_tmp"
+pythonpath = ["src"]
