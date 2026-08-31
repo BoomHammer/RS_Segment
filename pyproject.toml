@@ -11,6 +11,8 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
     "numpy>=2.1",
     "pyyaml>=6.0.2",
+    "rasterio>=1.4",
+    "tqdm>=4.67",
     "torch>=2.5",
     "torchgeo>=0.7",
 ]
@@ -23,20 +25,22 @@ dev = [
 ]
 
 [project.scripts]
-rs-check-data = "rs_segment.data_check:main"
+rs-check-data = "data_check:main"
+rs-compute-stats = "data_stats:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/rs_segment"]
+only-include = ["src"]
+sources = ["src"]
 
 [tool.ruff]
 line-length = 88
 target-version = "py311"
-src = ["src", "scripts", "tests"]
+src = ["src", "scripts", "scripts/test"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["scripts/test"]
 addopts = "-ra -p no:cacheprovider --basetemp=.pytest_tmp"
 pythonpath = ["src"]

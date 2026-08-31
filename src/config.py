@@ -16,10 +16,18 @@ class DataConfig:
     root: Path = Path("data")
     labels: Path = Path("data/labels")
     raw: Path = Path("data/raw")
+    dynamic: Path = Path("data/raw/dynamic")
+    static: Path = Path("data/raw/static")
+    processed: Path = Path("data/processed")
     label_file: Path | None = None
     required_subdirectories: list[str] = field(
         default_factory=lambda: ["labels", "raw"]
     )
+    label_columns: dict[str, str] = field(default_factory=dict)
+    raster: dict[str, Any] = field(default_factory=dict)
+    sampling: dict[str, Any] = field(default_factory=dict)
+    dynamic_filename: dict[str, Any] = field(default_factory=dict)
+    metadata_schema: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -54,9 +62,26 @@ def load_config(path: str | Path) -> AppConfig:
             or config_path.parent,
             raw=_resolve_path(data.get("raw", "data/raw"), config_path.parent)
             or config_path.parent,
+            dynamic=_resolve_path(
+                data.get("dynamic", "data/raw/dynamic"), config_path.parent
+            )
+            or config_path.parent,
+            static=_resolve_path(
+                data.get("static", "data/raw/static"), config_path.parent
+            )
+            or config_path.parent,
+            processed=_resolve_path(
+                data.get("processed", "data/processed"), config_path.parent
+            )
+            or config_path.parent,
             label_file=_resolve_path(data.get("label_file"), config_path.parent),
             required_subdirectories=list(
                 data.get("required_subdirectories", ["labels", "raw"])
             ),
+            label_columns=dict(data.get("label_columns", {})),
+            raster=dict(data.get("raster", {})),
+            sampling=dict(data.get("sampling", {})),
+            dynamic_filename=dict(data.get("dynamic_filename", {})),
+            metadata_schema=dict(data.get("metadata_schema", {})),
         )
     )

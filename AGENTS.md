@@ -15,10 +15,18 @@ CUDA 版本: 12.4
 │&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── labels/  # 标签数据  
 │&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── raw/  
 │&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── dynamic/  # 动态遥感数据  
+│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── processed/  # 处理后遥感数据，避免每次实验重复计算  
 │&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── static/  # 静态遥感数据  
+├── experiments/   # 存储每次实验的模型、结果   
 ├── scripts/  # 程序入口（train.py, test.py）  
-├── src/  # 源码  
-└── test/  # 存储每次实验的模型、结果  
+│&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── test/  # 各种测试模块功能的脚本  
+└── src/  # 源码  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── data/  # 数据处理  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── inference/  # 推理预测  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── losses/  # 损失  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;├── models/  # 模型  
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└── utils/  #工具函数  
+
 
 ### 4. 项目背景与约束 (Context & Constraints)
 **硬件环境:** 本地单机部署，单张 RTX 4090 显卡 (24GB 显存)。
@@ -44,4 +52,4 @@ CUDA 版本: 12.4
 1. 任何提供的代码必须考虑到 RTX 4090 24GB 的显存瓶颈。
 2. 涉及全图推断的代码，必须使用重叠滑窗和高斯加权，拒绝提供简单的分块拼接代码。始终使用全局统计常量。以保证最终输出结果（tiff影像）中没有明显接缝和方格。
 3. 所有提供的 Python 代码必须遵循 Ruff 的规范。
-4. 本.md文档只能由人工修改，AI Agent禁止修改。
+4. 本AGENTS.md文档只能由人工修改，AI Agent禁止修改。

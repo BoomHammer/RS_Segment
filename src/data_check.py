@@ -6,8 +6,8 @@ import argparse
 import logging
 from pathlib import Path
 
-from rs_segment.config import AppConfig, load_config
-from rs_segment.logging import configure_logging
+from config import AppConfig, load_config
+from logging_config import configure_logging
 
 LOGGER = logging.getLogger(__name__)
 

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from rs_segment.config import load_config
+from config import load_config
 
 
 def test_load_config_resolves_paths(tmp_path: Path) -> None:

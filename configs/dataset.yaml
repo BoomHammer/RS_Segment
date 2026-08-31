@@ -1,9 +1,55 @@
-# 数据检查和训练共用的数据配置。
+# 数据检查、预处理和训练共用的数据配置。
 data:
   root: ../data
   labels: ../data/labels
   raw: ../data/raw
-  label_file: null
+  dynamic: ../data/raw/dynamic
+  static: ../data/raw/static
+  processed: ../data/processed
+  label_file: ../data/labels/traindata20250626ori.csv
   required_subdirectories:
     - labels
     - raw
+    - raw/dynamic
+    - raw/static
+    - processed
+
+  # 标签 CSV 的字段约定。
+  label_columns:
+    index: Index
+    x: X
+    y: Y
+    formation: Eng_Formation
+    alliance: Eng_Alliance
+    chn_formation: Formation
+    chn_alliance: Alliance
+
+  # 所有 GeoTIFF 输入均按单波段读取；NoData 是统一的默认填充值。
+  raster:
+    single_band: true
+    nodata: -9999
+
+  # 默认使用全部有效样点；只有显式填写整数时才限制样点数量。
+  sampling:
+    strategy: all
+    max_samples: null
+
+  # 动态文件名解析规则。静态影像不从文件名推断时间。
+  dynamic_filename:
+    extension: .tif
+    date_pattern: "^(?P<category>[A-Za-z]+)(?P<date>\\d{6})(?:B(?P<band>\\d+))?\\.tif$"
+    month_pattern: "^(?P<category>[A-Za-z]+)(?P<month>\\d{4})\\.tif$"
+    date_format: "%y%m%d"
+    month_format: "%y%m"
+
+  # 动态解析结果的 JSON/YAML 记录结构。
+  metadata_schema:
+    version: 1
+    record:
+      path: string
+      filename: string
+      category: string
+      temporal_resolution: date | month
+      date: YYYY-MM-DD | null
+      month: YYYY-MM | null
+      band: integer | null
