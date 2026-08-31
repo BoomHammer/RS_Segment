@@ -7,6 +7,7 @@ data:
   static: ../data/raw/static
   processed: ../data/processed
   label_file: ../data/labels/traindata20250626ori.csv
+  output_nodata: -9999
   required_subdirectories:
     - labels
     - raw
@@ -14,15 +15,26 @@ data:
     - raw/static
     - processed
 
-  # 标签 CSV 的字段约定。
-  label_columns:
-    index: Index
-    x: X
-    y: Y
-    formation: Eng_Formation
-    alliance: Eng_Alliance
-    chn_formation: Formation
-    chn_alliance: Alliance
+  # 标签字段、坐标及分类编码契约。内部统一使用英文类别；中文仅写入输出映射。
+  label_crs: EPSG:4326
+  label_schema:
+    version: 1
+    columns:
+      index: Index
+      x: X
+      y: Y
+      formation: Eng_Formation
+      alliance: Eng_Alliance
+      chn_formation: Formation
+      chn_alliance: Alliance
+    first_id: 1
+
+  # 所有重采样/定位/模型计算使用此目标网格契约。可改为 EPSG:5070 + 250。
+  target_grid:
+    crs: EPSG:4326
+    resolution: [0.00225, 0.00225]
+    resampling: nearest
+    reference_raster: null
 
   # 所有 GeoTIFF 输入均按单波段读取；NoData 是统一的默认填充值。
   raster:

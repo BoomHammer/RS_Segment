@@ -20,14 +20,23 @@ class DataConfig:
     static: Path = Path("data/raw/static")
     processed: Path = Path("data/processed")
     label_file: Path | None = None
+    output_nodata: int = -9999
     required_subdirectories: list[str] = field(
         default_factory=lambda: ["labels", "raw"]
     )
-    label_columns: dict[str, str] = field(default_factory=dict)
+    label_crs: str = "EPSG:4326"
+    label_schema: dict[str, Any] = field(default_factory=dict)
+    target_grid: dict[str, Any] = field(default_factory=dict)
     raster: dict[str, Any] = field(default_factory=dict)
     sampling: dict[str, Any] = field(default_factory=dict)
     dynamic_filename: dict[str, Any] = field(default_factory=dict)
     metadata_schema: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def label_columns(self) -> dict[str, str]:
+        """Return CSV columns from the unified label schema."""
+
+        return dict(self.label_schema.get("columns", {}))
 
 
 @dataclass(slots=True)
@@ -75,10 +84,13 @@ def load_config(path: str | Path) -> AppConfig:
             )
             or config_path.parent,
             label_file=_resolve_path(data.get("label_file"), config_path.parent),
+            output_nodata=int(data.get("output_nodata", -9999)),
             required_subdirectories=list(
                 data.get("required_subdirectories", ["labels", "raw"])
             ),
-            label_columns=dict(data.get("label_columns", {})),
+            label_crs=str(data.get("label_crs", "EPSG:4326")),
+            label_schema=dict(data.get("label_schema", {})),
+            target_grid=dict(data.get("target_grid", {})),
             raster=dict(data.get("raster", {})),
             sampling=dict(data.get("sampling", {})),
             dynamic_filename=dict(data.get("dynamic_filename", {})),

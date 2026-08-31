@@ -1,6 +1,6 @@
 # RS-Segment
 
-基于弱监督学习的遥感植被语义分割项目。当前代码处于数据准备阶段，已提供数据目录检查、GeoTIFF 流式统计和动态影像文件名解析命令；训练与推理入口暂未实现。
+基于弱监督学习的遥感植被语义分割项目。当前处于数据准备与 PointSAM 标签基础设施阶段，已提供数据目录检查、样点标签校验与编码、栅格空间对齐、GeoTIFF 流式统计和动态影像文件名解析；训练与推理入口暂未实现。
 
 ## 环境准备
 
@@ -29,17 +29,39 @@ data:
   static: ../data/raw/static
   processed: ../data/processed
   label_file: ../data/labels/traindata20250626ori.csv
+  output_nodata: -9999
+  label_crs: EPSG:4326
+  label_schema:
+    columns:
+      index: Index
+      x: X
+      y: Y
+      formation: Eng_Formation
+      alliance: Eng_Alliance
+      chn_formation: Formation
+      chn_alliance: Alliance
+  target_grid:
+    crs: EPSG:4326
+    resolution: [0.00225, 0.00225]
   raster:
     nodata: -9999
 ```
 
 相对路径均相对于配置文件所在目录解析，而不是相对于当前 shell 目录解析。提交命令前，请根据本地数据位置调整配置。
 
+标签契约中 `formation` 是英文大类字段，`alliance` 是英文小类字段，分别对应
+`Eng_Formation` 和 `Eng_Alliance`；中文字段只用于输出映射。`Index` 保留为样点自身编号，类别编码使用 `formation_code` 和 `alliance_code`。`output_nodata` 是输出结果的无效值，默认为 `-9999`。
+
+`target_grid` 规定所有空间对齐和样点定位使用的目标 CRS 与分辨率。默认是 WGS84、
+`0.00225°`；如需使用 Albers 等面积投影，可改为对应 CRS 和 `250` 米分辨率。
+
 ## 程序入口
 
 | 文件或命令 | 作用 | 当前状态 |
 | --- | --- | --- |
 | `rs-check-data` / `scripts/check_data.py` | 检查数据目录、必需子目录和标签文件 | 可用 |
+| `scripts/preprocess.py` | 统一运行标签校验、类别映射和栅格统计 | 可用 |
+| `scripts/validate_labels.py` | 单独运行样点读取、校验和类别映射 | 可用 |
 | `rs-compute-stats` / `scripts/compute_stats.py` | 按窗口流式计算 GeoTIFF 统计量 | 可用 |
 | `data.filename_parser` | 解析动态影像文件名并生成元数据 | 可用 |
 | `scripts/train.py` | 训练入口 | 预留，尚未实现 |
@@ -141,7 +163,32 @@ uv run rs-compute-stats \
 
 动态文件明细会带有 `date`（日尺度）或 `month`（月尺度）字段；静态文件明细不包含时间字段。处理过程中，进度条末尾会显示当前正在处理的文件名。
 
-### 3. 解析动态影像文件名
+### 3. 运行统一预处理
+
+推荐使用统一入口。每次运行会在 `data/processed` 下创建一个时间目录，并写入同一批次的三个产物：
+
+```bash
+uv run python scripts/preprocess.py --config configs/dataset.yaml
+```
+
+目录结构如下：
+
+```text
+data/processed/<YYYYMMDD_HHMMSS>/
+├── label_mapping_<时间>.json
+├── label_validation_<时间>.json
+└── raster_stats_<时间>.json
+```
+
+标签校验包含 CSV 字段检查、坐标 CRS 与 WGS84 范围检查、重复点/冲突类别检查、未知类别检查和类别统计。标签读取按批次进行，不会一次性载入整个 CSV；栅格统计按窗口流式读取。
+
+如只需检查标签：
+
+```bash
+uv run python scripts/validate_labels.py --config configs/dataset.yaml
+```
+
+### 4. 解析动态影像文件名
 
 解析目录下顶层的 `.tif` 文件，并生成 JSON 或 YAML 元数据：
 
