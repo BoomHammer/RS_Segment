@@ -82,15 +82,19 @@ def open_aligned_raster(
     """
 
     source = rasterio.open(path)
-    vrt = WarpedVRT(
-        source,
-        crs=grid.crs,
-        transform=grid.transform,
-        width=grid.width,
-        height=grid.height,
-        resampling=_resampling(resampling),
-        nodata=source.nodata,
-    )
+    try:
+        vrt = WarpedVRT(
+            source,
+            crs=grid.crs,
+            transform=grid.transform,
+            width=grid.width,
+            height=grid.height,
+            resampling=_resampling(resampling),
+            nodata=source.nodata,
+        )
+    except Exception:
+        source.close()
+        raise
     return source, vrt
 
 

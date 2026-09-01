@@ -159,8 +159,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/dataset.yaml"),
-        help="YAML 配置文件，默认 configs/dataset.yaml",
+        default=Path("configs/data.yaml"),
+        help="YAML 配置文件，默认 configs/data.yaml",
     )
     parser.add_argument(
         "--output",

@@ -1,0 +1,117 @@
+# 数据检查、预处理和训练共用的数据配置。
+data:
+  # SAM2 权重文件；相对本配置文件所在目录解析，也可被命令行 --checkpoint 覆盖。
+  sam2_checkpoint: ../SAM/sam2.1_hiera_small.pt
+  # 数据总目录及各类数据子目录。
+  root: ../data
+  labels: ../data/labels
+  raw: ../data/raw
+  dynamic: ../data/raw/dynamic
+  static: ../data/raw/static
+  processed: ../data/processed
+  # 原始样点 CSV，包含坐标和中英文分类字段。
+  label_file: ../data/labels/traindata20250626ori.csv
+  # 输出 GeoTIFF 中表示未标注像元的值。
+  output_nodata: -9999
+  # 数据检查阶段必须存在的目录，相对 data.root 目录。
+  required_subdirectories:
+    - labels
+    - raw
+    - raw/dynamic
+    - raw/static
+    - processed
+
+  # 标签字段、坐标及分类编码契约。内部统一使用英文类别；中文仅写入输出映射。
+  # 样点 CSV 中 X/Y 坐标使用的坐标参考系。
+  label_crs: EPSG:4326
+  label_schema:
+    # 标签契约版本，便于后续变更字段时兼容旧数据。
+    version: 1
+    # 内部字段名到 CSV 列名的映射。
+    columns:
+      index: Index
+      x: X
+      y: Y
+      formation: Eng_Formation
+      alliance: Eng_Alliance
+      chn_formation: Formation
+      chn_alliance: Alliance
+    # 自动编码类别时使用的起始整数编号。
+    first_id: 1
+
+  # 所有重采样/定位/模型计算使用此目标网格契约。可改为 EPSG:5070 + 250。
+  target_grid:
+    # 所有输入影像和输出标签统一到此 CRS。
+    crs: EPSG:4326
+    # 目标像元大小；EPSG:4326 下单位为度。
+    resolution: [0.00225, 0.00225]
+    # 重投影时的重采样方法；分类或离散数据通常使用 nearest。
+    resampling: nearest
+    # 可选参考影像路径；为空时由命令行 --reference-raster 提供。
+    reference_raster: null
+
+  # 所有 GeoTIFF 输入均按单波段读取；NoData 是统一的默认填充值。
+  raster:
+    # 当前数据读取接口是否按单波段 GeoTIFF 处理。
+    single_band: true
+    # 输入栅格声明的默认 NoData 值；实际文件元数据优先。
+    nodata: -9999
+
+  # 稀疏弱标签生成参数。输入窗口仅提供上下文，最终标签严格限制在样点附近。
+  weak_labels:
+    # SAM 读取的局部上下文窗口大小，单位为目标栅格像元。
+    input_window_size: [256, 256]
+    # 高置信度 SAM mask 最终允许写入的最大样点半径。
+    label_radius: 16
+    # 高置信度 SAM mask 的整体质量分数阈值。
+    mask_confidence: 0.90
+    # 中等置信度区间的下限；低于此值进入光谱回退。
+    medium_confidence: 0.70
+    # 中等置信度 mask 使用的较小标签半径。
+    medium_label_radius: 8
+    # 光谱回退搜索的最大样点半径。
+    fallback_radius: 8
+    # 归一化 RGB 光谱距离阈值，越小越严格。
+    spectral_distance_threshold: 0.12
+    # mask logits 转为像元置信度后的最小阈值。
+    logit_threshold: 0.5
+    # 是否丢弃接触局部输入窗口边缘的 SAM mask。
+    reject_boundary_touch: true
+    # 两个类别分数接近到此范围内时，认为像元存在冲突并置为 NoData。
+    conflict_margin: 0.05
+    # MOD09A1 原始缩放整数的合理范围（实际反射率乘以 0.0001）。
+    input_range: [-100.0, 16000.0]
+    # 使用全局采样统计进行每个 RGB 波段的线性拉伸。
+    stretch_percentiles: [2.0, 98.0]
+
+  # 样点抽样策略；all 表示默认使用全部有效样点。
+  sampling:
+    strategy: all
+    # 仅在显式填写整数时限制样点数量，null 表示不限制。
+    max_samples: null
+
+  # 动态文件名解析规则。静态影像不从文件名推断时间。
+  dynamic_filename:
+    # 动态影像文件扩展名。
+    extension: .tif
+    # 日尺度文件名正则表达式，支持可选波段号。
+    date_pattern: "^(?P<category>[A-Za-z]+)(?P<date>\\d{6})(?:B(?P<band>\\d+))?\\.tif$"
+    # 月尺度文件名正则表达式。
+    month_pattern: "^(?P<category>[A-Za-z]+)(?P<month>\\d{4})\\.tif$"
+    # 日尺度日期解析格式。
+    date_format: "%y%m%d"
+    # 月尺度日期解析格式。
+    month_format: "%y%m"
+
+  # 动态解析结果的 JSON/YAML 记录结构。
+  metadata_schema:
+    version: 1
+    record:
+      # 下面是 metadata JSON 中每条记录的字段类型约定。
+      path: string
+      filename: string
+      category: string
+      temporal_resolution: date | month
+      date: YYYY-MM-DD | null
+      month: YYYY-MM | null
+      band: integer | null

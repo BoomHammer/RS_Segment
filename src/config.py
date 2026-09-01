@@ -20,6 +20,7 @@ class DataConfig:
     static: Path = Path("data/raw/static")
     processed: Path = Path("data/processed")
     label_file: Path | None = None
+    sam2_checkpoint: Path | None = None
     output_nodata: int = -9999
     required_subdirectories: list[str] = field(
         default_factory=lambda: ["labels", "raw"]
@@ -28,6 +29,7 @@ class DataConfig:
     label_schema: dict[str, Any] = field(default_factory=dict)
     target_grid: dict[str, Any] = field(default_factory=dict)
     raster: dict[str, Any] = field(default_factory=dict)
+    weak_labels: dict[str, Any] = field(default_factory=dict)
     sampling: dict[str, Any] = field(default_factory=dict)
     dynamic_filename: dict[str, Any] = field(default_factory=dict)
     metadata_schema: dict[str, Any] = field(default_factory=dict)
@@ -84,6 +86,9 @@ def load_config(path: str | Path) -> AppConfig:
             )
             or config_path.parent,
             label_file=_resolve_path(data.get("label_file"), config_path.parent),
+            sam2_checkpoint=_resolve_path(
+                data.get("sam2_checkpoint"), config_path.parent
+            ),
             output_nodata=int(data.get("output_nodata", -9999)),
             required_subdirectories=list(
                 data.get("required_subdirectories", ["labels", "raw"])
@@ -92,6 +97,7 @@ def load_config(path: str | Path) -> AppConfig:
             label_schema=dict(data.get("label_schema", {})),
             target_grid=dict(data.get("target_grid", {})),
             raster=dict(data.get("raster", {})),
+            weak_labels=dict(data.get("weak_labels", {})),
             sampling=dict(data.get("sampling", {})),
             dynamic_filename=dict(data.get("dynamic_filename", {})),
             metadata_schema=dict(data.get("metadata_schema", {})),

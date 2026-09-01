@@ -18,7 +18,7 @@ uv sync --extra dev
 
 ## 配置文件
 
-数据相关命令通过 YAML 配置文件读取路径。默认配置为 [`configs/dataset.yaml`](configs/dataset.yaml)，主要结构如下：
+数据相关命令通过 YAML 配置文件读取路径。默认配置为 [`configs/data.yaml`](configs/data.yaml)，主要结构如下：
 
 ```yaml
 data:
@@ -75,13 +75,13 @@ data:
 安装项目后推荐使用：
 
 ```bash
-uv run rs-check-data --config configs/dataset.yaml
+uv run rs-check-data --config configs/data.yaml
 ```
 
 不安装命令行脚本时可使用：
 
 ```bash
-uv run python scripts/check_data.py --config configs/dataset.yaml
+uv run python scripts/check_data.py --config configs/data.yaml
 ```
 
 命令会检查配置中的数据根目录、`required_subdirectories` 指定的目录、`labels`、`raw` 以及可选的 `label_file`。
@@ -94,7 +94,7 @@ uv run python scripts/check_data.py --config configs/dataset.yaml
 
 ### 2. 计算 GeoTIFF 流式统计量
 
-命令默认读取 `configs/dataset.yaml`，一次扫描配置中的 `data/raw/dynamic` 和
+命令默认读取 `configs/data.yaml`，一次扫描配置中的 `data/raw/dynamic` 和
 `data/raw/static` 两个目录，对其中全部顶层 `.tif` 影像计算统计量，并将结果缓存到
 `data/processed`：
 
@@ -117,7 +117,7 @@ uv run rs-compute-stats \
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `--config` | `configs/dataset.yaml` | YAML 配置文件 |
+| `--config` | `configs/data.yaml` | YAML 配置文件 |
 | `--output` | 自动生成 | 输出 JSON 路径；默认写入 `data.processed` 并添加时间戳 |
 | `--band` | `1` | 要统计的波段编号 |
 | `--window-size WIDTH HEIGHT` | `1024 1024` | 分块读取窗口大小 |
@@ -168,7 +168,7 @@ uv run rs-compute-stats \
 推荐使用统一入口。每次运行会在 `data/processed` 下创建一个时间目录，并写入同一批次的三个产物：
 
 ```bash
-uv run python scripts/preprocess.py --config configs/dataset.yaml
+uv run python scripts/preprocess.py --config configs/data.yaml
 ```
 
 目录结构如下：
@@ -185,7 +185,7 @@ data/processed/<YYYYMMDD_HHMMSS>/
 如只需检查标签：
 
 ```bash
-uv run python scripts/validate_labels.py --config configs/dataset.yaml
+uv run python scripts/validate_labels.py --config configs/data.yaml
 ```
 
 ### 4. 解析动态影像文件名

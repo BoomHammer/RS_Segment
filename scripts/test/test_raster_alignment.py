@@ -34,9 +34,7 @@ def test_target_grid_location_and_window_read(tmp_path: Path) -> None:
     _write_raster(path)
     grid = target_grid_from_raster(path, target_crs="EPSG:4326", resolution=1)
 
-    locations = locate_points(
-        [(0.5, 3.5), (99, 99)], point_crs="EPSG:4326", grid=grid
-    )
+    locations = locate_points([(0.5, 3.5), (99, 99)], point_crs="EPSG:4326", grid=grid)
     values = point_pixel_values(
         path,
         [(0.5, 3.5), (99, 99)],

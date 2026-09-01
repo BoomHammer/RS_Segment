@@ -45,3 +45,14 @@ select = ["E", "F", "I", "UP", "B"]
 testpaths = ["scripts/test"]
 addopts = "-ra -p no:cacheprovider --basetemp=.pytest_tmp"
 pythonpath = ["src"]
+
+# 添加 PyTorch 的 CUDA 12.4 专属源
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+# 强制这两个包从 pytorch 源下载，而不是默认的 PyPI
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
