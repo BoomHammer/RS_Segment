@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections import Counter
 from collections.abc import Iterable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ class WeakLabelGenerationConfig:
     conflict_margin: float = 0.05
     output_nodata: int = -9999
     min_confidence: float = 0.0
+    mask_fusion: str = "intersection"
 
 
 def _window_for_point(
@@ -209,8 +211,14 @@ def generate_weak_labels(
     """Generate sparse, point-local labels from high-confidence SAM regions."""
 
     config = config or WeakLabelGenerationConfig()
-    if len(image_paths) != 3:
-        raise ValueError("image_paths 必须提供三个单波段影像路径")
+    if image_paths and isinstance(image_paths[0], (str, Path)):
+        image_groups = (tuple(image_paths),)
+    else:
+        image_groups = tuple(tuple(group) for group in image_paths)
+    if not image_groups or any(len(group) != 3 for group in image_groups):
+        raise ValueError("image_paths 必须提供一个或多个三波段影像组合")
+    if config.mask_fusion not in {"intersection", "union"}:
+        raise ValueError("mask_fusion 必须是 intersection 或 union")
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output_profile = _profile(grid, config.output_nodata)
@@ -249,18 +257,21 @@ def generate_weak_labels(
                     "status": "outside_grid",
                 }
             )
-    with (
-        aligned_raster(image_paths[0], grid) as band_a,
-        aligned_raster(image_paths[1], grid) as band_b,
-        aligned_raster(image_paths[2], grid) as band_c,
-        rasterio.open(output, "r+") as destination,
-    ):
-        ranges = _global_input_ranges(
-            (band_a, band_b, band_c),
-            grid,
-            config.input_range,
-            config.stretch_percentiles,
-        )
+    with ExitStack() as stack:
+        datasets = [
+            tuple(stack.enter_context(aligned_raster(path, grid)) for path in group)
+            for group in image_groups
+        ]
+        destination = stack.enter_context(rasterio.open(output, "r+"))
+        ranges = [
+            _global_input_ranges(
+                group,
+                grid,
+                config.input_range,
+                config.stretch_percentiles,
+            )
+            for group in datasets
+        ]
         score = np.full((grid.height, grid.width), -np.inf, dtype=np.float32)
         labels = np.full(
             (grid.height, grid.width), config.output_nodata, dtype=np.int32
@@ -273,49 +284,82 @@ def generate_weak_labels(
             window = _window_for_point(row, column, grid, config.window_size)
             row_start, column_start = int(window.row_off), int(window.col_off)
             local_row, local_column = row - row_start, column - column_start
-            arrays = [
-                dataset.read(1, window=window, masked=True)
-                for dataset in (band_a, band_b, band_c)
-            ]
-            valid = np.logical_and.reduce(
-                [~np.ma.getmaskarray(array) for array in arrays]
-            )
-            image = _stretch_rgb(
-                np.stack([array.filled(0) for array in arrays]), ranges
-            )
             seed = record_to_seed(record, local_row, local_column)
-            request = build_pointsam_request(
-                image,
-                [seed],
-                [],
-                metadata={
-                    "window": (
-                        window.col_off,
-                        window.row_off,
-                        window.width,
-                        window.height,
+            predictions = []
+            images = []
+            valids = []
+            for group, group_ranges in zip(datasets, ranges, strict=True):
+                arrays = [
+                    dataset.read(1, window=window, masked=True) for dataset in group
+                ]
+                valids.append(
+                    np.logical_and.reduce(
+                        [~np.ma.getmaskarray(array) for array in arrays]
                     )
-                },
-            )
-            prediction = run_pointsam_with_npc(
-                inferencer,
-                request.image,
-                request.positive_points,
-                request.negative_points,
-                spatial_shape=image.shape[-2:],
-                metadata=request.metadata,
-            )
-            confidence = (
-                float(prediction.confidence.flat[0])
-                if prediction.confidence is not None
-                else 1.0
-            )
+                )
+                image = _stretch_rgb(
+                    np.stack([array.filled(0) for array in arrays]), group_ranges
+                )
+                images.append(image)
+                request = build_pointsam_request(
+                    image,
+                    [seed],
+                    [],
+                    metadata={
+                        "window": (
+                            window.col_off,
+                            window.row_off,
+                            window.width,
+                            window.height,
+                        )
+                    },
+                )
+                predictions.append(
+                    run_pointsam_with_npc(
+                        inferencer,
+                        request.image,
+                        request.positive_points,
+                        request.negative_points,
+                        spatial_shape=image.shape[-2:],
+                        metadata=request.metadata,
+                    )
+                )
+            image = images[0]
+            valid = np.logical_and.reduce(valids)
+            masks = [prediction.mask.astype(bool) for prediction in predictions]
+            if config.mask_fusion == "intersection":
+                fused_mask = np.logical_and.reduce(masks)
+                confidence_values = [
+                    float(prediction.confidence.flat[0])
+                    if prediction.confidence is not None
+                    else 1.0
+                    for prediction in predictions
+                ]
+                confidence = min(confidence_values)
+            else:
+                fused_mask = np.logical_or.reduce(masks)
+                confidence_values = [
+                    float(prediction.confidence.flat[0])
+                    if prediction.confidence is not None
+                    else 1.0
+                    for prediction in predictions
+                ]
+                confidence = max(confidence_values)
+            fused_logits = None
+            logits = [prediction.mask_logits for prediction in predictions]
+            if all(logit is not None for logit in logits):
+                stacked_logits = np.stack(logits)
+                fused_logits = (
+                    np.min(stacked_logits, axis=0)
+                    if config.mask_fusion == "intersection"
+                    else np.max(stacked_logits, axis=0)
+                )
             global_seeds.append(record_to_seed(record, row, column))
             selected = np.zeros(valid.shape, dtype=bool)
             pixel_score = np.zeros(valid.shape, dtype=np.float32)
             if confidence >= config.medium_confidence:
                 component = _seed_component(
-                    prediction.mask.astype(bool), local_row, local_column
+                    fused_mask, local_row, local_column
                 )
                 if component.any() and not (
                     config.reject_boundary_touch
@@ -331,9 +375,9 @@ def generate_weak_labels(
                         & valid
                         & _disk_mask(component.shape, local_row, local_column, radius)
                     )
-                    if prediction.mask_logits is not None:
+                    if fused_logits is not None:
                         pixel_score = 1.0 / (
-                            1.0 + np.exp(-prediction.mask_logits.astype(np.float32))
+                            1.0 + np.exp(-fused_logits.astype(np.float32))
                         )
                     else:
                         pixel_score.fill(confidence)
@@ -367,11 +411,11 @@ def generate_weak_labels(
                 else:
                     if confidence < config.medium_confidence:
                         outcome["status"] = "low_confidence"
-                    elif not prediction.mask[local_row, local_column]:
+                    elif not fused_mask[local_row, local_column]:
                         outcome["status"] = "mask_missing_seed"
                     elif config.reject_boundary_touch and _touches_boundary(
                         _seed_component(
-                            prediction.mask.astype(bool), local_row, local_column
+                            fused_mask, local_row, local_column
                         ),
                         window,
                         grid,
@@ -409,6 +453,7 @@ def generate_weak_labels(
         alliance_names=alliance_names,
         sample_outcomes=sample_outcomes,
     )
+    _warn_missing_classes(report, sample_outcomes, alliance_names)
     if quality_report_path is not None:
         report_path = Path(quality_report_path)
         report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -592,3 +637,29 @@ def evaluate_label_quality_from_raster(
         "spatial_grid": spatial_grid,
         "sample_quality": sample_quality,
     }
+
+
+def _warn_missing_classes(
+    report: dict[str, Any],
+    sample_outcomes: Sequence[dict[str, Any]],
+    alliance_names: dict[int, str] | None,
+) -> None:
+    """Warn when an expected class produced no pixel in the output raster."""
+
+    expected_codes = set(alliance_names or {})
+    expected_codes.update(int(item["alliance_code"]) for item in sample_outcomes)
+    generated_codes = {int(code) for code in report["class_distribution"]}
+    missing_codes = sorted(expected_codes - generated_codes)
+    report["missing_classes"] = [
+        {
+            "alliance_code": code,
+            "alliance": (alliance_names or {}).get(code, str(code)),
+        }
+        for code in missing_codes
+    ]
+    if missing_codes:
+        names = ", ".join(
+            f"{code} ({(alliance_names or {}).get(code, str(code))})"
+            for code in missing_codes
+        )
+        print(f"警告：以下类别未参与伪标签生成：{names}")

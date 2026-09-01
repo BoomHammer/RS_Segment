@@ -10,25 +10,10 @@ from pathlib import Path
 from config import load_config
 from data.labels import iter_encoded_labels
 from data.raster_alignment import target_grid_from_raster
+from data.sam_input import discover_sam_composites
 from data.weak_labels import WeakLabelGenerationConfig, generate_weak_labels
 from inference.sam2_backend import SAM2Inferencer
 from preprocessing import run_preprocessing
-
-
-def _discover_rgb_images(directory: Path) -> tuple[Path, Path, Path]:
-    """Find the first complete SR date with MOD09A1 RGB bands 1, 4, and 3."""
-
-    by_date: dict[str, dict[int, Path]] = {}
-    for path in sorted(directory.glob("SR*B[134].tif")):
-        stem = path.stem
-        date = stem[2:8]
-        band = int(stem[-1])
-        by_date.setdefault(date, {})[band] = path
-    for date in sorted(by_date):
-        bands = by_date[date]
-        if all(band in bands for band in (1, 3, 4)):
-            return bands[1], bands[4], bands[3]
-    raise FileNotFoundError("未找到包含 SR B1/B4/B3 的同日期影像")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -62,11 +47,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not args.skip_weak_labels:
         image_paths = (
-            tuple(args.image)
+            (tuple(args.image),)
             if args.image
-            else _discover_rgb_images(config.data.dynamic)
+            else discover_sam_composites(
+                config.data.dynamic,
+                [
+                    weak_config.get(f"CompositeBands{index}", [])
+                    for index in range(1, 6)
+                ],
+            )
         )
-        reference = args.reference_raster or image_paths[0]
+        reference = args.reference_raster or image_paths[0][0]
         mapping_path = next(run_dir.glob("label_mapping_*.json"))
         mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
         record_batches = iter_encoded_labels(
@@ -136,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
                     weak_config.get("reject_boundary_touch", True)
                 ),
                 conflict_margin=float(weak_config.get("conflict_margin", 0.05)),
+                mask_fusion=str(weak_config.get("mask_fusion", "intersection")),
                 output_nodata=config.data.output_nodata,
             ),
         )

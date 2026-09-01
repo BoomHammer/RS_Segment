@@ -10,6 +10,7 @@ from pathlib import Path
 from config import load_config
 from data.labels import iter_encoded_labels
 from data.raster_alignment import target_grid_from_raster
+from data.sam_input import discover_sam_composites
 from data.weak_labels import WeakLabelGenerationConfig, generate_weak_labels
 from inference.sam2_backend import SAM2Inferencer
 
@@ -17,10 +18,8 @@ from inference.sam2_backend import SAM2Inferencer
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="生成流式弱监督标签 GeoTIFF")
     parser.add_argument("--config", type=Path, default=Path("configs/data.yaml"))
-    parser.add_argument(
-        "--image", type=Path, nargs=3, required=True, metavar=("R", "G", "B")
-    )
-    parser.add_argument("--reference-raster", type=Path, required=True)
+    parser.add_argument("--image", type=Path, nargs=3, metavar=("R", "G", "B"))
+    parser.add_argument("--reference-raster", type=Path)
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--quality-report", type=Path)
@@ -32,8 +31,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = load_config(args.config)
     weak_config = config.data.weak_labels
+    image_paths = (
+        (tuple(args.image),)
+        if args.image
+        else discover_sam_composites(
+            config.data.dynamic,
+            [
+                weak_config.get(f"CompositeBands{index}", [])
+                for index in range(1, 6)
+            ],
+        )
+    )
+    reference_raster = args.reference_raster or image_paths[0][0]
     grid = target_grid_from_raster(
-        args.reference_raster,
+        reference_raster,
         target_crs=config.data.target_grid.get("crs", "EPSG:4326"),
         resolution=tuple(config.data.target_grid.get("resolution", [0.00225, 0.00225])),
     )
@@ -63,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     generate_weak_labels(
         records,
         grid=grid,
-        image_paths=args.image,
+        image_paths=image_paths,
         inferencer=inferencer,
         output_path=output,
         quality_report_path=report,
@@ -93,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
             logit_threshold=float(weak_config.get("logit_threshold", 0.5)),
             reject_boundary_touch=bool(weak_config.get("reject_boundary_touch", True)),
             conflict_margin=float(weak_config.get("conflict_margin", 0.05)),
+            mask_fusion=str(weak_config.get("mask_fusion", "intersection")),
             output_nodata=config.data.output_nodata,
         ),
     )
