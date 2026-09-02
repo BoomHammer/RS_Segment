@@ -1,6 +1,6 @@
 # 数据模块说明 Data Module Instructions
 ### 职责Responsibility
-data/ 负责：  
+src/data/ 负责：  
 数据集访问  
 数据解析  
 预处理  
@@ -23,4 +23,7 @@ data/ 负责：
 #### 标签数据
 文件位置：data\labels
 ### 输出结果
-所有处理好的数据存入data\processed，后续计算可直接读取，避免每次实验重复计算
+所有处理好的数据存入data\processed，后续计算可直接读取，避免每次实验重复计算。
+
+### 后续特性
+以后多光谱数据将使用Landsat/Sentinel等30m分辨率高分数据，不能只考虑使用MODIS 250m分辨率数据的情况。

@@ -1,0 +1,22 @@
+# 阶段3模型架构配置。
+model:
+  architecture: segformer_utae
+  backbone: mit_b1
+  temporal:
+    type: utae_ltae
+    projection_channels: 64
+  static:
+    projection_channels: 32
+  fusion:
+    output_channels: 96
+  input:
+    # 仅作为计算哨兵值；有效性由数据批次中的 mask 决定。
+    invalid_fill_value: 0.0
+  supervision:
+    ground_truth_weight: 1.0
+    weak_label_weight: 0.5
+    ignore_index: -1
+  artifacts:
+    # 由阶段2 run 目录自动发现，不在此手工填写通道数或类别数。
+    sample_index: auto
+    label_mapping: auto

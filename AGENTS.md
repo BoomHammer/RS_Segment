@@ -1,5 +1,5 @@
 ### 1. 项目介绍 (Project Introduction)
-本项目是一个基于弱监督学习的大陆级遥感植被语义分割任务。核心目标是利用极度稀疏的实测样点数据，结合多源异构的遥感影像（多时态动态影像与静态影像），通过深度学习混合架构（Swin-U-TAE）与弱监督标签生成（PointSAM），最终输出覆盖整个研究区域的无缝、无方块效应的250m分辨率植被类型分布图（约10余大类，70余小类）。
+本项目是一个基于弱监督学习的大陆级遥感植被语义分割任务。核心目标是利用极度稀疏的实测样点数据，结合多源异构的遥感影像（多时态动态影像与静态影像），通过深度学习混合架构（SegFormer + U-TAE）与弱监督标签生成（PointSAM），最终输出覆盖整个研究区域的无缝、无方块效应的250m分辨率植被类型分布图（约10余大类，70余小类）。
 
 ### 2. 环境与工具 (Environment & Tooling)
 CUDA 版本: 12.4  
@@ -44,12 +44,12 @@ CUDA 版本: 12.4
 ### 5. 核心技术栈 (Core Tech Stack)
 **基础框架:** PyTorch, TorchGeo
 
-**模型架构:** PointSAM (Segment Anything Model), Swin Transformer (Tiny), L-TAE (Lightweight Temporal Attention Encoder)
+**模型架构:** SAM2 (Segment Anything Model), SegFormer MiT-B1, U-TAE-style encoder + 内部 L-TAE temporal attention
 
 **显存优化:** BF16 混合精度训练 (AMP), 梯度累积 (Gradient Accumulation)
 
 ### 6. 严格行为准则 (Strict Directives for Agent)
 1. 任何提供的代码必须考虑到 RTX 4090 24GB 的显存瓶颈。
-2. 涉及全图推断的代码，必须使用重叠滑窗和高斯加权，拒绝提供简单的分块拼接代码。始终使用全局统计常量。以保证最终输出结果（tiff影像）中没有明显接缝和方格。
+2. 必须考虑无缝训练+无缝图例。
 3. 所有提供的 Python 代码必须遵循 Ruff 的规范。
 4. 本AGENTS.md文档只能由人工修改，AI Agent禁止修改。

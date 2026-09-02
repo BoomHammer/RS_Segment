@@ -265,4 +265,4 @@ data/
 └── processed/               # 预处理数据
 ```
 
-训练、PointSAM 弱监督标签生成、Swin-U-TAE 模型和带重叠滑窗及高斯加权的全图推理将在后续阶段接入。
+训练、PointSAM 弱监督标签生成、SegFormer-U-TAE 模型和带重叠滑窗及高斯加权的全图推理将在后续阶段接入。

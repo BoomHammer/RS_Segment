@@ -47,6 +47,7 @@ class AppConfig:
     """Top-level application configuration."""
 
     data: DataConfig = field(default_factory=DataConfig)
+    model: dict[str, Any] = field(default_factory=dict)
 
 
 def _resolve_path(value: str | Path | None, base_dir: Path) -> Path | None:
@@ -71,6 +72,7 @@ def load_config(path: str | Path) -> AppConfig:
         if stage2.get(key) is not None:
             stage2[key] = str(_resolve_path(stage2[key], config_path.parent))
     return AppConfig(
+        model=dict(raw.get("model", {})),
         data=DataConfig(
             root=_resolve_path(data.get("root", "data"), config_path.parent)
             or config_path.parent,
@@ -107,5 +109,5 @@ def load_config(path: str | Path) -> AppConfig:
             stage2=stage2,
             dynamic_filename=dict(data.get("dynamic_filename", {})),
             metadata_schema=dict(data.get("metadata_schema", {})),
-        )
+        ),
     )
