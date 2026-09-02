@@ -6,6 +6,7 @@ from data.labels import (
     build_label_mapping,
     iter_encoded_labels,
     iter_label_rows,
+    validate_label_mapping,
     validate_labels,
     write_label_artifacts,
 )
@@ -59,6 +60,30 @@ def test_label_mapping_and_streaming_validation(tmp_path: Path) -> None:
     assert encoded[0][0].alliance_code > 0
 
 
+def test_label_mapping_validates_fine_to_coarse_contract() -> None:
+    mapping = {
+        "major_count": 1,
+        "minor_count": 2,
+        "classes": [
+            {
+                "formation_code": 1,
+                "alliance_code": 1,
+                "formation": "A",
+                "alliance": "a",
+            },
+            {
+                "formation_code": 1,
+                "alliance_code": 2,
+                "formation": "A",
+                "alliance": "b",
+            },
+        ],
+    }
+    report = validate_label_mapping(mapping)
+    assert report["valid"] is True
+    assert report["alliance_to_formation"] == {"1": 1, "2": 1}
+
+
 def test_label_artifacts_are_json(tmp_path: Path) -> None:
     path = tmp_path / "labels.csv"
     _write_labels(path)
@@ -69,4 +94,6 @@ def test_label_artifacts_are_json(tmp_path: Path) -> None:
     mapping_data = json.loads(mapping.read_text(encoding="utf-8"))
     assert mapping_data["major_count"] == 2
     assert mapping_data["output_nodata"] == -9999
-    assert json.loads(report.read_text(encoding="utf-8"))["invalid_rows"] == 0
+    report_data = json.loads(report.read_text(encoding="utf-8"))
+    assert report_data["invalid_rows"] == 0
+    assert report_data["mapping_validation"]["valid"] is True

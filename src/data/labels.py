@@ -160,6 +160,59 @@ def build_label_mapping(
     }
 
 
+def validate_label_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the persisted fine-to-coarse label mapping contract."""
+
+    classes = list(mapping.get("classes", []))
+    required = {"formation_code", "alliance_code", "formation", "alliance"}
+    errors: list[str] = []
+    if not classes:
+        errors.append("classes 不能为空")
+    if int(mapping.get("major_count", -1)) < 1:
+        errors.append("major_count 必须为正数")
+    if int(mapping.get("minor_count", -1)) != len(classes):
+        errors.append("minor_count 与 classes 数量不一致")
+    alliance_to_formation: dict[int, int] = {}
+    formation_names: dict[int, str] = {}
+    pairs: set[tuple[str, str]] = set()
+    for index, item in enumerate(classes):
+        missing = required - set(item)
+        if missing:
+            errors.append(f"classes[{index}] 缺少字段: {sorted(missing)}")
+            continue
+        formation_code = int(item["formation_code"])
+        alliance_code = int(item["alliance_code"])
+        formation = str(item["formation"])
+        alliance = str(item["alliance"])
+        previous = alliance_to_formation.get(alliance_code)
+        if previous is not None and previous != formation_code:
+            errors.append(f"小类 {alliance_code} 对应了多个大类")
+        alliance_to_formation[alliance_code] = formation_code
+        previous_name = formation_names.get(formation_code)
+        if previous_name is not None and previous_name != formation:
+            errors.append(f"大类编码 {formation_code} 对应了多个名称")
+        formation_names[formation_code] = formation
+        pair = (formation, alliance)
+        if pair in pairs:
+            errors.append(f"重复的大类-小类组合: {formation}|{alliance}")
+        pairs.add(pair)
+    if len(alliance_to_formation) != len(classes):
+        errors.append("alliance_code 不唯一")
+    if len(formation_names) != int(mapping.get("major_count", -1)):
+        errors.append("major_count 与实际大类编码数量不一致")
+    if errors:
+        raise ValueError("标签映射校验失败: " + "; ".join(errors))
+    return {
+        "valid": True,
+        "major_count": len(formation_names),
+        "minor_count": len(alliance_to_formation),
+        "alliance_to_formation": {
+            str(alliance): formation
+            for alliance, formation in sorted(alliance_to_formation.items())
+        },
+    }
+
+
 def validate_labels(
     path: str | Path,
     *,
@@ -267,6 +320,7 @@ def write_label_artifacts(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     mapping = build_label_mapping(path, label_columns=label_columns, schema=schema)
+    mapping_validation = validate_label_mapping(mapping)
     report = validate_labels(
         path,
         label_columns=label_columns,
@@ -290,7 +344,9 @@ def write_label_artifacts(
     mapping_path.write_text(
         json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    report_payload = report.to_dict()
+    report_payload["mapping_validation"] = mapping_validation
     report_path.write_text(
-        json.dumps(report.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(report_payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return mapping_path, report_path
