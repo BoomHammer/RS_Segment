@@ -45,8 +45,6 @@ data:
     crs: EPSG:4326
     # 目标像元大小；EPSG:4326 下单位为度。
     resolution: [0.00225, 0.00225]
-    # 重投影时的重采样方法；分类或离散数据通常使用 nearest。
-    resampling: nearest
     # 可选参考影像路径；为空时由命令行 --reference-raster 提供。
     reference_raster: null
 
@@ -99,6 +97,54 @@ data:
     strategy: all
     # 仅在显式填写整数时限制样点数量，null 表示不限制。
     max_samples: null
+
+  # 阶段2训练数据协议；空特征清单表示使用索引中发现的全部特征。
+  stage2:
+    features:
+      dynamic: []
+      static: []
+      # 动态特征名称按此顺序排列；空值时按名称排序。
+      dynamic_order: []
+    time:
+      start: "2023-01-01"
+      end: "2023-12-31"
+      # mask_nan：缺帧填 NaN 并由 dynamic_mask 标记；drop：丢弃缺失特征的时间点。
+      missing: mask_nan
+    window:
+      size: [256, 256]
+      stride: [256, 256]
+    statistics_file: null
+    statistics_window_size: [1024, 1024]
+    split_file: ../data/processed/spatial_split.json
+    dataloader:
+      batch_size: 1
+      num_workers: 2
+      pin_memory: true
+      persistent_workers: true
+      prefetch_factor: 2
+      drop_last: false
+    cache:
+      # 默认关闭窗口缓存，避免大规模数据实验占满内存。
+      enabled: false
+      max_items: 0
+    training:
+      amp_dtype: bfloat16
+      gradient_accumulation_steps: 4
+    sampling:
+      strategy: spatial_weighted
+      split: train
+      num_samples: null
+    split:
+      block_size: [2048, 2048]
+      ratios: [0.8, 0.1, 0.1]
+      seed: 42
+    benchmark:
+      enabled: true
+      batches: 20
+      warmup: 3
+    validation:
+      max_windows: 2
+      require_ground_truth: true
 
   # 动态文件名解析规则。静态影像不从文件名推断时间。
   dynamic_filename:

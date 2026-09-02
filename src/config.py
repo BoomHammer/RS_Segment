@@ -31,6 +31,7 @@ class DataConfig:
     raster: dict[str, Any] = field(default_factory=dict)
     weak_labels: dict[str, Any] = field(default_factory=dict)
     sampling: dict[str, Any] = field(default_factory=dict)
+    stage2: dict[str, Any] = field(default_factory=dict)
     dynamic_filename: dict[str, Any] = field(default_factory=dict)
     metadata_schema: dict[str, Any] = field(default_factory=dict)
 
@@ -65,6 +66,10 @@ def load_config(path: str | Path) -> AppConfig:
     data = raw.get("data", {})
     if not isinstance(data, dict):
         raise ValueError("配置中的 data 必须是对象")
+    stage2 = dict(data.get("stage2", {}))
+    for key in ("statistics_file", "split_file"):
+        if stage2.get(key) is not None:
+            stage2[key] = str(_resolve_path(stage2[key], config_path.parent))
     return AppConfig(
         data=DataConfig(
             root=_resolve_path(data.get("root", "data"), config_path.parent)
@@ -99,6 +104,7 @@ def load_config(path: str | Path) -> AppConfig:
             raster=dict(data.get("raster", {})),
             weak_labels=dict(data.get("weak_labels", {})),
             sampling=dict(data.get("sampling", {})),
+            stage2=stage2,
             dynamic_filename=dict(data.get("dynamic_filename", {})),
             metadata_schema=dict(data.get("metadata_schema", {})),
         )

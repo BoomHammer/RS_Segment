@@ -64,6 +64,7 @@ data:
 | `scripts/validate_labels.py` | 单独运行样点读取、校验和类别映射 | 可用 |
 | `rs-compute-stats` / `scripts/compute_stats.py` | 按窗口流式计算 GeoTIFF 统计量 | 可用 |
 | `data.filename_parser` | 解析动态影像文件名并生成元数据 | 可用 |
+| `scripts/stage2.py` | 根据阶段1 run 目录统一生成阶段2索引、空间划分、验证和基准报告 | 可用 |
 | `scripts/train.py` | 训练入口 | 预留，尚未实现 |
 | `scripts/predict.py` | 推理入口 | 预留，尚未实现 |
 | `scripts/test.py` | 测试入口 | 预留；当前使用 pytest |
@@ -188,7 +189,32 @@ data/processed/<YYYYMMDD_HHMMSS>/
 uv run python scripts/validate_labels.py --config configs/data.yaml
 ```
 
-### 4. 解析动态影像文件名
+### 4. 阶段2数据流程
+
+阶段1完成后，只需把阶段1生成的 run 目录作为唯一必填参数传给阶段2入口：
+
+```bash
+uv run python scripts/stage2.py data/processed/<YYYYMMDD_HHMMSS>
+```
+
+阶段2会自动从该目录发现 `weak_labels.tif`、`raster_stats_*.json` 和
+`label_mapping_*.json`；如果阶段1跳过了栅格统计，会按 `configs/data.yaml` 的配置在
+同一目录补算统计量。所有阶段2产物均写入该 run 目录：
+
+```text
+data/processed/<YYYYMMDD_HHMMSS>/
+├── sample_index.json
+├── spatial_split.json
+├── stage2_validation.json
+├── stage2_benchmark.json
+└── raster_stats_stage2.json       # 阶段1未生成统计量时才会出现
+```
+
+阶段2的特征清单、时间范围、缺帧策略、窗口大小和步长、空间块划分、采样、
+DataLoader worker、缓存、BF16、梯度累积及基准批次数均在
+`configs/data.yaml` 的 `data.stage2` 中配置，不需要重复写入命令行。
+
+### 5. 解析动态影像文件名
 
 解析目录下顶层的 `.tif` 文件，并生成 JSON 或 YAML 元数据：
 
