@@ -2,7 +2,7 @@
 
 ## 当前阶段
 
-阶段 1：数据准备与弱监督标签生成（已完成，可进入阶段 2）。
+阶段 2：数据加载与多分辨率融合（规划中，尚未开始实现）。
 
 ## 已完成
 
@@ -26,18 +26,25 @@
 - [ ] 可选环境优化：编译 SAM2 CUDA 扩展 `_C`。当前机器缺少 MSVC `cl.exe`，且项目已关闭依赖该扩展的可选空洞后处理，不影响主体推理结果。
 - [ ] 可选质量优化：降低 `spectral_fallback_accepted` 比例并评估圆形回退标签对训练的影响；不阻塞阶段2数据加载开发。
 
-## 后续计划
+## 当前项目状态
 
-- [ ] 2. 数据加载与多分辨率融合（TorchGeo，需保持流式/动态读取）。阶段1尚未实现 TorchGeo 数据集及多源时序融合。
-- [ ] 3. 模型架构（Swin-U-TAE）。
-- [ ] 4. 层级化损失函数与长尾类别处理。
-- [ ] 5. 无缝推理：重叠滑窗、全局统计常量和高斯加权融合，输出无明显接缝的 GeoTIFF。
+- 当前分支：`feat/DataPreparation`，与 `origin/feat/DataPreparation` 同步。
+- 检查开始时工作区干净；本次仅更新了本文件，当前唯一未提交变更为 `DEVELOPMENT.md`。
+- 最近提交已完成阶段1的数据准备、标签处理、SAM2伪标签及时序融合功能。
+- 当前代码已具备阶段1的可复用数据基础设施，但训练主链路尚未形成：`scripts/train.py` 和 `scripts/predict.py` 为空，`src/models/` 与 `src/losses/` 目前只有目录级约定文件。
+- `torchgeo` 已列入项目依赖，但尚未实现基于 TorchGeo 的训练数据集、采样器或多源时序样本协议。
 
-## 当前阻塞与注意事项
+## 验证状态
 
-- 当前环境中 `uv.exe` 无法启动；本次验证改用项目 `.venv` 内的 Python、pytest 和 Ruff。
-- 当前 SAM2 自定义 CUDA 扩展 `_C` 未编译，原因是本机缺少 MSVC `cl.exe`；已关闭依赖该扩展的可选后处理，主体视频推理可运行。
+- [x] `.venv\\Scripts\\python.exe -m pytest`：33 项通过，17 个来自 rasterio 的弃用提示，无失败。
+- [x] `.venv\\Scripts\\python.exe -m ruff check .`：通过。
+- [ ] 尚未进行阶段2验证：真实多源样本读取、批处理显存、动态长度时序和端到端训练均未验证。
 
-## 阶段1完成后的下一步
+## 未完成任务
 
-开始阶段2：实现 TorchGeo 数据集、多分辨率对齐和多时相动态读取。阶段1核心代码位于 `src/data/` 和 `src/inference/sam2_backend.py`。弱标签质量报告可在生成后查看 `weak_labels_quality.json`；当前报告应重点关注 `sample_quality.status_counts`、`failure_reasons` 和 `missing_classes`。
+- [ ] 阶段1可选项：编译 SAM2 CUDA 扩展 `_C`；本机缺少 MSVC `cl.exe`，不阻塞主体推理。
+- [ ] 阶段1可选项：分析并降低 `spectral_fallback_accepted`，评估圆形回退标签对训练的影响。
+- [ ] 2.1 建立动态/静态/弱标签的统一样本索引和元数据协议。
+- [ ] 2.2 实现 TorchGeo 数据集与空间查询，支持 GeoTIFF 窗口级读取，禁止将全量栅格加载到内存。
+- [ ] 2.3 实现多分辨率对齐到目标网格，明确连续变量与分类标签的重采样策略。
+- [ ] 2.4 实现多时相动态
