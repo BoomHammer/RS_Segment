@@ -10,7 +10,7 @@ from pathlib import Path
 from config import load_config
 from data.labels import iter_encoded_labels
 from data.raster_alignment import target_grid_from_raster
-from data.sam_input import discover_sam_composites
+from data.sam_input import discover_sam_videos
 from data.weak_labels import WeakLabelGenerationConfig, generate_weak_labels
 from inference.sam2_backend import SAM2Inferencer
 from preprocessing import run_preprocessing
@@ -36,20 +36,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-confidence", type=float, default=0.0)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--skip-weak-labels", action="store_true")
+    parser.add_argument(
+        "--skip-statistics",
+        action="store_true",
+        help="跳过与 SAM 推理无关的全量栅格统计扫描",
+    )
     args = parser.parse_args(argv)
     config = load_config(args.config)
     weak_config = config.data.weak_labels
+    if args.skip_statistics:
+        print("已跳过全量栅格统计量计算。")
     run_dir = run_preprocessing(
         config,
         band=args.band,
         window_size=tuple(args.window_size or [1024, 1024]),
         nodata=args.nodata,
+        skip_statistics=args.skip_statistics,
     )
     if not args.skip_weak_labels:
-        image_paths = (
-            (tuple(args.image),)
+        composite_names = (
+            ["命令行影像"]
             if args.image
-            else discover_sam_composites(
+            else [
+                f"CompositeBands{index}"
+                for index in range(1, 6)
+                if weak_config.get(f"CompositeBands{index}", [])
+            ]
+        )
+        image_paths, keyframe_index = (
+            ((tuple(args.image),), 0)
+            if args.image
+            else discover_sam_videos(
                 config.data.dynamic,
                 [
                     weak_config.get(f"CompositeBands{index}", [])
@@ -57,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
                 ],
             )
         )
-        reference = args.reference_raster or image_paths[0][0]
+        reference = args.reference_raster or image_paths[0][0][0]
         mapping_path = next(run_dir.glob("label_mapping_*.json"))
         mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
         record_batches = iter_encoded_labels(
@@ -89,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
             or Path("SAM/sam2.1_hiera_small.pt"),
             device=args.device,
             input_range=(0.0, 255.0),
+            use_video=True,
         )
         generate_weak_labels(
             records,
@@ -128,8 +146,13 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 conflict_margin=float(weak_config.get("conflict_margin", 0.05)),
                 mask_fusion=str(weak_config.get("mask_fusion", "intersection")),
+                weighted_vote_threshold=float(
+                    weak_config.get("weighted_vote_threshold", 0.5)
+                ),
                 output_nodata=config.data.output_nodata,
             ),
+            keyframe_index=keyframe_index,
+            composite_names=composite_names,
         )
     print(f"预处理产物: {run_dir}")
     return 0

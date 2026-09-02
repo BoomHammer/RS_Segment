@@ -18,6 +18,7 @@ def run_preprocessing(
     window_size: tuple[int, int] = (1024, 1024),
     nodata: float | int | None = None,
     timestamp: str | None = None,
+    skip_statistics: bool = False,
 ) -> Path:
     """Write mapping, validation, and raster statistics for one preprocessing run."""
 
@@ -35,15 +36,16 @@ def run_preprocessing(
         mapping_file=run_dir / f"label_mapping_{run_timestamp}.json",
         validation_report=run_dir / f"label_validation_{run_timestamp}.json",
     )
-    payload = compute_statistics(
-        config,
-        band=band,
-        window_size=window_size,
-        nodata=nodata,
-    )
-    stats_path = run_dir / f"raster_stats_{run_timestamp}.json"
-    stats_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
-        encoding="utf-8",
-    )
+    if not skip_statistics:
+        payload = compute_statistics(
+            config,
+            band=band,
+            window_size=window_size,
+            nodata=nodata,
+        )
+        stats_path = run_dir / f"raster_stats_{run_timestamp}.json"
+        stats_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
     return run_dir

@@ -65,8 +65,10 @@ data:
     CompositeBands3: [6, 2, 1]  # 短波红外/农业假彩色
     CompositeBands4: [7, 6, 5]  # 穿透大气/地质组合
     CompositeBands5: []
-    # mask 融合方式：intersection 提高精度，union 提高召回率。
-    mask_fusion: intersection
+    # mask 融合方式：intersection、union 或 weighted_vote。
+    mask_fusion: weighted_vote
+    # weighted_vote 的最小加权投票比例，0.5 表示加权半数通过，值越大要求越严格。
+    weighted_vote_threshold: 0.5
     # SAM 读取的局部上下文窗口大小，单位为目标栅格像元。
     input_window_size: [256, 256]
     # 高置信度 SAM mask 最终允许写入的最大样点半径。

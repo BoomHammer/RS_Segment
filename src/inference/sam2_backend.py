@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,12 @@ import numpy as np
 import torch
 
 from inference.pointsam import PointSAMPrediction, PointSAMRequest
+
+
+def _quiet_tqdm(iterable: Any, *args: Any, **kwargs: Any) -> Any:
+    """Disable SAM2's per-frame progress bars; outer progress remains visible."""
+
+    return iterable
 
 
 def prepare_sam2_image(
@@ -71,6 +78,7 @@ class SAM2Inferencer:
         input_range: tuple[float, float] = (0.0, 255.0),
         multimask_output: bool = True,
         use_amp: bool = True,
+        use_video: bool = False,
     ) -> None:
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -87,13 +95,36 @@ class SAM2Inferencer:
         self.input_range = input_range
         self.multimask_output = multimask_output
         self.use_amp = use_amp and self.device.type == "cuda"
-        self.model = build_sam2(
-            config_file=config_file,
-            ckpt_path=str(checkpoint_path),
-            device=str(self.device),
-            mode="eval",
-        )
+        if use_video:
+            try:
+                from sam2.build_sam import build_sam2_video_predictor
+            except ImportError as error:
+                raise RuntimeError("当前 SAM2 版本不支持视频预测器") from error
+            self.model = build_sam2_video_predictor(
+                config_file=config_file,
+                ckpt_path=str(checkpoint_path),
+                device=str(self.device),
+                apply_postprocessing=False,
+            )
+            self.video_predictor = self.model
+            self._disable_video_progress()
+        else:
+            self.model = build_sam2(
+                config_file=config_file,
+                ckpt_path=str(checkpoint_path),
+                device=str(self.device),
+                mode="eval",
+            )
+            self.video_predictor = None
         self.predictor = SAM2ImagePredictor(self.model)
+
+    def _disable_video_progress(self) -> None:
+        """Silence tqdm calls inside the installed SAM2 video implementation."""
+
+        for name, module in tuple(sys.modules.items()):
+            if name.startswith("sam2") and module is not None:
+                if "tqdm" in vars(module):
+                    module.tqdm = _quiet_tqdm
 
     def _autocast(self) -> Any:
         if not self.use_amp:
@@ -135,6 +166,86 @@ class SAM2Inferencer:
             confidence=confidence,
             mask_logits=mask_logits[best],
         )
+
+    def predict_video(
+        self,
+        images: Sequence[np.ndarray],
+        keyframe_index: int,
+        seed: Any,
+    ) -> list[PointSAMPrediction]:
+        """Prompt the July keyframe and propagate masks in both directions."""
+
+        if self.video_predictor is None:
+            raise RuntimeError("SAM2Inferencer 未启用视频模式")
+        if not images or not 0 <= keyframe_index < len(images):
+            raise ValueError("视频帧或 keyframe_index 无效")
+        from tempfile import TemporaryDirectory
+
+        from PIL import Image
+
+        with TemporaryDirectory(prefix="sam2_video_") as directory:
+            for index, image in enumerate(images):
+                Image.fromarray(prepare_sam2_image(image)).save(
+                    Path(directory) / f"{index:05d}.jpg",
+                    format="JPEG",
+                )
+            state = self.video_predictor.init_state(video_path=directory)
+            self.video_predictor.reset_state(state)
+            points = np.asarray([[seed.column, seed.row]], dtype=np.float32)
+            labels = np.asarray([1], dtype=np.int32)
+            propagated: dict[int, PointSAMPrediction] = {}
+            with self._autocast():
+                _, object_ids, masks = self.video_predictor.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=keyframe_index,
+                    obj_id=1,
+                    points=points,
+                    labels=labels,
+                )
+                propagated[keyframe_index] = _video_prediction_for_object(
+                    masks, object_ids, seed
+                )
+                for reverse in (False, True):
+                    for frame_idx, ids, frame_masks in (
+                        self.video_predictor.propagate_in_video(
+                            state,
+                            start_frame_idx=keyframe_index,
+                            reverse=reverse,
+                        )
+                    ):
+                        propagated[frame_idx] = _video_prediction_for_object(
+                            frame_masks, ids, seed
+                        )
+            return [propagated[index] for index in sorted(propagated)]
+
+
+def _video_prediction_for_object(
+    masks: Any, object_ids: Any, seed: Any
+) -> PointSAMPrediction:
+    """Extract object 1's logits and point confidence from a video result."""
+
+    ids = np.asarray(object_ids).reshape(-1).tolist()
+    mask_array = (
+        masks.detach().float().cpu().numpy()
+        if torch.is_tensor(masks)
+        else np.asarray(masks)
+    )
+    object_index = ids.index(1)
+    logits = np.squeeze(
+        np.asarray(mask_array[object_index], dtype=np.float32)
+    )
+    if logits.ndim != 2:
+        raise RuntimeError(
+            f"SAM2 视频 mask 形状异常，目标对象 mask 应为二维，实际为 {logits.shape}"
+        )
+    row = min(max(int(seed.row), 0), logits.shape[0] - 1)
+    column = min(max(int(seed.column), 0), logits.shape[1] - 1)
+    confidence = float(1.0 / (1.0 + np.exp(-logits[row, column])))
+    return PointSAMPrediction(
+        mask=logits > 0,
+        confidence=np.full(logits.shape, confidence, dtype=np.float32),
+        mask_logits=logits,
+    )
 
 
 def default_sam2_paths(project_root: str | Path) -> tuple[Path, str]:

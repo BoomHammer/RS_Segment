@@ -20,7 +20,6 @@ from data.labels import LabelRecord
 from data.raster_alignment import TargetGrid, aligned_raster, locate_points
 from inference.pointsam import (
     PointSAMInferencer,
-    build_pointsam_request,
     run_pointsam_with_npc,
 )
 
@@ -43,6 +42,7 @@ class WeakLabelGenerationConfig:
     output_nodata: int = -9999
     min_confidence: float = 0.0
     mask_fusion: str = "intersection"
+    weighted_vote_threshold: float = 0.5
 
 
 def _window_for_point(
@@ -207,18 +207,35 @@ def generate_weak_labels(
     quality_report_path: str | Path | None = None,
     quality_visualization_path: str | Path | None = None,
     alliance_names: dict[int, str] | None = None,
+    keyframe_index: int = 0,
+    composite_names: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Generate sparse, point-local labels from high-confidence SAM regions."""
 
     config = config or WeakLabelGenerationConfig()
     if image_paths and isinstance(image_paths[0], (str, Path)):
-        image_groups = (tuple(image_paths),)
+        video_frames = ((tuple(image_paths),),)
+    elif image_paths and isinstance(image_paths[0][0], (str, Path)):
+        video_frames = (tuple(tuple(group) for group in image_paths),)
     else:
-        image_groups = tuple(tuple(group) for group in image_paths)
-    if not image_groups or any(len(group) != 3 for group in image_groups):
-        raise ValueError("image_paths 必须提供一个或多个三波段影像组合")
-    if config.mask_fusion not in {"intersection", "union"}:
-        raise ValueError("mask_fusion 必须是 intersection 或 union")
+        video_frames = tuple(
+            tuple(tuple(group) for group in frame) for frame in image_paths
+        )
+    if not video_frames or any(
+        len(group) != 3 for frame in video_frames for group in frame
+    ):
+        raise ValueError("image_paths 必须提供一个或多个三波段时间组合")
+    if not 0 <= keyframe_index < len(video_frames):
+        raise ValueError("keyframe_index 超出时间帧范围")
+    names = tuple(composite_names or ())
+    if names and len(names) != len(video_frames[0]):
+        raise ValueError("composite_names 数量必须与波段组合数量一致")
+    if config.mask_fusion not in {"intersection", "union", "weighted_vote"}:
+        raise ValueError(
+            "mask_fusion 必须是 intersection、union 或 weighted_vote"
+        )
+    if not 0 < config.weighted_vote_threshold <= 1:
+        raise ValueError("weighted_vote_threshold 必须位于 (0, 1]")
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output_profile = _profile(grid, config.output_nodata)
@@ -259,27 +276,36 @@ def generate_weak_labels(
             )
     with ExitStack() as stack:
         datasets = [
-            tuple(stack.enter_context(aligned_raster(path, grid)) for path in group)
-            for group in image_groups
+            [
+                tuple(
+                    stack.enter_context(aligned_raster(path, grid)) for path in group
+                )
+                for group in frame
+            ]
+            for frame in video_frames
         ]
         destination = stack.enter_context(rasterio.open(output, "r+"))
+        print("开始计算 SAM 视频帧的全局光谱拉伸统计量...")
         ranges = [
-            _global_input_ranges(
-                group,
-                grid,
-                config.input_range,
-                config.stretch_percentiles,
-            )
-            for group in datasets
+            [
+                _global_input_ranges(
+                    group,
+                    grid,
+                    config.input_range,
+                    config.stretch_percentiles,
+                )
+                for group in frame
+            ]
+            for frame in datasets
         ]
+        print("全局光谱拉伸统计量完成，开始加载视频帧并生成弱标签...")
         score = np.full((grid.height, grid.width), -np.inf, dtype=np.float32)
         labels = np.full(
             (grid.height, grid.width), config.output_nodata, dtype=np.int32
         )
         global_seeds = []
-        for record, row, column, outcome_index in tqdm(
-            located_records, desc="生成弱标签", unit="sample"
-        ):
+        progress = tqdm(located_records, desc="生成弱标签", unit="sample")
+        for record, row, column, outcome_index in progress:
             outcome = sample_outcomes[outcome_index]
             window = _window_for_point(row, column, grid, config.window_size)
             row_start, column_start = int(window.row_off), int(window.col_off)
@@ -288,72 +314,106 @@ def generate_weak_labels(
             predictions = []
             images = []
             valids = []
-            for group, group_ranges in zip(datasets, ranges, strict=True):
-                arrays = [
-                    dataset.read(1, window=window, masked=True) for dataset in group
-                ]
-                valids.append(
-                    np.logical_and.reduce(
-                        [~np.ma.getmaskarray(array) for array in arrays]
-                    )
+            for group_index in range(len(datasets[0])):
+                progress.set_postfix_str(
+                    names[group_index]
+                    if names
+                    else f"CompositeBands{group_index + 1}"
                 )
-                image = _stretch_rgb(
-                    np.stack([array.filled(0) for array in arrays]), group_ranges
-                )
-                images.append(image)
-                request = build_pointsam_request(
-                    image,
-                    [seed],
-                    [],
-                    metadata={
-                        "window": (
-                            window.col_off,
-                            window.row_off,
-                            window.width,
-                            window.height,
+                group_images = []
+                group_valids = []
+                for frame_index, frame in enumerate(datasets):
+                    group = frame[group_index]
+                    group_ranges = ranges[frame_index][group_index]
+                    arrays = [
+                        dataset.read(1, window=window, masked=True)
+                        for dataset in group
+                    ]
+                    group_valids.append(
+                        np.logical_and.reduce(
+                            [~np.ma.getmaskarray(array) for array in arrays]
                         )
-                    },
-                )
-                predictions.append(
-                    run_pointsam_with_npc(
-                        inferencer,
-                        request.image,
-                        request.positive_points,
-                        request.negative_points,
-                        spatial_shape=image.shape[-2:],
-                        metadata=request.metadata,
                     )
-                )
-            image = images[0]
+                    group_images.append(
+                        _stretch_rgb(
+                            np.stack([array.filled(0) for array in arrays]),
+                            group_ranges,
+                        )
+                    )
+                images.append(group_images)
+                valids.append(np.logical_and.reduce(group_valids))
+                if hasattr(inferencer, "predict_video"):
+                    predictions.append(
+                        inferencer.predict_video(
+                            group_images,
+                            keyframe_index,
+                            seed,
+                        )
+                    )
+                else:
+                    predictions.append(
+                        [
+                            run_pointsam_with_npc(
+                                inferencer,
+                                group_images[keyframe_index],
+                                [seed],
+                                [],
+                                spatial_shape=group_images[keyframe_index].shape[-2:],
+                            )
+                        ]
+                    )
+            image = images[0][keyframe_index]
             valid = np.logical_and.reduce(valids)
-            masks = [prediction.mask.astype(bool) for prediction in predictions]
+            all_predictions = [
+                prediction
+                for group_predictions in predictions
+                for prediction in group_predictions
+            ]
+            masks = [prediction.mask.astype(bool) for prediction in all_predictions]
+            confidence_values = [
+                float(prediction.confidence.flat[0])
+                if prediction.confidence is not None
+                else 1.0
+                for prediction in all_predictions
+            ]
+            weights = np.maximum(
+                np.asarray(confidence_values, dtype=np.float32),
+                np.finfo(np.float32).eps,
+            )
             if config.mask_fusion == "intersection":
                 fused_mask = np.logical_and.reduce(masks)
-                confidence_values = [
-                    float(prediction.confidence.flat[0])
-                    if prediction.confidence is not None
-                    else 1.0
-                    for prediction in predictions
-                ]
-                confidence = min(confidence_values)
-            else:
+            elif config.mask_fusion == "union":
                 fused_mask = np.logical_or.reduce(masks)
-                confidence_values = [
-                    float(prediction.confidence.flat[0])
-                    if prediction.confidence is not None
-                    else 1.0
-                    for prediction in predictions
-                ]
+            else:
+                weighted_votes = np.average(
+                    np.asarray(masks, dtype=np.float32), axis=0, weights=weights
+                )
+                fused_mask = weighted_votes >= config.weighted_vote_threshold
+            if config.mask_fusion == "intersection":
+                confidence = min(confidence_values)
+            elif config.mask_fusion == "union":
                 confidence = max(confidence_values)
+            else:
+                confidence = float(
+                    np.average(
+                        confidence_values,
+                        weights=weights,
+                    )
+                )
+            logits = [prediction.mask_logits for prediction in all_predictions]
             fused_logits = None
-            logits = [prediction.mask_logits for prediction in predictions]
             if all(logit is not None for logit in logits):
                 stacked_logits = np.stack(logits)
-                fused_logits = (
-                    np.min(stacked_logits, axis=0)
-                    if config.mask_fusion == "intersection"
-                    else np.max(stacked_logits, axis=0)
-                )
+                if config.mask_fusion == "intersection":
+                    fused_logits = np.min(stacked_logits, axis=0)
+                elif config.mask_fusion == "union":
+                    fused_logits = np.max(stacked_logits, axis=0)
+                else:
+                    fused_logits = np.average(
+                        stacked_logits,
+                        axis=0,
+                        weights=weights,
+                    )
             global_seeds.append(record_to_seed(record, row, column))
             selected = np.zeros(valid.shape, dtype=bool)
             pixel_score = np.zeros(valid.shape, dtype=np.float32)
@@ -586,6 +646,7 @@ def evaluate_label_quality_from_raster(
             for outcome in outcomes
             if outcome["status"] not in accepted_statuses
         )
+        status_counts = Counter(outcome["status"] for outcome in outcomes)
         invalid_count = sum(reason_counts.values())
         in_grid_outcomes = [
             outcome for outcome in outcomes if outcome["status"] != "outside_grid"
@@ -612,6 +673,7 @@ def evaluate_label_quality_from_raster(
                 else 0.0
             ),
             "failure_reasons": dict(sorted(reason_counts.items())),
+            "status_counts": dict(sorted(status_counts.items())),
         }
     return {
         "shape": [dataset.height, dataset.width],

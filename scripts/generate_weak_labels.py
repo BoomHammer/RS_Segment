@@ -10,7 +10,7 @@ from pathlib import Path
 from config import load_config
 from data.labels import iter_encoded_labels
 from data.raster_alignment import target_grid_from_raster
-from data.sam_input import discover_sam_composites
+from data.sam_input import discover_sam_videos
 from data.weak_labels import WeakLabelGenerationConfig, generate_weak_labels
 from inference.sam2_backend import SAM2Inferencer
 
@@ -31,10 +31,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = load_config(args.config)
     weak_config = config.data.weak_labels
-    image_paths = (
-        (tuple(args.image),)
+    composite_names = (
+        ["命令行影像"]
         if args.image
-        else discover_sam_composites(
+        else [
+            f"CompositeBands{index}"
+            for index in range(1, 6)
+            if weak_config.get(f"CompositeBands{index}", [])
+        ]
+    )
+    image_paths, keyframe_index = (
+        (((tuple(args.image),),), 0)
+        if args.image
+        else discover_sam_videos(
             config.data.dynamic,
             [
                 weak_config.get(f"CompositeBands{index}", [])
@@ -42,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
             ],
         )
     )
-    reference_raster = args.reference_raster or image_paths[0][0]
+    reference_raster = args.reference_raster or image_paths[0][0][0]
     grid = target_grid_from_raster(
         reference_raster,
         target_crs=config.data.target_grid.get("crs", "EPSG:4326"),
@@ -70,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         or Path("SAM/sam2.1_hiera_small.pt"),
         device=args.device,
         input_range=(0.0, 255.0),
+        use_video=True,
     )
     generate_weak_labels(
         records,
@@ -105,8 +115,13 @@ def main(argv: list[str] | None = None) -> int:
             reject_boundary_touch=bool(weak_config.get("reject_boundary_touch", True)),
             conflict_margin=float(weak_config.get("conflict_margin", 0.05)),
             mask_fusion=str(weak_config.get("mask_fusion", "intersection")),
+            weighted_vote_threshold=float(
+                weak_config.get("weighted_vote_threshold", 0.5)
+            ),
             output_nodata=config.data.output_nodata,
         ),
+        keyframe_index=keyframe_index,
+        composite_names=composite_names,
     )
     print(f"弱标签: {output}")
     print(f"质量报告: {report}")
