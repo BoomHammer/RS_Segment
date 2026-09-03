@@ -48,12 +48,25 @@ def derive_model_contract(
     num_classes = int(mapping.get("minor_count") or len(classes))
     if not dynamic_features or not static_features or num_classes < 1:
         raise ValueError("阶段产物无法推导动态特征、静态特征或类别数")
+    ordered_classes = sorted(classes, key=lambda item: int(item["alliance_code"]))
+    # Some lightweight interface fixtures contain only minor_count.  They can
+    # still describe tensor dimensions, but cannot describe a real hierarchy.
+    fine_to_coarse = (
+        [int(item["formation_code"]) - 1 for item in ordered_classes]
+        if ordered_classes
+        else [0] * num_classes
+    )
+    major_count = int(mapping.get("major_count") or (max(fine_to_coarse) + 1))
+    if len(fine_to_coarse) != num_classes:
+        raise ValueError("标签映射的小类数量与 minor_count 不一致")
     return {
         "dynamic_features": dynamic_features,
         "static_features": static_features,
         "dynamic_features_count": len(dynamic_features),
         "static_features_count": len(static_features),
         "num_classes": num_classes,
+        "num_coarse_classes": major_count,
+        "fine_to_coarse": fine_to_coarse,
         "sample_index": str(Path(sample_index).resolve()),
         "label_mapping": str(Path(label_mapping).resolve()),
     }
@@ -76,7 +89,7 @@ def load_model_contract(config_path: str | Path, run: str | Path) -> dict[str, A
     label_mapping_path = (
         Path(label_mapping)
         if label_mapping != "auto"
-        else _discover(run, "label_mapping_*.json")
+        else _discover(run, "label_mapping*.json")
     )
     derived = derive_model_contract(sample_index_path, label_mapping_path)
     model["derived"] = derived

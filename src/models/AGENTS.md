@@ -33,7 +33,6 @@ P(fine) = P(coarse) * P(fine | coarse)
 
 #### 类别不平衡 (Class Imbalance)
 使用类别感知采样 (class-aware sampling)。罕见类别必须更频繁地出现，但不能过度重复单个样本。
-Focal Loss 仅可作为辅助选项使用，不要完全依赖 Focal Loss。
 联合训练粗分类和细分类。
 
 #### 地面调查样点+SAM生成的伪标签(Field truth labels + SAM weak-labels)

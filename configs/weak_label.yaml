@@ -1,0 +1,21 @@
+weak_label:
+  # SAM 输入组合，按 RGB 顺序排列；空列表表示不启用该组合。
+  CompositeBands1: [1, 4, 3]
+  CompositeBands2: [2, 1, 4]
+  CompositeBands3: [6, 2, 1]
+  CompositeBands4: [7, 6, 5]
+  CompositeBands5: []
+  mask_fusion: weighted_vote
+  weighted_vote_threshold: 0.5
+  input_window_size: [256, 256]
+  label_radius: 16
+  mask_confidence: 0.90
+  medium_confidence: 0.70
+  medium_label_radius: 8
+  fallback_radius: 8
+  spectral_distance_threshold: 0.12
+  logit_threshold: 0.5
+  reject_boundary_touch: true
+  conflict_margin: 0.05
+  input_range: [-100.0, 16000.0]
+  stretch_percentiles: [2.0, 98.0]

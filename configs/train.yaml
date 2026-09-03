@@ -1,1 +1,32 @@
-# 主训练配置
+# 主训练配置。数据路径和模型结构分别由 data.yaml、model.yaml 管理。
+training:
+  epochs: 1
+  amp_dtype: bfloat16
+  gradient_accumulation_steps: 4
+  seed: 42
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    patience: 5
+    min_delta: 0.0001
+
+optimizer:
+  name: adamw
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+scheduler:
+  name: cosine
+  warmup_ratio: 0.05
+
+gradient_clipping:
+  enabled: true
+  max_norm: 1.0
+
+ema:
+  enabled: true
+  decay: 0.99
+
+checkpoint:
+  filename: model_{timestamp}.pt

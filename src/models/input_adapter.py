@@ -148,4 +148,9 @@ class SegFormerUtaeInputAdapter(nn.Module):
         static = self.static(clean["static"])
         fused = self.fusion(torch.cat((temporal, static), dim=1))
         valid = clean["valid_mask"][:, None] & temporal_valid
-        return {"features": fused, "valid_mask": valid}
+        return {
+            "features": fused,
+            "dynamic_features": temporal,
+            "static_features": static,
+            "valid_mask": valid,
+        }

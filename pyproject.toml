@@ -28,6 +28,7 @@ dev = [
 [project.scripts]
 rs-check-data = "data_check:main"
 rs-compute-stats = "data_stats:main"
+rs-prepare-data = "prepare_data:main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["src"]

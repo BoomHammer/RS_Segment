@@ -9,6 +9,9 @@ model:
     projection_channels: 32
   fusion:
     output_channels: 96
+  regularization:
+    dropout: 0.1
+    drop_path: 0.05
   input:
     # 仅作为计算哨兵值；有效性由数据批次中的 mask 决定。
     invalid_fill_value: 0.0

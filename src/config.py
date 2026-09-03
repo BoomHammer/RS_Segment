@@ -29,7 +29,6 @@ class DataConfig:
     label_schema: dict[str, Any] = field(default_factory=dict)
     target_grid: dict[str, Any] = field(default_factory=dict)
     raster: dict[str, Any] = field(default_factory=dict)
-    weak_labels: dict[str, Any] = field(default_factory=dict)
     sampling: dict[str, Any] = field(default_factory=dict)
     stage2: dict[str, Any] = field(default_factory=dict)
     dynamic_filename: dict[str, Any] = field(default_factory=dict)
@@ -104,7 +103,6 @@ def load_config(path: str | Path) -> AppConfig:
             label_schema=dict(data.get("label_schema", {})),
             target_grid=dict(data.get("target_grid", {})),
             raster=dict(data.get("raster", {})),
-            weak_labels=dict(data.get("weak_labels", {})),
             sampling=dict(data.get("sampling", {})),
             stage2=stage2,
             dynamic_filename=dict(data.get("dynamic_filename", {})),

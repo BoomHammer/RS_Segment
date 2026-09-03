@@ -7,6 +7,8 @@ from typing import Any
 from torch import Tensor
 from torch.nn import functional as F
 
+from losses.hierarchical import hierarchical_supervision_loss
+
 
 def masked_cross_entropy(
     logits: Tensor,
@@ -26,14 +28,31 @@ def masked_cross_entropy(
 
 
 def combined_supervision_loss(
-    logits: Tensor,
+    logits: Tensor | dict[str, Tensor],
     batch: dict[str, Any],
     *,
     ground_truth_weight: float = 1.0,
     weak_label_weight: float = 0.5,
     ignore_index: int = -1,
+    fine_to_coarse: list[int] | None = None,
+    hierarchy_weight: float = 0.2,
+    class_weights: Tensor | None = None,
 ) -> dict[str, Tensor]:
     """Use ground truth and weak labels as two masked supervision sources."""
+
+    if isinstance(logits, dict):
+        if fine_to_coarse is None:
+            raise ValueError("层级输出需要 fine_to_coarse 映射")
+        return hierarchical_supervision_loss(
+            logits,
+            batch,
+            fine_to_coarse,
+            ground_truth_weight=ground_truth_weight,
+            weak_label_weight=weak_label_weight,
+            hierarchy_weight=hierarchy_weight,
+            class_weights=class_weights,
+            ignore_index=ignore_index,
+        )
 
     if logits.ndim != 4:
         raise ValueError("logits 必须是 [B, C, H, W]")

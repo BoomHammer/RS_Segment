@@ -1,6 +1,6 @@
 # RS-Segment
 
-基于弱监督学习的遥感植被语义分割项目。当前处于数据准备与 PointSAM 标签基础设施阶段，已提供数据目录检查、样点标签校验与编码、栅格空间对齐、GeoTIFF 流式统计和动态影像文件名解析；训练与推理入口暂未实现。
+基于弱监督学习的遥感植被语义分割项目。主流程采用 PointSAM 生成伪标签、窗口化数据集切分，以及 SegFormer-U-TAE 训练；所有大栅格均按窗口流式读取。
 
 ## 环境准备
 
@@ -18,7 +18,7 @@ uv sync --extra dev
 
 ## 配置文件
 
-数据相关命令通过 YAML 配置文件读取路径。默认配置为 [`configs/data.yaml`](configs/data.yaml)，主要结构如下：
+数据路径通过 [`configs/data.yaml`](configs/data.yaml) 配置，PointSAM 参数独立放在 [`configs/weak_label.yaml`](configs/weak_label.yaml)，模型和训练参数分别放在 `configs/model.yaml` 与 `configs/train.yaml`。
 
 ```yaml
 data:
@@ -59,129 +59,100 @@ data:
 
 | 文件或命令 | 作用 | 当前状态 |
 | --- | --- | --- |
-| `rs-check-data` / `scripts/check_data.py` | 检查数据目录、必需子目录和标签文件 | 可用 |
-| `scripts/preprocess.py` | 统一运行标签校验、类别映射和栅格统计 | 可用 |
+| `rs-prepare-data` / `scripts/prepare_data.py` | 无参数执行数据目录检查与栅格统计 | 可用 |
 | `scripts/validate_labels.py` | 单独运行样点读取、校验和类别映射 | 可用 |
-| `rs-compute-stats` / `scripts/compute_stats.py` | 按窗口流式计算 GeoTIFF 统计量 | 可用 |
 | `data.filename_parser` | 解析动态影像文件名并生成元数据 | 可用 |
-| `scripts/stage2.py` | 根据阶段1 run 目录统一生成阶段2索引、空间划分、验证和基准报告 | 可用 |
-| `scripts/train.py` | 训练入口 | 预留，尚未实现 |
+| `scripts/weak_label.py` | 使用 PointSAM 生成伪标签及质量报告 | 可用 |
+| `scripts/datasets.py` | 根据伪标签 run 生成样本索引、空间划分、验证和基准报告 | 可用 |
+| `scripts/train.py` | 使用准备好的窗口数据集训练 SegFormer-U-TAE | 可用 |
+| `scripts/stage2.py` | `datasets.py` 的历史兼容入口 | 兼容 |
 | `scripts/predict.py` | 推理入口 | 预留，尚未实现 |
-| `scripts/test.py` | 测试入口 | 预留；当前使用 pytest |
+| `scripts/test.py` | 在空间测试集上评估 checkpoint | 可用 |
 
 ## 命令行用法
 
-### 1. 检查数据目录
+### 1. 数据准备
 
 安装项目后推荐使用：
 
 ```bash
-uv run rs-check-data --config configs/data.yaml
+uv run rs-prepare-data
 ```
+
+该命令固定读取 `configs/data.yaml`，先检查目录、标签文件和配置，再计算或复用栅格统计结果。
 
 不安装命令行脚本时可使用：
 
 ```bash
-uv run python scripts/check_data.py --config configs/data.yaml
+uv run python scripts/prepare_data.py
 ```
 
-命令会检查配置中的数据根目录、`required_subdirectories` 指定的目录、`labels`、`raw` 以及可选的 `label_file`。
+### 2. 独立生成 PointSAM 伪标签
 
-返回码：
-
-- `0`：检查通过
-- `1`：数据目录或标签文件缺失
-- `2`：配置无法读取或格式无效
-
-### 2. 计算 GeoTIFF 流式统计量
-
-命令默认读取 `configs/data.yaml`，一次扫描配置中的 `data/raw/dynamic` 和
-`data/raw/static` 两个目录，对其中全部顶层 `.tif` 影像计算统计量，并将结果缓存到
-`data/processed`：
+伪标签生成是主流程的第一步，会自动创建 `data/processed/<YYYYMMDD_HHMMSS>`，并将标签映射、GeoTIFF 伪标签和质量报告写入其中：
 
 ```bash
-uv run rs-compute-stats
+uv run python scripts/weak_label.py
 ```
 
-默认输出文件名类似 `raster_stats_20260831_163000.json`。也可以通过 `--output` 指定
-输出位置，但建议仍放在 `data/processed`：
+PointSAM 参数统一配置在 [`configs/weak_label.yaml`](configs/weak_label.yaml)，数据路径和标签字段配置在 [`configs/data.yaml`](configs/data.yaml)。
+
+### 3. 主流程：准备数据集和训练
+
+完成上一节的伪标签生成后，继续执行以下命令：
 
 ```bash
-uv run rs-compute-stats \
-  --output data/processed/raster_stats_manual.json \
-  --band 1 \
-  --window-size 512 512 \
-  --nodata -9999
-```
-
-可用参数：
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--config` | `configs/data.yaml` | YAML 配置文件 |
-| `--output` | 自动生成 | 输出 JSON 路径；默认写入 `data.processed` 并添加时间戳 |
-| `--band` | `1` | 要统计的波段编号 |
-| `--window-size WIDTH HEIGHT` | `1024 1024` | 分块读取窗口大小 |
-| `--nodata` | 配置值 | 覆盖 `data.raster.nodata` |
-
-统计过程按窗口读取影像，不会把整幅大图一次性载入内存；`NaN`、正负无穷和 NoData 像元会被排除。输出按类别组织：普通动态影像按文件名中的系列（如 `LST`）分组，带波段的 `SR230101B1.tif`、`SR230102B1.tif` 等按 `SR_B1` 分组，静态影像按文件名主干（如 `DSM`）分组。每个类别包含独立的 `statistics` 和 `files` 明细，动态与静态类别统一列在 `groups` 数组中。
-
-命令会先检查 `data/processed/raster_stats_*.json` 中是否存在匹配缓存。只要输入影像的路径、文件大小、修改时间以及统计参数均未变化，就直接复用已有 JSON，不重复计算。
-
-实际计算时使用单行进度条显示整体处理进度，不会为每个影像单独打印日志。
-
-示例输出结构：
-
-```json
-{
-  "schema_version": 3,
-  "band": 1,
-  "window_size": [1024, 1024],
-  "nodata": -9999,
-  "groups": [
-    {
-      "category": "SR_B1",
-      "statistics": {
-        "count": 123456,
-        "mean": 0.42,
-        "variance": 0.03,
-        "standard_deviation": 0.17
-      },
-      "files": [
-        {
-          "path": "data/raw/dynamic/SR230101B1.tif",
-          "date": "2023-01-01",
-          "count": 123456,
-          "mean": 0.42,
-          "variance": 0.03,
-          "standard_deviation": 0.17
-        }
-      ]
-    }
-  ]
-}
-```
-
-动态文件明细会带有 `date`（日尺度）或 `month`（月尺度）字段；静态文件明细不包含时间字段。处理过程中，进度条末尾会显示当前正在处理的文件名。
-
-### 3. 运行统一预处理
-
-推荐使用统一入口。每次运行会在 `data/processed` 下创建一个时间目录，并写入同一批次的三个产物：
-
-```bash
-uv run python scripts/preprocess.py --config configs/data.yaml
+uv run python scripts/datasets.py data/processed/<YYYYMMDD_HHMMSS>
+uv run python scripts/train.py data/processed/<YYYYMMDD_HHMMSS>
 ```
 
 目录结构如下：
 
 ```text
 data/processed/<YYYYMMDD_HHMMSS>/
-├── label_mapping_<时间>.json
-├── label_validation_<时间>.json
-└── raster_stats_<时间>.json
+├── label_mapping.json
+├── weak_labels.tif
+├── weak_labels_quality.json
+├── weak_labels_quality.png
+├── sample_index.json
+├── spatial_split.json
+├── stage2_validation.json
+├── stage2_benchmark.json
+└── raster_stats_stage2.json
 ```
 
-标签校验包含 CSV 字段检查、坐标 CRS 与 WGS84 范围检查、重复点/冲突类别检查、未知类别检查和类别统计。标签读取按批次进行，不会一次性载入整个 CSV；栅格统计按窗口流式读取。
+训练完成后，关键训练产物写入：
+
+```text
+experiments/<YYYYMMDD_HHMMSS>/
+├── model_<YYYYMMDD_HHMMSS>.pt
+├── train_log.json
+├── train.yaml
+├── model.yaml
+├── data.yaml
+└── test_metrics.json
+```
+
+每次训练均使用训练启动时间创建独立实验目录，因此同一数据集可以重复训练。`train_log.json` 合并保存训练元数据、每个 epoch 的 loss/accuracy、验证指标、学习率、最佳 epoch 和早停信息。
+
+训练完成后，只需将 checkpoint 作为测试入口参数。程序会从同目录的 `train_log.json` 自动找到训练数据和配置：
+
+```bash
+uv run python scripts/test.py experiments/<训练实验时间戳>/model_<训练实验时间戳>.pt
+```
+
+测试默认使用 `spatial_split.json` 中的 `test` 划分，并只在实测样点上统计指标。
+可用 `--split validation` 测试验证集，或用 `--max-windows` 限制窗口数量进行快速检查。
+测试结果直接写入 checkpoint 所在的实验目录：
+
+```text
+experiments/<YYYYMMDD_HHMMSS>/
+├── train_log.json     # 训练配置、来源和完整训练过程
+├── test_metrics.json  # loss、Accuracy、Precision、Recall、F1、ROC/AUC、MSE、MAE、IoU
+└── model_<YYYYMMDD_HHMMSS>.pt
+```
+
+训练入口可通过 `--data-config`、`--config`、`--train-config`、`--epochs` 和 `--device` 覆盖默认设置；测试入口只需提供 checkpoint，另支持 `--split`、`--max-windows` 和 `--device`。
 
 如只需检查标签：
 
@@ -189,32 +160,11 @@ data/processed/<YYYYMMDD_HHMMSS>/
 uv run python scripts/validate_labels.py --config configs/data.yaml
 ```
 
-### 4. 阶段2数据流程
-
-阶段1完成后，只需把阶段1生成的 run 目录作为唯一必填参数传给阶段2入口：
-
-```bash
-uv run python scripts/stage2.py data/processed/<YYYYMMDD_HHMMSS>
-```
-
-阶段2会自动从该目录发现 `weak_labels.tif`、`raster_stats_*.json` 和
-`label_mapping_*.json`；如果阶段1跳过了栅格统计，会按 `configs/data.yaml` 的配置在
-同一目录补算统计量。所有阶段2产物均写入该 run 目录：
-
-```text
-data/processed/<YYYYMMDD_HHMMSS>/
-├── sample_index.json
-├── spatial_split.json
-├── stage2_validation.json
-├── stage2_benchmark.json
-└── raster_stats_stage2.json       # 阶段1未生成统计量时才会出现
-```
-
-阶段2的特征清单、时间范围、缺帧策略、窗口大小和步长、空间块划分、采样、
+数据集阶段的特征清单、时间范围、缺帧策略、窗口大小和步长、空间块划分、采样、
 DataLoader worker、缓存、BF16、梯度累积及基准批次数均在
 `configs/data.yaml` 的 `data.stage2` 中配置，不需要重复写入命令行。
 
-### 5. 解析动态影像文件名
+### 4. 解析动态影像文件名
 
 解析目录下顶层的 `.tif` 文件，并生成 JSON 或 YAML 元数据：
 
@@ -254,15 +204,6 @@ uv run ruff format --check .
 
 测试文件当前位于 [`scripts/test`](scripts/test)；pytest 配置已在 `pyproject.toml` 中设置测试路径和 `src` 导入路径。
 
-## 数据目录约定
 
-```text
-data/
-├── labels/                 # 标签 CSV
-├── raw/
-│   ├── dynamic/             # 动态遥感影像
-│   └── static/              # 静态遥感影像
-└── processed/               # 预处理数据
-```
 
-训练、PointSAM 弱监督标签生成、SegFormer-U-TAE 模型和带重叠滑窗及高斯加权的全图推理将在后续阶段接入。
+PointSAM 弱监督标签生成、SegFormer-U-TAE 训练和数据集切分已接入；带重叠滑窗及高斯加权的全图推理将在后续阶段接入。

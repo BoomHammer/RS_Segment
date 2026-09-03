@@ -7,13 +7,15 @@ import json
 from itertools import chain, islice
 from pathlib import Path
 
+import yaml
+
 from config import load_config
 from data.labels import iter_encoded_labels
 from data.raster_alignment import target_grid_from_raster
-from data.sam_input import discover_sam_videos
-from data.weak_labels import WeakLabelGenerationConfig, generate_weak_labels
 from inference.sam2_backend import SAM2Inferencer
 from preprocessing import run_preprocessing
+from weak_label.generation import WeakLabelGenerationConfig, generate_weak_labels
+from weak_label.sam_input import discover_sam_videos
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -43,7 +45,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    weak_config = config.data.weak_labels
+    with Path("configs/weak_label.yaml").open(encoding="utf-8") as stream:
+        weak_config = dict((yaml.safe_load(stream) or {}).get("weak_label", {}))
     if args.skip_statistics:
         print("已跳过全量栅格统计量计算。")
     run_dir = run_preprocessing(

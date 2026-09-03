@@ -1,4 +1,4 @@
-"""Run the complete stage-2 data pipeline for one stage-1 run directory."""
+"""Create and validate a training dataset in a weak-label run directory."""
 
 from __future__ import annotations
 
@@ -34,16 +34,16 @@ def _artifact(run: Path, pattern: str) -> Path | None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="运行阶段2数据处理全流程")
-    parser.add_argument("run", type=Path, help="阶段1 preprocess.py 生成的结果目录")
+    parser = argparse.ArgumentParser(description="切分并验证训练数据集")
+    parser.add_argument("run", type=Path, help="weak_label.py 生成的结果目录")
     args = parser.parse_args(argv)
     run = args.run.resolve()
     if not run.is_dir():
-        raise NotADirectoryError(f"阶段1结果目录不存在: {run}")
+        raise NotADirectoryError(f"伪标签结果目录不存在: {run}")
     config = load_config(Path("configs/data.yaml"))
     weak_label = run / "weak_labels.tif"
     if not weak_label.exists():
-        raise FileNotFoundError(f"阶段1结果目录缺少弱标签: {weak_label}")
+        raise FileNotFoundError(f"伪标签结果目录缺少弱标签: {weak_label}")
     stage2 = copy.deepcopy(config.data.stage2)
     statistics = _artifact(run, "raster_stats_*.json")
     if statistics is None:
@@ -134,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         benchmark_report = {"enabled": False}
     write_stage2_report(benchmark_report, run / "stage2_benchmark.json")
-    print(f"阶段2产物: {run}")
+    print(f"数据集产物: {run}")
     return 0
 
 

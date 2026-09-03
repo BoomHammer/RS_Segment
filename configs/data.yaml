@@ -55,43 +55,6 @@ data:
     # 输入栅格声明的默认 NoData 值；实际文件元数据优先。
     nodata: -9999
 
-  # 稀疏弱标签生成参数。输入窗口仅提供上下文，最终标签严格限制在样点附近。
-  weak_labels:
-    # SAM 输入组合，均按 RGB 顺序排列；空值组合不会参与推理。
-    CompositeBands1: [1, 4, 3]  # 真彩色
-    CompositeBands2: [2, 1, 4]  # 标准假彩色
-    CompositeBands3: [6, 2, 1]  # 短波红外/农业假彩色
-    CompositeBands4: [7, 6, 5]  # 穿透大气/地质组合
-    CompositeBands5: []
-    # mask 融合方式：intersection、union 或 weighted_vote。
-    mask_fusion: weighted_vote
-    # weighted_vote 的最小加权投票比例，0.5 表示加权半数通过，值越大要求越严格。
-    weighted_vote_threshold: 0.5
-    # SAM 读取的局部上下文窗口大小，单位为目标栅格像元。
-    input_window_size: [256, 256]
-    # 高置信度 SAM mask 最终允许写入的最大样点半径。
-    label_radius: 16
-    # 高置信度 SAM mask 的整体质量分数阈值。
-    mask_confidence: 0.90
-    # 中等置信度区间的下限；低于此值进入光谱回退。
-    medium_confidence: 0.70
-    # 中等置信度 mask 使用的较小标签半径。
-    medium_label_radius: 8
-    # 光谱回退搜索的最大样点半径。
-    fallback_radius: 8
-    # 归一化 RGB 光谱距离阈值，越小越严格。
-    spectral_distance_threshold: 0.12
-    # mask logits 转为像元置信度后的最小阈值。
-    logit_threshold: 0.5
-    # 是否丢弃接触局部输入窗口边缘的 SAM mask。
-    reject_boundary_touch: true
-    # 两个类别分数接近到此范围内时，认为像元存在冲突并置为 NoData。
-    conflict_margin: 0.05
-    # MOD09A1 原始缩放整数的合理范围（实际反射率乘以 0.0001）。
-    input_range: [-100.0, 16000.0]
-    # 使用全局采样统计进行每个 RGB 波段的线性拉伸。
-    stretch_percentiles: [2.0, 98.0]
-
   # 样点抽样策略；all 表示默认使用全部有效样点。
   sampling:
     strategy: all
