@@ -2,110 +2,109 @@
 
 ## 当前阶段
 
-**阶段 3：模型架构开发。**
+**阶段 5：模型推理开发。**
 
-阶段 1 已完成，阶段 2 的数据加载与多分辨率融合基础设施已完成验收，当前可以基于统一数据接口开发 SegFormer-U-TAE 模型。
+训练和测试闭环已经具备，当前可以开始开发基于 checkpoint 的全图预测与无缝输出。
 
 ## 阶段状态总览
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
 | 阶段 1 | 数据准备与弱监督标签生成 | 已完成 |
-| 阶段 2 | 数据加载与多分辨率融合 | 已完成，可作为阶段 3 输入 |
-| 阶段 3 | SegFormer-U-TAE 模型架构 | 进行中 |
-| 阶段 4 | 层级化损失与长尾类别处理 | 未开始 |
-| 阶段 5 | 重叠滑窗无缝推理 | 未开始 |
+| 阶段 2 | 数据加载与多分辨率融合 | 已完成 |
+| 阶段 3 | SegFormer-U-TAE 模型、训练与验证 | 已完成 |
+| 阶段 4 | 层级化损失与长尾类别处理 | 已完成 |
+| 阶段 5 | 重叠滑窗无缝推理与全图预测 | 待开发 |
 
 ## 阶段 1：数据准备与弱监督标签生成
 
-阶段 1 核心功能已完成。
+阶段 1 已完成：
 
-- [x] 项目初始化、YAML 配置加载、数据目录检查和基础工具。
-- [x] 全局统计量计算：GeoTIFF 分块流式读取、NoData/NaN/Inf 排除、Welford 统计、分组统计和 JSON 缓存。
-- [x] 标签 CSV 流式读取、字段映射、坐标/类别校验、层级类别编码和验证报告。
-- [x] PointSAM 接口、NPC prompt 适配、标签质量评估和可视化检查。
-- [x] NPC 负样本校准：正样本扩张、候选负样本生成、置信度过滤和层级约束。
-- [x] SAM2.1 small 后端：point prompt、RGB 输入、CUDA AMP、标准化输出和视频传播。
-- [x] 多波段组合及时序伪标签融合：支持交集、并集和加权多数投票。
-- [x] 弱标签 GeoTIFF 生成：窗口流式读取、样点半径限制、置信度过滤、边界处理和质量报告。
-- [x] 阶段 1 验证：已生成实际弱标签产物并完成样点状态、类别覆盖和质量检查。
+- [x] YAML 配置、数据目录检查、随机种子和基础工具。
+- [x] GeoTIFF 分块流式统计、NoData/NaN/Inf 排除和 JSON 缓存。
+- [x] 标签 CSV 流式读取、字段映射、坐标/类别校验和层级编码。
+- [x] PointSAM、NPC prompt、SAM2.1 small 后端和弱标签 GeoTIFF 生成。
+- [x] 弱标签质量评估、类别分布、样点状态和可视化报告。
 
-### 阶段 1 统一入口
+统一入口：
 
-```text
+```bash
 uv run python scripts/preprocess.py
 ```
-### 阶段 1 可选优化
 
-- [ ] 编译 SAM2 CUDA 扩展 `_C`。当前机器缺少 MSVC `cl.exe`，不影响主体推理。
-- [ ] 降低 `spectral_fallback_accepted` 比例，并评估圆形回退标签对训练的影响。
+可选优化：编译 SAM2 CUDA 扩展，以及继续评估光谱回退标签质量；二者不阻塞后续模型开发。
 
 ## 阶段 2：数据加载与多分辨率融合
 
-阶段 2 已完成，所有任务均已实现：
+阶段 2 已完成并通过合成数据、真实窗口和全量测试验证：
 
-- [x] 2.1 统一动态影像、静态影像、地面真实值 CSV 和弱标签 GeoTIFF 的样本索引及元数据协议。
-- [x] 2.2 基于 TorchGeo 的空间查询和 GeoTIFF 窗口级懒加载，禁止全量栅格载入内存。
-- [x] 2.3 多分辨率对齐：连续变量使用连续重采样，分类标签使用 nearest 重采样。
-- [x] 2.4 多时相动态数据发现、分组、确定性特征顺序和时间轴生成。
-- [x] 2.5 缺帧、不同时序分辨率和不等长序列协议，包含时间编码、时间掩码和批内 padding。
-- [x] 2.6 样点、弱标签和目标网格到窗口索引的转换，包含边界裁剪、有效像元掩码和状态记录。
-- [x] 2.7 按空间块划分训练/验证/测试集，避免相邻窗口泄漏，并记录类别统计和长尾权重。
-- [x] 2.8 多源特征窗口读取、全局统计量归一化和 NoData/NaN/Inf/有效性掩码统一处理。
-- [x] 2.9 TorchGeo/PyTorch `Dataset`、采样器和 `collate_fn`，支持加权采样、时序 padding 和多进程读取。
-- [x] 2.10 多源栅格、时序帧、分类标签和有效性掩码的同步空间增强，以及连续特征光谱增强。
-- [x] 2.11 阶段 2 数据配置、特征清单、波段顺序、时间范围、窗口、采样、划分和 worker 参数校验。
-- [x] 2.12 合成数据和真实含标签窗口验证。
-- [x] 2.13 4090 数据加载吞吐与显存基准，并记录 BF16、梯度累积和 DataLoader 默认值。
+- [x] 统一动态影像、静态影像、实测样点和弱标签的数据索引协议。
+- [x] TorchGeo 窗口级懒加载，多分辨率对齐和流式栅格读取。
+- [x] 多时相分组、特征顺序、缺帧处理、时间编码和批内 padding。
+- [x] 有效性掩码、NoData/NaN/Inf 处理、归一化和同步空间增强。
+- [x] 空间块级 train/validation/test 划分，避免相邻窗口泄漏。
+- [x] DataLoader、采样器、长尾类别权重和 4090 显存/吞吐配置。
 
-### 阶段 2 统一入口
+入口：
 
-```text
-uv run python scripts/stage2.py <run>
+```bash
+uv run python scripts/datasets.py data/processed/<YYYYMMDD_HHMMSS>
 ```
 
-`<run>` 是 `scripts/preprocess.py` 生成的结果目录。阶段 2 产物均写入该目录，包括：
+## 阶段 3/4：模型训练与测试
 
-- `sample_index.json`
-- `spatial_split.json`
-- `stage2_validation.json`
-- `stage2_benchmark.json`
+训练和测试功能已实现，可以进行多次独立训练比较：
 
-### 阶段 2 验收结论
+- [x] SegFormer-U-TAE 风格多尺度模型、动态时序编码和静态特征融合。
+- [x] 层级 coarse/fine 输出、实测标签与弱标签掩码监督。
+- [x] AdamW、Linear Warmup + Cosine Decay、BF16 AMP、梯度累积。
+- [x] Gradient Clipping、EMA、Dropout、DropPath 和 validation early stopping。
+- [x] 每轮保存 loss、accuracy、validation loss/accuracy、学习率等训练历史。
+- [x] 测试输出 fine/coarse 的 Accuracy、Precision、Recall、F1、IoU、ROC/AUC、MSE、MAE 和混淆矩阵。
 
-- 空间划分清单已同时生成 `train`、`validation` 和 `test` 三个子集。
-- 真实验收会从 CSV 样点反查并检查含地面真实值的窗口，避免只验证无标签背景窗口。
-- 最近一次真实验收窗口包含 11 和 1 个地面真实值像元，同时包含弱标签像元。
-- 当前测试数据实际观测到 32 个类别；这是测试数据覆盖范围，不代表数据协议只支持 32 类。协议面向 70 余个细分类别。
-- 当前已完成数据构建和数据加载基础设施，但尚未完成模型训练、验证和测试闭环。
+训练命令：
 
-## 当前项目状态
+```bash
+uv run python scripts/train.py data/processed/<YYYYMMDD_HHMMSS>
+```
 
-- 分支：`feat/DataLoad`，与 `origin/feat/DataLoad` 同步。
-- 阶段 2 数据管线、配置、测试和文档存在未提交变更。
-- 阶段 2 统一入口和数据接口已经可以供阶段 3 使用。
-- `scripts/train.py`、`scripts/predict.py` 尚未实现；`src/models/` 和 `src/losses/` 尚处于目录约定阶段。
+每次训练按照训练启动时间创建独立目录：
+
+```text
+experiments/<训练开始时间>/
+├── model_<训练开始时间>.pt
+├── train_log.json
+├── train.yaml
+├── model.yaml
+├── data.yaml
+└── test_metrics.json       # 执行测试后生成
+```
+
+测试命令：
+
+```bash
+uv run python scripts/test.py experiments/<训练开始时间>/model_<训练开始时间>.pt
+```
+
+`train_log.json` 保存训练数据来源、配置快照、逐 epoch 历史、最佳模型和早停信息，保证 checkpoint 与数据集对应。
+
+## 阶段 5：模型推理开发
+
+当前训练和测试功能已经完成，因此可以开始预测模块开发。当前 [scripts/predict.py](scripts/predict.py) 仍为空，尚不能生成全图预测结果。
+
+待实现内容：
+
+1. 只输入 checkpoint，自动读取 `train_log.json`、`data.yaml`、特征顺序、统计量和类别映射。
+2. 实现重叠滑窗、边界窗口处理和流式推理，避免整幅栅格进入内存。
+3. 使用高斯权重融合窗口结果，消除接缝和方块效应。
+4. 输出带 CRS、transform、nodata 和类别映射信息的 GeoTIFF。
+5. 增加小区域预测、全图预测、边界一致性和 4090 显存峰值测试。
 
 ## 验证状态
 
-- [x] `pytest`：37 项通过，存在来自 rasterio 的弃用提示，无失败。
+- [x] `pytest`：43 项通过；仅有 rasterio 的弃用提示。
 - [x] `ruff check .`：通过。
-- [x] 新增阶段 2 文件的 Ruff 格式检查：通过。
-- [ ] `ruff format --check .`：项目中仍有 4 个既有 Python 文件存在格式差异，未纳入本次阶段 2 改动。
-
-## 阶段 3 入口与后续计划
-
-阶段 3 首要任务是实现并验证以下模型链路：
-
-- [x] 阶段 3 输入契约：由 `sample_index.json` 和标签映射 JSON 自动推导动态特征数、静态特征数和类别数。
-- [x] 阶段 3 输入适配：使用有效性掩码排除 NaN/Inf，保留有效物理零值，并提供 U-TAE 风格时序聚合和静态特征融合。
-- [x] 阶段 3 监督接口：地面真实值与弱标签分别按有效性掩码参与损失计算，并完成 1-based 标签到 PyTorch 0-based 标签的转换。
-- 动态时序特征编码，消费 `[B, T, F, H, W]` 数据和时间掩码。
-- 静态特征编码与动态特征融合。
-- SegFormer 、U-TAE 和 70 余类分割输出头。
-- 与地面真实值标签、弱标签及其有效性掩码对接的训练接口。
-
-后续阶段：
-
-1. 阶段 4：实现层级化损失函数、弱监督损失和长尾类别处理。
-2. 阶段 5：实现重叠滑窗、全局统计常量和高斯加权的无缝推理，输出无明显接缝的 GeoTIFF。
+- [x] 训练入口已完成真实数据单 epoch 冒烟训练。
+- [x] 测试入口已完成 checkpoint 加载和测试指标输出验证。
+- [ ] 预测入口及全图无缝推理尚未实现。
+- [ ] 多 epoch 训练效果和最终制图质量尚待实验验收。
