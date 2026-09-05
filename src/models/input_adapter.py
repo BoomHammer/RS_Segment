@@ -147,7 +147,11 @@ class SegFormerUtaeInputAdapter(nn.Module):
         )
         static = self.static(clean["static"])
         fused = self.fusion(torch.cat((temporal, static), dim=1))
-        valid = clean["valid_mask"][:, None] & temporal_valid
+        # A missing dynamic branch is allowed when another input branch has
+        # data. The dataset-level mask is authoritative and marks NoData only
+        # when every input source is invalid at that pixel.
+        del temporal_valid
+        valid = clean["valid_mask"][:, None]
         return {
             "features": fused,
             "dynamic_features": temporal,

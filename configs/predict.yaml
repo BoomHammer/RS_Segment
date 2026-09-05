@@ -1,0 +1,60 @@
+# 全图预测配置。
+# 当前 scripts/predict.py 仍通过命令行读取已实现的参数；本文件用于统一保存
+# 预测策略，后续接入配置加载后可直接作为默认配置。
+
+predict:
+  # 模型权重。为空时由命令行提供 checkpoint。
+  checkpoint: null
+
+  # 输出文件；为空时根据 checkpoint 文件名自动生成。
+  output: null
+  # 是否用所有地面实测标签覆盖结果图中的对应像素；false 表示保留模型预测。
+  override_ground_truth: true
+  # 类别映射 CSV 输出文件；为空时根据 checkpoint 文件名自动生成。
+  mapping_output: null
+  # 是否允许覆盖已有输出文件；false 时发现同名文件会直接报错。
+  overwrite: false
+
+  # 滑窗参数，顺序为 [width, height]。
+  # 512 可以减少窗口调度和文件读取次数；显存不足时退回 256。
+  window_size: [128, 128]
+
+  # 推荐的质量/速度折中配置。512 窗口配 384 步长仍保留重叠融合。[256, 256] 窗口配 [192, 192] 步长。
+  # 若优先速度，可设为 [512, 512]，但会取消重叠融合。
+  stride: [96, 96]
+
+  # 推理设备；cuda、cpu 或 auto。
+  device: cuda
+
+  # CUDA 推理使用 BF16 自动混合精度。
+  amp:
+    enabled: true
+    dtype: bfloat16
+
+  # 批量推理参数。
+  # 当前 predict.py 是单窗口串行推理，batch_size 目前仅作为目标配置记录。
+  # 512 窗口和较长时间序列下，4090 建议先从 2 开始；显存充足时再增大。
+  batch_size: 2
+
+  # 数据读取和预取参数。
+  dataloader:
+    num_workers: 6
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+
+  # 预测阶段 CPU 线程数。null 表示使用 PyTorch 默认值。
+  # 线程过多可能与 Rasterio/GDAL 争抢 CPU，建议先从 4 或 8 测试。
+  cpu_threads: 8
+
+  # 重叠窗口融合参数。
+  blending:
+    method: gaussian
+    sigma_scale: 0.35
+
+  # GeoTIFF 输出参数。
+  output_raster:
+    compress: deflate
+    predictor: 2
+    bigtiff: IF_SAFER
+    write_row_block: 512

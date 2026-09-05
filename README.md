@@ -18,42 +18,9 @@ uv sync --extra dev
 
 ## 配置文件
 
-数据路径通过 [`configs/data.yaml`](configs/data.yaml) 配置，PointSAM 参数独立放在 [`configs/weak_label.yaml`](configs/weak_label.yaml)，模型和训练参数分别放在 `configs/model.yaml` 与 `configs/train.yaml`。
-
-```yaml
-data:
-  root: ../data
-  labels: ../data/labels
-  raw: ../data/raw
-  dynamic: ../data/raw/dynamic
-  static: ../data/raw/static
-  processed: ../data/processed
-  label_file: ../data/labels/traindata20250626ori.csv
-  output_nodata: -9999
-  label_crs: EPSG:4326
-  label_schema:
-    columns:
-      index: Index
-      x: X
-      y: Y
-      formation: Eng_Formation
-      alliance: Eng_Alliance
-      chn_formation: Formation
-      chn_alliance: Alliance
-  target_grid:
-    crs: EPSG:4326
-    resolution: [0.00225, 0.00225]
-  raster:
-    nodata: -9999
-```
+数据路径通过 [`configs/data.yaml`](configs/data.yaml) 配置，PointSAM 参数独立放在 [`configs/weak_label.yaml`](configs/weak_label.yaml)，模型和训练参数分别放在 `configs/model.yaml` 与 [`configs/train.yaml`](configs/train.yaml)，全图预测参数放在 [`configs/predict.yaml`](configs/predict.yaml)。
 
 相对路径均相对于配置文件所在目录解析，而不是相对于当前 shell 目录解析。提交命令前，请根据本地数据位置调整配置。
-
-标签契约中 `formation` 是英文大类字段，`alliance` 是英文小类字段，分别对应
-`Eng_Formation` 和 `Eng_Alliance`；中文字段只用于输出映射。`Index` 保留为样点自身编号，类别编码使用 `formation_code` 和 `alliance_code`。`output_nodata` 是输出结果的无效值，默认为 `-9999`。
-
-`target_grid` 规定所有空间对齐和样点定位使用的目标 CRS 与分辨率。默认是 WGS84、
-`0.00225°`；如需使用 Albers 等面积投影，可改为对应 CRS 和 `250` 米分辨率。
 
 ## 程序入口
 
@@ -66,8 +33,9 @@ data:
 | `scripts/datasets.py` | 根据伪标签 run 生成样本索引、空间划分、验证和基准报告 | 可用 |
 | `scripts/train.py` | 使用准备好的窗口数据集训练 SegFormer-U-TAE | 可用 |
 | `scripts/stage2.py` | `datasets.py` 的历史兼容入口 | 兼容 |
-| `scripts/predict.py` | 推理入口 | 预留，尚未实现 |
+| `scripts/predict.py` | 重叠滑窗全图推理和 GeoTIFF 输出 | 可用 |
 | `scripts/test.py` | 在空间测试集上评估 checkpoint | 可用 |
+| `rs-pipeline` / `src/pipeline.py` | 串联数据准备、训练、测试和全图预测 | 可用 |
 
 ## 命令行用法
 
@@ -85,6 +53,28 @@ uv run rs-prepare-data
 
 ```bash
 uv run python scripts/prepare_data.py
+```
+
+### 1.1 一键完成全流程
+
+推荐在项目根目录执行下面的命令。它会依次创建预处理 run、生成 PointSAM 弱标签、建立窗口索引和空间划分、训练模型、计算测试指标，并生成全图预测 GeoTIFF 及类别对照表：
+
+```bash
+uv run rs-pipeline
+```
+
+也可以不安装命令行脚本直接运行：
+
+```bash
+uv run python -m pipeline
+```
+
+常用覆盖参数如下：
+
+```bash
+uv run rs-pipeline --epochs 30 --device cuda
+uv run rs-pipeline --data-config configs/data.yaml --model-config configs/model.yaml \
+  --train-config configs/train.yaml --predict-config configs/predict.yaml
 ```
 
 ### 2. 独立生成 PointSAM 伪标签
@@ -164,7 +154,32 @@ uv run python scripts/validate_labels.py --config configs/data.yaml
 DataLoader worker、缓存、BF16、梯度累积及基准批次数均在
 `configs/data.yaml` 的 `data.stage2` 中配置，不需要重复写入命令行。
 
-### 4. 解析动态影像文件名
+`data.stage2.split` 的 `ratios` 按 `[train, validation, test]` 顺序配置空间划分比例；
+划分以空间块为不可拆分单元，并根据地面实测类别进行分层分配，减少验证集或测试集缺少类别的情况。
+`data.stage2.sampling.split: train` 仅表示训练阶段的加权采样从 `train` 划分取样。
+伪标签只进入训练损失，验证和测试指标只使用地面实测标签。
+
+### 4. 全图预测
+
+使用训练 checkpoint 执行重叠滑窗推理：
+
+```bash
+uv run python scripts/predict.py \
+  experiments/<训练实验时间戳>/model_<训练实验时间戳>.pt \
+  --config configs/predict.yaml
+```
+
+预测参数包括窗口大小、步长、高斯融合、设备、AMP 和输出压缩方式。默认情况下，结果图完全来自模型预测；
+如果需要将所有地面实测标签写回结果图对应像素，在 `configs/predict.yaml` 中设置：
+
+```yaml
+predict:
+  override_ground_truth: true
+```
+
+该覆盖只作用于输出 GeoTIFF，不会改变模型推理或训练数据。
+
+### 5. 解析动态影像文件名
 
 解析目录下顶层的 `.tif` 文件，并生成 JSON 或 YAML 元数据：
 
@@ -204,6 +219,4 @@ uv run ruff format --check .
 
 测试文件当前位于 [`scripts/test`](scripts/test)；pytest 配置已在 `pyproject.toml` 中设置测试路径和 `src` 导入路径。
 
-
-
-PointSAM 弱监督标签生成、SegFormer-U-TAE 训练和数据集切分已接入；带重叠滑窗及高斯加权的全图推理将在后续阶段接入。
+完整流程会在 `data/processed/<时间戳>/` 保存数据准备和数据集产物，在 `experiments/<时间戳>/` 保存 checkpoint、配置快照、训练日志、测试指标以及预测结果。预测使用重叠滑窗和高斯融合，默认按配置写出 GeoTIFF；所有阶段按窗口流式读取，不会把 100GB 级原始栅格一次性加载到内存。

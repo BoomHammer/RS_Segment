@@ -1,0 +1,4 @@
+data:
+  stage2:
+    statistics_file: stats.json
+    split_file: split.json

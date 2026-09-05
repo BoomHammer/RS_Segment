@@ -134,3 +134,21 @@ def test_sample_index_round_trip_and_dataset_reads_both_labels(tmp_path: Path) -
     )
     batch = next(iter(loader))
     assert batch["dynamic"].shape == (1, 1, 2, 2, 2)
+
+
+def test_valid_mask_survives_partial_static_nodata(tmp_path: Path) -> None:
+    dynamic = tmp_path / "dynamic"
+    static = tmp_path / "static"
+    dynamic.mkdir()
+    static.mkdir()
+    _write_raster(dynamic / "NDVI230101.tif", np.ones((2, 2), dtype=np.float32))
+    first = np.ones((2, 2), dtype=np.float32)
+    first[0, 0] = -9999
+    _write_raster(static / "A.tif", first)
+    _write_raster(static / "B.tif", np.ones((2, 2), dtype=np.float32))
+    grid = target_grid_from_raster(
+        dynamic / "NDVI230101.tif", target_crs="EPSG:4326", resolution=1
+    )
+    index = build_sample_index(dynamic_dir=dynamic, static_dir=static, target_grid=grid)
+    sample = WindowedSampleDataset(index, window_size=(2, 2))[0]
+    assert sample["valid_mask"].tolist() == [[True, True], [True, True]]

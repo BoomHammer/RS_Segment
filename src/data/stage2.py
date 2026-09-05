@@ -86,12 +86,6 @@ def validate_stage2_config(
     missing = str(time_config.get("missing", "mask_nan"))
     if missing not in {"mask_nan", "drop"}:
         errors.append("time.missing 只能是 mask_nan 或 drop")
-    dataloader = dict(stage2.get("dataloader", {}))
-    if (
-        int(dataloader.get("batch_size", 1)) < 1
-        or int(dataloader.get("num_workers", 0)) < 0
-    ):
-        errors.append("dataloader.batch_size 必须为正数且 num_workers 不能为负数")
     cache = dict(stage2.get("cache", {}))
     if int(cache.get("max_items", 0)) < 0:
         errors.append("cache.max_items 不能为负数")

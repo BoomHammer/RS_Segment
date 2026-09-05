@@ -1,21 +1,36 @@
 weak_label:
   # SAM 输入组合，按 RGB 顺序排列；空列表表示不启用该组合。
+  # 每个 CompositeBands 项均为 [R, G, B] 波段编号。
   CompositeBands1: [1, 4, 3]
   CompositeBands2: [2, 1, 4]
   CompositeBands3: [6, 2, 1]
   CompositeBands4: [7, 6, 5]
   CompositeBands5: []
+  # 多组合掩膜的融合方法。
   mask_fusion: weighted_vote
+  # 加权投票达到该比例才接受像元。
   weighted_vote_threshold: 0.5
+  # SAM 输入窗口大小，顺序为 [width, height]。
   input_window_size: [256, 256]
-  label_radius: 16
+  # 高置信度标签向外扩张的半径（像元）。
+  label_radius: 8
+  # 高置信度预测的最低置信度。
   mask_confidence: 0.90
+  # 中等置信度预测的最低置信度。
   medium_confidence: 0.70
-  medium_label_radius: 8
-  fallback_radius: 8
+  # 中等置信度标签向外扩张的半径（像元）。
+  medium_label_radius: 4
+  # 无法使用置信度时的回退半径（像元）。
+  fallback_radius: 4
+  # 光谱距离筛选阈值。
   spectral_distance_threshold: 0.12
+  # mask logit 转为有效掩膜的阈值。
   logit_threshold: 0.5
+  # 是否拒绝接触输入窗口边界的掩膜。
   reject_boundary_touch: true
+  # 冲突类别之间的最小置信度差。
   conflict_margin: 0.05
+  # 输入影像拉伸前的固定值范围。
   input_range: [-100.0, 16000.0]
+  # 百分位拉伸范围。
   stretch_percentiles: [2.0, 98.0]

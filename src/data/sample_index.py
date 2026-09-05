@@ -303,6 +303,7 @@ class WindowedSampleDataset(GeoDataset):
         statistics: str | Path | dict[str, Any] | None = None,
         nodata: float | int = -9999,
         stage2: dict[str, Any] | None = None,
+        use_weak_labels: bool = True,
         transforms: Any = None,
     ) -> None:
         self.sample_index = (
@@ -312,6 +313,7 @@ class WindowedSampleDataset(GeoDataset):
         self.window_size = window_size
         self.stride = stride or window_size
         self.transforms = transforms
+        self.use_weak_labels = use_weak_labels
         self.statistics = load_raster_statistics(statistics)
         self.nodata = float(nodata)
         self._label_columns = label_columns or {}
@@ -529,11 +531,15 @@ class WindowedSampleDataset(GeoDataset):
                 for asset in static
             ]
         )
+        # A pixel is usable when at least one input observation is usable.
+        # Clouds or swaths missing from one frame/layer must not erase other
+        # sources. Only the union of "any dynamic valid" and "any static
+        # valid" is output-valid; all-inputs-invalid remains NoData.
         dynamic_valid = np.isfinite(dynamic_array).any(axis=(0, 1))
-        static_valid = np.isfinite(static_array).all(axis=0)
+        static_valid = np.isfinite(static_array).any(axis=0)
         shape = dynamic_array.shape[-2:]
         weak = np.full(shape, -1, dtype=np.int64)
-        if self.sample_index.weak_label is not None:
+        if self.use_weak_labels and self.sample_index.weak_label is not None:
             weak_values = self._read_asset(
                 _asset(
                     Path(self.sample_index.weak_label["path"]),
@@ -568,7 +574,7 @@ class WindowedSampleDataset(GeoDataset):
             "static": torch.from_numpy(static_array),
             "dynamic_valid_mask": torch.from_numpy(dynamic_valid),
             "static_valid_mask": torch.from_numpy(static_valid),
-            "valid_mask": torch.from_numpy(dynamic_valid & static_valid),
+            "valid_mask": torch.from_numpy(dynamic_valid | static_valid),
             "ground_truth": torch.from_numpy(ground_truth),
             "ground_truth_mask": torch.from_numpy(ground_truth >= 0),
             "weak_label": torch.from_numpy(weak),
@@ -586,7 +592,7 @@ class WindowedSampleDataset(GeoDataset):
                 ],
                 "ground_truth_pixels": int((ground_truth >= 0).sum()),
                 "weak_label_pixels": int((weak >= 0).sum()),
-                "valid_pixels": int((dynamic_valid & static_valid).sum()),
+                "valid_pixels": int((dynamic_valid | static_valid).sum()),
             },
         }
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import yaml
 from torch.nn import functional as F
 from tqdm import tqdm
 
@@ -210,6 +211,13 @@ def main(argv: list[str] | None = None) -> int:
     if not data_config_path.is_file():
         data_config_path = Path("configs/data.yaml")
     data_config = load_config(data_config_path)
+    train_config_path = experiment_dir / str(
+        metadata.get("train_config", "train.yaml")
+    )
+    if not train_config_path.is_file():
+        train_config_path = Path("configs/train.yaml")
+    with train_config_path.open(encoding="utf-8") as stream:
+        train_config = yaml.safe_load(stream) or {}
     stage2 = dict(data_config.data.stage2)
     window = dict(stage2.get("window", {}))
     statistics = next(iter(sorted(run.glob("raster_stats*.json"))), None)
@@ -223,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         statistics=statistics,
         nodata=data_config.data.raster.get("nodata", -9999),
         stage2=stage2,
+        use_weak_labels=False,
     )
     manifest = load_spatial_split(split_path)
     indices = manifest.splits[args.split]
@@ -243,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     model.to(device).eval()
-    loader_config = dict(stage2.get("dataloader", {}))
+    loader_config = dict(train_config.get("dataloader", {}))
     num_workers = int(loader_config.get("num_workers", 0))
     loader = build_dataloader(
         dataset,

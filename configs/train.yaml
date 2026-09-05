@@ -1,32 +1,66 @@
-# 主训练配置。数据路径和模型结构分别由 data.yaml、model.yaml 管理。
+# 主训练配置。数据路径和数据集结构由 data.yaml 管理，模型结构由 model.yaml 管理。
 training:
-  epochs: 1
+  # 训练轮数。
+  epochs: 30
+  # CUDA 自动混合精度类型：bfloat16、float16 或 none。
   amp_dtype: bfloat16
-  gradient_accumulation_steps: 4
+  # 梯度累积步数；用于在较小显存下模拟更大 batch。
+  gradient_accumulation_steps: 2
+  # 随机种子，保证数据采样和增强可复现。
   seed: 42
   early_stopping:
+    # 是否在验证损失长期不下降时提前结束训练。
     enabled: true
+    # 早停监控指标名称。
     monitor: val_loss
+    # 连续多少轮没有改善后停止。
     patience: 5
+    # 认为有效改善所需的最小损失下降量。
     min_delta: 0.0001
 
+dataloader:
+  # 训练/验证每个 batch 包含的窗口数量。增大可提高 GPU 吞吐，但会增加显存占用。
+  batch_size: 2
+  # 数据加载子进程数量。大于 0 时可并行读取和预处理 GeoTIFF，减少 GPU 等待。
+  # 建议从 2~4 开始测试；过大可能造成磁盘争用和内存占用增加。
+  num_workers: 6
+  # 将 batch 复制到页锁定内存，配合 non_blocking=True 加快 CPU 到 GPU 的传输。
+  pin_memory: true
+  # 保留 worker 进程，避免每个 epoch 重复创建进程；仅在 num_workers > 0 时有效。
+  persistent_workers: true
+  # 每个 worker 提前准备的 batch 数量；增大可隐藏读取延迟，但会增加内存占用。
+  prefetch_factor: 2
+  # 最后一个不完整 batch 是否丢弃。训练时可保持 batch 尺寸稳定，验证时通常关闭。
+  drop_last: false
+
 optimizer:
+  # 优化器名称；当前训练入口使用 AdamW。
   name: adamw
+  # 初始学习率。
   learning_rate: 0.0001
+  # AdamW 权重衰减系数。
   weight_decay: 0.01
+  # AdamW 的 beta 参数。
   betas: [0.9, 0.999]
 
 scheduler:
+  # 学习率调度器名称；当前训练入口使用 cosine。
   name: cosine
+  # 预热阶段占总优化步数的比例。
   warmup_ratio: 0.05
 
 gradient_clipping:
+  # 是否启用梯度范数裁剪。
   enabled: true
+  # 梯度范数上限。
   max_norm: 1.0
 
 ema:
+  # 是否维护指数滑动平均模型权重。
   enabled: true
+  # EMA 衰减率，越接近 1 越平滑。
   decay: 0.99
 
 checkpoint:
+  # checkpoint 文件名模板；{timestamp} 由训练入口替换。
   filename: model_{timestamp}.pt

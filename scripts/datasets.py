@@ -7,6 +7,8 @@ import copy
 import json
 from pathlib import Path
 
+import yaml
+
 from config import load_config
 from data.raster_alignment import grid_from_config
 from data.sample_index import WindowedSampleDataset, build_sample_index
@@ -36,11 +38,17 @@ def _artifact(run: Path, pattern: str) -> Path | None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="切分并验证训练数据集")
     parser.add_argument("run", type=Path, help="weak_label.py 生成的结果目录")
+    parser.add_argument("--config", type=Path, default=Path("configs/data.yaml"))
+    parser.add_argument(
+        "--train-config", type=Path, default=Path("configs/train.yaml")
+    )
     args = parser.parse_args(argv)
     run = args.run.resolve()
     if not run.is_dir():
         raise NotADirectoryError(f"伪标签结果目录不存在: {run}")
-    config = load_config(Path("configs/data.yaml"))
+    config = load_config(args.config)
+    with args.train_config.open(encoding="utf-8") as stream:
+        train_config = yaml.safe_load(stream) or {}
     weak_label = run / "weak_labels.tif"
     if not weak_label.exists():
         raise FileNotFoundError(f"伪标签结果目录缺少弱标签: {weak_label}")
@@ -113,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     benchmark_config = dict(stage2.get("benchmark", {}))
     if benchmark_config.get("enabled", True):
         training = dict(stage2.get("training", {}))
-        loader = dict(stage2.get("dataloader", {}))
+        loader = dict(train_config.get("dataloader", {}))
         sampling = dict(stage2.get("sampling", {}))
         benchmark_report = benchmark_dataset(
             dataset,

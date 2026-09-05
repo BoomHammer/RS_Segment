@@ -63,6 +63,15 @@ data:
 
   # 阶段2训练数据协议；空特征清单表示使用索引中发现的全部特征。
   stage2:
+    # 仅用于训练集；验证/推理不做随机增强。遥感地物通常允许旋转和翻转，
+    # 可配合光谱微扰降低对少量样点和局部纹理的过拟合。
+    augmentation:
+      enabled: true
+      horizontal_flip_probability: 0.5
+      vertical_flip_probability: 0.5
+      rotate_probability: 0.5
+      spectral_noise_std: 0.01
+      spectral_gain_std: 0.02
     features:
       dynamic: []
       static: []
@@ -79,27 +88,22 @@ data:
     statistics_file: null
     statistics_window_size: [1024, 1024]
     split_file: ../data/processed/spatial_split.json
-    dataloader:
-      batch_size: 1
-      num_workers: 2
-      pin_memory: true
-      persistent_workers: true
-      prefetch_factor: 2
-      drop_last: false
     cache:
       # 默认关闭窗口缓存，避免大规模数据实验占满内存。
       enabled: false
       max_items: 0
     training:
       amp_dtype: bfloat16
-      gradient_accumulation_steps: 4
+      gradient_accumulation_steps: 2
     sampling:
       strategy: spatial_weighted
+      # 加权采样使用的划分；训练时必须为 train，验证/测试不使用该采样器。
       split: train
       num_samples: null
+    # 数据集空间划分配置；将空间块分配到训练、验证和测试集。
     split:
-      block_size: [2048, 2048]
-      ratios: [0.8, 0.1, 0.1]
+      block_size: [1024, 1024]
+      ratios: [0.6, 0.2, 0.2]
       seed: 42
     benchmark:
       enabled: true

@@ -1,25 +1,38 @@
 # 阶段3模型架构配置。
 model:
+  # 模型架构标识。
   architecture: segformer_utae
+  # SegFormer 主干网络。
   backbone: mit_b1
   temporal:
+    # 动态时序编码器类型。
     type: utae_ltae
+    # 时序特征投影通道数。
     projection_channels: 64
   static:
+    # 静态特征投影通道数。
     projection_channels: 32
   fusion:
+    # 动静态特征融合后的通道数。
     output_channels: 96
   regularization:
+    # 解码器 dropout 概率。
     dropout: 0.1
+    # 随机深度概率。
     drop_path: 0.05
   input:
     # 仅作为计算哨兵值；有效性由数据批次中的 mask 决定。
     invalid_fill_value: 0.0
   supervision:
+    # 地面实测标签损失权重。
     ground_truth_weight: 1.0
+    # 伪标签损失权重；仅用于训练。
     weak_label_weight: 0.5
+    # 无效标签的忽略值。
     ignore_index: -1
   artifacts:
     # 由阶段2 run 目录自动发现，不在此手工填写通道数或类别数。
+    # 样本索引文件来源。
     sample_index: auto
+    # 标签映射文件来源。
     label_mapping: auto

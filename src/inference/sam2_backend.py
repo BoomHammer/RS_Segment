@@ -206,12 +206,14 @@ class SAM2Inferencer:
                     masks, object_ids, seed
                 )
                 for reverse in (False, True):
-                    for frame_idx, ids, frame_masks in (
-                        self.video_predictor.propagate_in_video(
-                            state,
-                            start_frame_idx=keyframe_index,
-                            reverse=reverse,
-                        )
+                    for (
+                        frame_idx,
+                        ids,
+                        frame_masks,
+                    ) in self.video_predictor.propagate_in_video(
+                        state,
+                        start_frame_idx=keyframe_index,
+                        reverse=reverse,
                     ):
                         propagated[frame_idx] = _video_prediction_for_object(
                             frame_masks, ids, seed
@@ -231,9 +233,7 @@ def _video_prediction_for_object(
         else np.asarray(masks)
     )
     object_index = ids.index(1)
-    logits = np.squeeze(
-        np.asarray(mask_array[object_index], dtype=np.float32)
-    )
+    logits = np.squeeze(np.asarray(mask_array[object_index], dtype=np.float32))
     if logits.ndim != 2:
         raise RuntimeError(
             f"SAM2 视频 mask 形状异常，目标对象 mask 应为二维，实际为 {logits.shape}"

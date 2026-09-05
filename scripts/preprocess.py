@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from itertools import chain, islice
 from pathlib import Path
 
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from config import load_config
 from data.labels import iter_encoded_labels

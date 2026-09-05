@@ -15,8 +15,9 @@ from torch.nn import functional as F
 from tqdm import tqdm
 
 from config import load_config
+from data.augmentations import SynchronizedAugmentation
 from data.sample_index import WindowedSampleDataset
-from data.sampling import build_dataloader
+from data.sampling import SpatialWeightedSampler, build_dataloader
 from data.spatial_split import load_spatial_split
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
@@ -135,15 +136,39 @@ def main(argv: list[str] | None = None) -> int:
     if mapping_path is None:
         raise FileNotFoundError(f"数据集目录缺少标签映射: {run}")
     statistics = next(iter(sorted(run.glob("raster_stats*.json"))), None)
+    dataset_kwargs = {
+        "index": run / "sample_index.json",
+        "window_size": tuple(window.get("size", (256, 256))),
+        "stride": tuple(window.get("stride", window.get("size", (256, 256)))),
+        "label_columns": data_config.data.label_columns,
+        "label_mapping": json.loads(mapping_path.read_text(encoding="utf-8")),
+        "statistics": statistics,
+        "nodata": data_config.data.raster.get("nodata", -9999),
+        "stage2": stage2,
+    }
+    augmentation_config = dict(stage2.get("augmentation", {}))
+    train_transforms = SynchronizedAugmentation(
+        horizontal_flip_probability=float(
+            augmentation_config.get("horizontal_flip_probability", 0.5)
+        ),
+        vertical_flip_probability=float(
+            augmentation_config.get("vertical_flip_probability", 0.5)
+        ),
+        rotate_probability=float(augmentation_config.get("rotate_probability", 0.5)),
+        spectral_noise_std=float(augmentation_config.get("spectral_noise_std", 0.0)),
+        spectral_gain_std=float(augmentation_config.get("spectral_gain_std", 0.0)),
+        seed=int(training.get("seed", 42)),
+    )
     dataset = WindowedSampleDataset(
-        run / "sample_index.json",
-        window_size=tuple(window.get("size", (256, 256))),
-        stride=tuple(window.get("stride", window.get("size", (256, 256)))),
-        label_columns=data_config.data.label_columns,
-        label_mapping=json.loads(mapping_path.read_text(encoding="utf-8")),
-        statistics=statistics,
-        nodata=data_config.data.raster.get("nodata", -9999),
-        stage2=stage2,
+        **dataset_kwargs,
+        transforms=train_transforms
+        if augmentation_config.get("enabled", False)
+        else None,
+    )
+    validation_dataset = WindowedSampleDataset(
+        **dataset_kwargs,
+        use_weak_labels=False,
+        transforms=None,
     )
     split_path = run / "spatial_split.json"
     if not split_path.is_file():
@@ -161,14 +186,30 @@ def main(argv: list[str] | None = None) -> int:
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     model.to(device)
-    loader_config = dict(stage2.get("dataloader", {}))
+    loader_config = dict(train_config.get("dataloader", {}))
     num_workers = int(loader_config.get("num_workers", 0))
     persistent_workers = bool(loader_config.get("persistent_workers", False))
     if num_workers == 0:
         persistent_workers = False
+    sampling_config = dict(stage2.get("sampling", {}))
+    if sampling_config.get("strategy", "spatial_weighted") == "spatial_weighted":
+        train_sampler = SpatialWeightedSampler(
+            dataset,
+            manifest=manifest,
+            split="train",
+            num_samples=sampling_config.get("num_samples"),
+            seed=int(training.get("seed", 42)),
+        )
+        train_loader_indices = None
+        train_sample_count = len(train_sampler)
+    else:
+        train_sampler = None
+        train_loader_indices = train_indices
+        train_sample_count = len(train_indices)
     loader = build_dataloader(
         dataset,
-        indices=train_indices,
+        indices=train_loader_indices,
+        sampler=train_sampler,
         batch_size=int(loader_config.get("batch_size", 1)),
         num_workers=num_workers,
         pin_memory=bool(loader_config.get("pin_memory", True)),
@@ -178,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=int(training.get("seed", 42)),
     )
     validation_loader = build_dataloader(
-        dataset,
+        validation_dataset,
         indices=validation_indices,
         batch_size=int(loader_config.get("batch_size", 1)),
         num_workers=num_workers,
@@ -199,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
         betas=tuple(optimizer_config.get("betas", (0.9, 0.999))),
     )
     scheduler_config = dict(train_config.get("scheduler", {}))
-    total_steps = max(1, epochs * math.ceil(len(train_indices) / accumulation_steps))
+    total_steps = max(1, epochs * math.ceil(train_sample_count / accumulation_steps))
     warmup_ratio = float(scheduler_config.get("warmup_ratio", 0.05))
     if not 0.0 <= warmup_ratio < 1.0:
         raise ValueError("scheduler.warmup_ratio 必须位于 [0, 1)")
@@ -213,6 +254,11 @@ def main(argv: list[str] | None = None) -> int:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, learning_rate)
     derived = model_config["derived"]
+    class_weights = torch.ones(int(derived["num_classes"]), device=device)
+    for code, weight in manifest.class_weights.items():
+        class_index = int(code) - 1
+        if 0 <= class_index < len(class_weights):
+            class_weights[class_index] = float(weight)
     supervision = dict(model_config.get("supervision", {}))
     early_stopping = dict(training.get("early_stopping", {}))
     early_stopping_enabled = bool(early_stopping.get("enabled", True))
@@ -298,6 +344,7 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                     weak_label_weight=float(supervision.get("weak_label_weight", 0.5)),
                     fine_to_coarse=derived["fine_to_coarse"],
+                    class_weights=class_weights,
                     ignore_index=int(supervision.get("ignore_index", -1)),
                 )["loss"]
             ground_truth_mask = (
@@ -370,15 +417,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"early stopping: 连续 {patience} 轮验证集未改善")
             break
     if best_state is not None:
-        print("训练循环完成，正在恢复验证集表现最好的 EMA 权重...", flush=True)
         model.load_state_dict(best_state)
-    print("正在整理 CPU 权重并保存 checkpoint...", flush=True)
     checkpoint = output / checkpoint_name
     cpu_state = {
         name: value.detach().cpu() for name, value in model.state_dict().items()
     }
     torch.save({"model": cpu_state, "contract": model_config}, checkpoint)
-    print(f"checkpoint 已保存: {checkpoint}", flush=True)
     train_log.update(
         {
             "status": "completed",
@@ -388,7 +432,6 @@ def main(argv: list[str] | None = None) -> int:
             "finished_at": datetime.now().isoformat(),
         }
     )
-    print("正在写入最终 train_log.json...", flush=True)
     (output / "train_log.json").write_text(
         json.dumps(train_log, indent=2), encoding="utf-8"
     )

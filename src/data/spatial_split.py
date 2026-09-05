@@ -79,6 +79,90 @@ def _split_sizes(total: int, ratios: tuple[float, float, float]) -> list[int]:
     return sizes
 
 
+def _stratified_block_assignment(
+    grouped: dict[tuple[int, int], list[int]],
+    block_classes: dict[tuple[int, int], Counter[str]],
+    ratios: tuple[float, float, float],
+    seed: int,
+) -> dict[tuple[int, int], str]:
+    """Assign blocks while keeping measured classes in every requested split.
+
+    A block is the atomic unit, so exact per-class ratios are not always
+    possible. The greedy objective minimizes deviation from the requested
+    class pixel counts and strongly prefers filling a class that is currently
+    absent from a split. This retains the leakage-safe block boundary.
+    """
+
+    names = ("train", "validation", "test")
+    sizes = _split_sizes(len(grouped), ratios)
+    capacities = dict(zip(names, sizes, strict=True))
+    rng = random.Random(seed)
+    blocks = list(grouped)
+    rng.shuffle(blocks)
+    class_totals = sum(block_classes.values(), Counter())
+    class_targets = {
+        code: [class_totals[code] * ratio for ratio in ratios] for code in class_totals
+    }
+    class_presence = Counter(
+        code for classes in block_classes.values() for code in classes
+    )
+    blocks.sort(
+        key=lambda block: (
+            -len(block_classes[block]),
+            min(class_presence[code] for code in block_classes[block])
+            if block_classes[block]
+            else len(blocks),
+        )
+    )
+    assigned: dict[tuple[int, int], str] = {}
+    counts = {name: Counter() for name in names}
+    for block in blocks:
+        candidates = [name for name in names if capacities[name] > 0]
+        if not candidates:
+            raise RuntimeError("空间块分配失败：剩余空间块没有可用划分")
+
+        def score(
+            name: str, current_block: tuple[int, int] = block
+        ) -> tuple[float, int]:
+            missing = sum(
+                1
+                for code in block_classes[current_block]
+                if counts[name][code] == 0 and class_presence[code] > 1
+            )
+            deviation = 0.0
+            for code, value in block_classes[current_block].items():
+                target = class_targets[code][names.index(name)]
+                deviation += (counts[name][code] + value - target) ** 2 / max(
+                    target, 1.0
+                )
+            return (-missing * 1000.0 + deviation, capacities[name])
+
+        selected = min(candidates, key=score)
+        assigned[block] = selected
+        capacities[selected] -= 1
+        counts[selected].update(block_classes[block])
+
+    missing = {
+        name: {
+            code
+            for code in class_totals
+            if class_presence[code] >= 3 and counts[name][code] == 0
+        }
+        for name in names
+        if ratios[names.index(name)] > 0
+    }
+    if any(missing.values()):
+        details = ", ".join(
+            f"{name}: {sorted(values)}" for name, values in missing.items() if values
+        )
+        raise ValueError(
+            "按空间块进行类别分层后仍有类别缺失；请减小 block_size "
+            "或提供更多跨空间块的实测样点。"
+            f" 缺失={details}"
+        )
+    return assigned
+
+
 def build_spatial_split(
     dataset: WindowedSampleDataset,
     *,
@@ -105,16 +189,16 @@ def build_spatial_split(
         block = (int(row.row) // block_size[1], int(row.column) // block_size[0])
         grouped[block].append(int(window_id))
 
-    blocks = list(grouped)
-    random.Random(seed).shuffle(blocks)
-    sizes = _split_sizes(len(blocks), normalized)
     names = ("train", "validation", "test")
-    split_blocks = {}
-    cursor = 0
-    for name, size in zip(names, sizes, strict=True):
-        for block in blocks[cursor : cursor + size]:
-            split_blocks[block] = name
-        cursor += size
+    block_classes: dict[tuple[int, int], Counter[str]] = {
+        block: Counter() for block in grouped
+    }
+    for (row, column), code in dataset.ground_truth_pixels.items():
+        block = (int(row) // block_size[1], int(column) // block_size[0])
+        block_classes[block][str(code)] += 1
+    split_blocks = _stratified_block_assignment(
+        grouped, block_classes, normalized, seed
+    )
     splits = {
         name: sorted(
             window_id
