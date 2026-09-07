@@ -84,7 +84,9 @@ data:
       missing: mask_nan
     window:
       size: [256, 256]
-      stride: [256, 256]
+      stride: [128, 128]
+      # 每侧上下文像素 [x, y]；256 中心窗口最多读取 320×320。
+      halo: [32, 32]
     statistics_file: null
     statistics_window_size: [1024, 1024]
     split_file: ../data/processed/spatial_split.json

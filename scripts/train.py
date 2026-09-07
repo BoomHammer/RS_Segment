@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -16,12 +18,60 @@ from tqdm import tqdm
 
 from config import load_config
 from data.augmentations import SynchronizedAugmentation
+from data.balanced_sampling import CappedClassSampler
+from data.overlap import overlapping_view
 from data.sample_index import WindowedSampleDataset
 from data.sampling import SpatialWeightedSampler, build_dataloader
-from data.spatial_split import load_spatial_split
+from data.spatial_split import build_spatial_split, load_spatial_split
+from data.training_policy import isolate_splits, point_windows, supervision_summary
+from losses.overlap import overlap_consistency_loss
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
 from models.config import load_model_contract
+from seed import seed_everything
+
+
+def _atomic_save(payload: dict, path: Path) -> None:
+    """Replace a checkpoint only after its complete contents reach disk."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as stream:
+        torch.save(payload, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+def _restrict_manifest_to_region(
+    dataset: WindowedSampleDataset,
+    manifest: object,
+    fraction: float,
+) -> object:
+    """Keep windows whose centers fall inside the central region."""
+
+    if not 0 < fraction <= 1:
+        raise ValueError("region_fraction 必须位于 (0, 1]")
+    width = int(dataset.grid.width * fraction)
+    height = int(dataset.grid.height * fraction)
+    left = (dataset.grid.width - width) // 2
+    top = (dataset.grid.height - height) // 2
+    right = left + width
+    bottom = top + height
+
+    def inside(index: int) -> bool:
+        record = dataset.index.iloc[index]
+        column = int(record.column)
+        row = int(record.row)
+        center_x = column + min(dataset.window_size[0], dataset.grid.width - column) / 2
+        center_y = row + min(dataset.window_size[1], dataset.grid.height - row) / 2
+        return left <= center_x < right and top <= center_y < bottom
+
+    splits = {
+        name: [index for index in indices if inside(index)]
+        for name, indices in manifest.splits.items()
+    }
+    if not splits.get("train") or not splits.get("validation"):
+        raise ValueError("中心区域筛选后 train 或 validation 集为空")
+    return replace(manifest, splits=splits)
 
 
 def _new_experiment_dir(root: Path) -> Path:
@@ -64,17 +114,17 @@ class ModelEMA:
         model.load_state_dict(self.shadow)
 
 
-def _evaluate(
-    model: SegFormerUtae, loader: object, device: torch.device
-) -> dict[str, float | int]:
+def _evaluate(model: SegFormerUtae, loader: object, device: torch.device) -> dict:
     """Evaluate fine-label loss and accuracy on the validation split."""
 
     model.eval()
     loss_sum = 0.0
     correct_pixels = 0
     labeled_pixels = 0
+    confusion = None
+    point_predictions = {}
     with torch.inference_mode():
-        for batch in loader:
+        for batch in tqdm(loader, desc="验证", unit="batch", dynamic_ncols=True):
             tensor_batch = {
                 key: value.to(device, non_blocking=True)
                 if isinstance(value, torch.Tensor)
@@ -87,11 +137,15 @@ def _evaluate(
                 enabled=device.type == "cuda",
             ):
                 output = model(tensor_batch)
+            if "core_mask" in tensor_batch:
+                tensor_batch["valid_mask"] = (
+                    tensor_batch["valid_mask"] & tensor_batch["core_mask"]
+                )
             mask = tensor_batch["ground_truth_mask"] & tensor_batch["valid_mask"]
             target = (tensor_batch["ground_truth"] - 1).masked_fill(~mask, -1)
             if mask.any():
                 pixel_loss = F.cross_entropy(
-                    output["fine_logits"],
+                    output["fine_logits"].float(),
                     target,
                     reduction="none",
                     ignore_index=-1,
@@ -100,10 +154,66 @@ def _evaluate(
                 loss_sum += float(pixel_loss[mask].sum())
                 correct_pixels += int((prediction[mask] == target[mask]).sum())
                 labeled_pixels += int(mask.sum())
+                classes = output["fine_logits"].shape[1]
+                counts = torch.bincount(
+                    target[mask] * classes + prediction[mask],
+                    minlength=classes * classes,
+                ).reshape(classes, classes)
+                confusion = counts if confusion is None else confusion + counts
+                if "input_window" in batch:
+                    for sample, window in enumerate(batch["input_window"]):
+                        local_mask = mask[sample]
+                        positions = local_mask.nonzero().cpu().tolist()
+                        probabilities = (
+                            output["fine_logits"][sample, :, local_mask]
+                            .float()
+                            .softmax(dim=0)
+                            .T.cpu()
+                        )
+                        targets = target[sample][local_mask].cpu().tolist()
+                        for position, probability, label in zip(
+                            positions, probabilities, targets, strict=True
+                        ):
+                            key = (
+                                int(window.row_off) + position[0],
+                                int(window.col_off) + position[1],
+                            )
+                            if key in point_predictions:
+                                previous, count, previous_label = point_predictions[key]
+                                if label != previous_label:
+                                    raise ValueError(
+                                        "同一实测像元在验证窗口中出现冲突标签"
+                                    )
+                                point_predictions[key] = (
+                                    previous + probability,
+                                    count + 1,
+                                    label,
+                                )
+                            else:
+                                point_predictions[key] = (probability, 1, label)
+    diagnostics = {}
+    if confusion is not None:
+        support = confusion.sum(dim=1)
+        recall = confusion.diag().float() / support.clamp_min(1)
+        diagnostics = {
+            "confusion_matrix": confusion.cpu().tolist(),
+            "class_support": support.cpu().tolist(),
+            "per_class_recall": recall.cpu().tolist(),
+            "macro_recall": float(recall[support > 0].mean()),
+            "majority_baseline": float(support.max() / support.sum()),
+        }
+    if point_predictions:
+        correct = sum(
+            int(probability.argmax()) == label
+            for probability, _, label in point_predictions.values()
+        )
+        diagnostics["unique_point_count"] = len(point_predictions)
+        diagnostics["unique_point_accuracy"] = correct / len(point_predictions)
     return {
         "loss": loss_sum / max(labeled_pixels, 1),
         "accuracy": correct_pixels / max(labeled_pixels, 1),
         "labeled_pixels": labeled_pixels,
+        **diagnostics,
     }
 
 
@@ -115,37 +225,98 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--train-config", type=Path, default=Path("configs/train.yaml"))
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--resume", type=Path, help="完整训练断点 last.pt 的路径")
+    parser.add_argument("--region-fraction", type=float, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--window-size", type=int, nargs=2, default=None)
+    parser.add_argument("--stride", type=int, nargs=2, default=None)
+    parser.add_argument("--halo", type=int, nargs=2, default=None)
+    parser.add_argument("--grid-offset", type=int, nargs=2, default=(0, 0))
     args = parser.parse_args(argv)
     run = args.run.resolve()
     if not run.is_dir():
         raise NotADirectoryError(f"数据集目录不存在: {run}")
+    resume = None
+    if args.resume is not None:
+        args.resume = args.resume.resolve()
+        resume = torch.load(args.resume, map_location="cpu", weights_only=True)
+        if resume.get("resume_version") != 1:
+            raise ValueError("需要完整训练断点 last.pt，推理模型文件不能用于断点续训")
+        if resume["source_run"] != str(run):
+            raise ValueError("续训的数据集目录与断点不一致")
+        if (
+            args.output_dir is not None
+            and args.output_dir.resolve() != args.resume.parent
+        ):
+            raise ValueError("续训必须使用断点所在的实验目录")
+        args.output_dir = args.resume.parent
+        args.train_config = args.output_dir / "train.yaml"
+        args.config = args.output_dir / "model.yaml"
+        args.data_config = args.output_dir / "data.yaml"
+        for name, value in resume["window_options"].items():
+            setattr(args, name, value)
+        if args.epochs is None:
+            args.epochs = resume["target_epochs"]
+        elif args.epochs != resume["target_epochs"]:
+            raise ValueError("断点续训须保持原目标 epochs，以保留原学习率计划")
     with args.train_config.open(encoding="utf-8") as stream:
         train_config = yaml.safe_load(stream) or {}
     training = dict(train_config.get("training", {}))
+    seed_everything(int(training.get("seed", 42)))
+    policy = dict(train_config.get("supervision_policy", {}))
     epochs = args.epochs if args.epochs is not None else int(training.get("epochs", 1))
     if epochs < 1:
         raise ValueError("epochs 必须是正整数")
     experiment_started_at = datetime.now().isoformat()
-    output = _new_experiment_dir(Path("experiments"))
+    output = (
+        args.output_dir.resolve()
+        if args.output_dir is not None
+        else _new_experiment_dir(Path("experiments"))
+    )
+    if resume is None and output.exists() and any(output.iterdir()):
+        raise FileExistsError(f"训练输出目录非空: {output}")
+    output.mkdir(parents=True, exist_ok=True)
     checkpoint_name = f"model_{output.name}.pt"
 
     data_config = load_config(args.data_config)
     stage2 = data_config.data.stage2
+    if "input_normalization" in train_config:
+        stage2 = {**stage2, "normalization": dict(train_config["input_normalization"])}
     window = dict(stage2.get("window", {}))
+    window_size = tuple(args.window_size or window.get("size", (256, 256)))
+    window_stride = tuple(args.stride or window.get("stride", window_size))
+    halo = tuple(args.halo or window.get("halo", (0, 0)))
+    if resume is not None:
+        halo = tuple(resume["train_log"].get("halo", (0, 0)))
+    if len(halo) != 2 or any(type(value) is not int or value < 0 for value in halo):
+        raise ValueError("halo 必须是两个非负整数")
+    if (
+        len(window_size) != 2
+        or len(window_stride) != 2
+        or min(window_size) < 1
+        or min(window_stride) < 1
+        or window_stride[0] * 2 > window_size[0]
+        or window_stride[1] * 2 > window_size[1]
+    ):
+        raise ValueError("训练窗口必须为正数，且 stride 不得超过 window_size 的一半")
     mapping_path = next(iter(sorted(run.glob("label_mapping*.json"))), None)
     if mapping_path is None:
         raise FileNotFoundError(f"数据集目录缺少标签映射: {run}")
     statistics = next(iter(sorted(run.glob("raster_stats*.json"))), None)
     dataset_kwargs = {
         "index": run / "sample_index.json",
-        "window_size": tuple(window.get("size", (256, 256))),
-        "stride": tuple(window.get("stride", window.get("size", (256, 256)))),
+        "window_size": window_size,
+        "stride": window_stride,
+        "halo": halo,
+        "grid_offset": tuple(args.grid_offset),
         "label_columns": data_config.data.label_columns,
         "label_mapping": json.loads(mapping_path.read_text(encoding="utf-8")),
         "statistics": statistics,
         "nodata": data_config.data.raster.get("nodata", -9999),
         "stage2": stage2,
     }
+    if policy.get("disable_weak_labels", False):
+        dataset_kwargs["use_weak_labels"] = False
     augmentation_config = dict(stage2.get("augmentation", {}))
     train_transforms = SynchronizedAugmentation(
         horizontal_flip_probability=float(
@@ -166,33 +337,89 @@ def main(argv: list[str] | None = None) -> int:
         else None,
     )
     validation_dataset = WindowedSampleDataset(
-        **dataset_kwargs,
-        use_weak_labels=False,
+        **{**dataset_kwargs, "use_weak_labels": False},
         transforms=None,
     )
     split_path = run / "spatial_split.json"
-    if not split_path.is_file():
-        raise FileNotFoundError(f"数据集目录缺少空间划分文件: {split_path}")
-    manifest = load_spatial_split(split_path)
+    if args.grid_offset != (0, 0):
+        split = dict(stage2.get("split", {}))
+        manifest = build_spatial_split(
+            dataset,
+            block_size=tuple(split.get("block_size", (2048, 2048))),
+            ratios=tuple(split.get("ratios", (0.8, 0.1, 0.1))),
+            seed=int(split.get("seed", 42)),
+        )
+    else:
+        if not split_path.is_file():
+            raise FileNotFoundError(f"数据集目录缺少空间划分文件: {split_path}")
+        manifest = load_spatial_split(split_path)
+    if args.region_fraction is not None:
+        manifest = _restrict_manifest_to_region(dataset, manifest, args.region_fraction)
+    if policy.get("isolate_spatial_splits", False):
+        manifest = isolate_splits(dataset, manifest)
+    supervision_audit = None
+    if policy:
+        supervision_audit = supervision_summary(dataset, manifest)
+        (output / "supervision_audit.json").write_text(
+            json.dumps(supervision_audit, indent=2), encoding="utf-8"
+        )
+        manifest.write(output / "spatial_split.json")
+        if policy.get("require_validation_classes_in_train", False):
+            counts = supervision_audit["unique_class_counts"]
+            missing = set(counts["validation"]) - set(counts["train"])
+            if missing:
+                raise ValueError(
+                    f"隔离后训练集缺少验证类别 {sorted(missing)}；"
+                    "请检查监督审计。可用 --halo 0 0 保留更多实测点。"
+                )
     train_indices = manifest.splits.get("train", [])
     validation_indices = manifest.splits.get("validation", [])
+    if policy.get("measured_windows_only", False):
+        measured = point_windows(dataset)
+        train_indices = [index for index in train_indices if index in measured]
+    if policy.get("skip_unlabeled_validation", False):
+        measured = point_windows(validation_dataset)
+        validation_indices = [
+            index for index in validation_indices if index in measured
+        ]
     if not train_indices:
         raise ValueError(f"空间划分中的 train 集为空: {split_path}")
     if not validation_indices:
         raise ValueError(f"空间划分中的 validation 集为空: {split_path}")
     model_config = load_model_contract(args.config, run)
     model = SegFormerUtae.from_contract(model_config)
+    pretrained_initialization = None
+    if resume is None and hasattr(model, "initialize_pretrained"):
+        pretrained_initialization = model.initialize_pretrained()
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     model.to(device)
     loader_config = dict(train_config.get("dataloader", {}))
+    configured_batch_size = int(loader_config.get("batch_size", 1))
+    if configured_batch_size < 1:
+        raise ValueError("batch_size 必须为正整数")
+    effective_batch_size = 1 if any(halo) else configured_batch_size
     num_workers = int(loader_config.get("num_workers", 0))
     persistent_workers = bool(loader_config.get("persistent_workers", False))
     if num_workers == 0:
         persistent_workers = False
     sampling_config = dict(stage2.get("sampling", {}))
-    if sampling_config.get("strategy", "spatial_weighted") == "spatial_weighted":
+    if policy.get("capped_class_sampling", False):
+        train_sampler = CappedClassSampler(
+            dataset,
+            train_indices,
+            supervision_audit["unique_class_counts"]["train"],
+            extra_fraction=float(policy.get("extra_fraction", 0.25)),
+            seed=int(training.get("seed", 42)),
+        )
+        train_loader_indices = None
+    elif policy.get("measured_windows_only", False):
+        # Sample measured windows uniformly, without applying class correction
+        # twice through both the sampler and the loss.
+        train_sampler = None
+        train_loader_indices = train_indices
+    elif sampling_config.get("strategy", "spatial_weighted") == "spatial_weighted":
         train_sampler = SpatialWeightedSampler(
             dataset,
             manifest=manifest,
@@ -201,16 +428,14 @@ def main(argv: list[str] | None = None) -> int:
             seed=int(training.get("seed", 42)),
         )
         train_loader_indices = None
-        train_sample_count = len(train_sampler)
     else:
         train_sampler = None
         train_loader_indices = train_indices
-        train_sample_count = len(train_indices)
     loader = build_dataloader(
         dataset,
         indices=train_loader_indices,
         sampler=train_sampler,
-        batch_size=int(loader_config.get("batch_size", 1)),
+        batch_size=effective_batch_size,
         num_workers=num_workers,
         pin_memory=bool(loader_config.get("pin_memory", True)),
         persistent_workers=persistent_workers,
@@ -221,7 +446,7 @@ def main(argv: list[str] | None = None) -> int:
     validation_loader = build_dataloader(
         validation_dataset,
         indices=validation_indices,
-        batch_size=int(loader_config.get("batch_size", 1)),
+        batch_size=effective_batch_size,
         num_workers=num_workers,
         pin_memory=bool(loader_config.get("pin_memory", True)),
         persistent_workers=persistent_workers,
@@ -233,18 +458,43 @@ def main(argv: list[str] | None = None) -> int:
     accumulation_steps = int(training.get("gradient_accumulation_steps", 1))
     if accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps 必须是正整数")
+    if any(halo):
+        accumulation_steps *= configured_batch_size
+        print(f"halo={halo}，单窗口训练，梯度累积={accumulation_steps}")
+    parameters = model.parameters()
+    if model_config.get("architecture") == "segformer_utae_pretrained":
+        encoder_parameters = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if name.startswith("static_encoder.") and parameter.requires_grad
+        ]
+        new_parameters = [
+            parameter
+            for name, parameter in model.named_parameters()
+            if not name.startswith("static_encoder.") and parameter.requires_grad
+        ]
+        parameters = [
+            {"params": new_parameters},
+            {
+                "params": encoder_parameters,
+                "lr": float(optimizer_config.get("pretrained_learning_rate", 1e-5)),
+            },
+        ]
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        parameters,
         lr=float(optimizer_config.get("learning_rate", 1e-4)),
         weight_decay=float(optimizer_config.get("weight_decay", 0.0001)),
         betas=tuple(optimizer_config.get("betas", (0.9, 0.999))),
     )
     scheduler_config = dict(train_config.get("scheduler", {}))
-    total_steps = max(1, epochs * math.ceil(train_sample_count / accumulation_steps))
+    total_steps = max(1, epochs * math.ceil(len(loader) / accumulation_steps))
     warmup_ratio = float(scheduler_config.get("warmup_ratio", 0.05))
     if not 0.0 <= warmup_ratio < 1.0:
         raise ValueError("scheduler.warmup_ratio 必须位于 [0, 1)")
     warmup_steps = max(1, math.ceil(total_steps * warmup_ratio))
+    if resume is not None:
+        total_steps = resume["total_steps"]
+        warmup_steps = resume["warmup_steps"]
 
     def learning_rate(step: int) -> float:
         if step < warmup_steps:
@@ -259,7 +509,11 @@ def main(argv: list[str] | None = None) -> int:
         class_index = int(code) - 1
         if 0 <= class_index < len(class_weights):
             class_weights[class_index] = float(weight)
+    if policy.get("class_weighting") == "none":
+        class_weights = None
     supervision = dict(model_config.get("supervision", {}))
+    if policy.get("disable_weak_labels", False):
+        supervision["weak_label_weight"] = 0.0
     early_stopping = dict(training.get("early_stopping", {}))
     early_stopping_enabled = bool(early_stopping.get("enabled", True))
     patience = int(early_stopping.get("patience", 8))
@@ -278,6 +532,11 @@ def main(argv: list[str] | None = None) -> int:
         else None
     )
     amp_enabled = device.type == "cuda"
+    overlap = dict(train_config.get("overlap_consistency", {}))
+    overlap_weight = float(overlap.get("weight", 0.0))
+    overlap_interval = int(overlap.get("every_n_batches", 4))
+    if overlap_weight < 0 or overlap_interval < 1:
+        raise ValueError("overlap weight 必须非负，every_n_batches 必须为正")
     metrics: list[dict[str, float | int]] = []
     train_log: dict[str, object] = {
         "status": "running",
@@ -286,20 +545,74 @@ def main(argv: list[str] | None = None) -> int:
         "model_config": "model.yaml",
         "train_config": "train.yaml",
         "checkpoint": checkpoint_name,
+        "window_size": list(window_size),
+        "stride": list(window_stride),
+        "grid_offset": list(args.grid_offset),
+        "halo": list(halo),
         "started_at": experiment_started_at,
+        "supervision_policy": policy,
+        "pretrained_initialization": pretrained_initialization,
+        "supervision_audit": supervision_audit,
         "epochs": metrics,
     }
-    shutil.copy2(args.train_config, output / "train.yaml")
-    shutil.copy2(args.config, output / "model.yaml")
-    shutil.copy2(args.data_config, output / "data.yaml")
-    (output / "train_log.json").write_text(
-        json.dumps(train_log, indent=2), encoding="utf-8"
-    )
+    if resume is None:
+        shutil.copy2(args.train_config, output / "train.yaml")
+        shutil.copy2(args.config, output / "model.yaml")
+        # Absolute paths keep the snapshot valid in the experiment directory.
+        data_payload = yaml.safe_load(args.data_config.read_text(encoding="utf-8"))
+        for name in (
+            "root",
+            "labels",
+            "raw",
+            "dynamic",
+            "static",
+            "processed",
+            "label_file",
+            "sam2_checkpoint",
+        ):
+            value = getattr(data_config.data, name)
+            data_payload.setdefault("data", {})[name] = str(value) if value else None
+        data_payload["data"]["stage2"] = stage2
+        (output / "data.yaml").write_text(
+            yaml.safe_dump(data_payload, allow_unicode=True), encoding="utf-8"
+        )
     best_validation_loss = float("inf")
     best_epoch = 0
     stale_epochs = 0
     best_state: dict[str, torch.Tensor] | None = None
     optimizer_steps = 0
+    start_epoch = 0
+    if resume is not None:
+        if resume["contract"] != model_config:
+            raise ValueError("模型配置或标签映射与断点不一致")
+        model.load_state_dict(resume["model"])
+        optimizer.load_state_dict(resume["optimizer"])
+        scheduler.load_state_dict(resume["scheduler"])
+        if ema is not None:
+            for name, value in resume["ema"].items():
+                ema.shadow[name].copy_(value)
+        start_epoch = resume["next_epoch"]
+        best_state = resume["best_state"]
+        best_validation_loss = resume["best_validation_loss"]
+        best_epoch = resume["best_epoch"]
+        stale_epochs = resume["stale_epochs"]
+        optimizer_steps = resume["optimizer_steps"]
+        train_log = resume["train_log"]
+        metrics = train_log["epochs"]
+        torch.set_rng_state(resume["rng"])
+        if device.type == "cuda" and resume["cuda_rng"] is not None:
+            torch.cuda.set_rng_state_all(resume["cuda_rng"])
+        loader.generator.set_state(resume["loader_rng"])
+        validation_loader.generator.set_state(resume["validation_loader_rng"])
+        train_transforms._generator.set_state(resume["augmentation_rng"])
+        if train_sampler is not None:
+            train_sampler.epoch = start_epoch
+        print(f"已恢复断点，完成 {start_epoch} 轮，目标共 {epochs} 轮")
+        del resume
+    train_log["status"] = "running"
+    (output / "train_log.json").write_text(
+        json.dumps(train_log, indent=2), encoding="utf-8"
+    )
 
     def optimizer_step() -> None:
         nonlocal optimizer_steps
@@ -312,12 +625,16 @@ def main(argv: list[str] | None = None) -> int:
             ema.update(model)
         optimizer.zero_grad(set_to_none=True)
 
-    model.train()
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
+        if early_stopping_enabled and stale_epochs >= patience:
+            break
+        model.train()
         total = 0.0
         batches = 0
         correct_pixels = 0
         labeled_pixels = 0
+        overlap_loss_sum = 0.0
+        overlap_batches = 0
         optimizer.zero_grad(set_to_none=True)
         progress = tqdm(
             loader,
@@ -336,7 +653,11 @@ def main(argv: list[str] | None = None) -> int:
                 device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
             ):
                 prediction = model(tensor_batch)
-                loss = combined_supervision_loss(
+                if "core_mask" in tensor_batch:
+                    tensor_batch["valid_mask"] = (
+                        tensor_batch["valid_mask"] & tensor_batch["core_mask"]
+                    )
+                loss_components = combined_supervision_loss(
                     prediction,
                     tensor_batch,
                     ground_truth_weight=float(
@@ -346,7 +667,8 @@ def main(argv: list[str] | None = None) -> int:
                     fine_to_coarse=derived["fine_to_coarse"],
                     class_weights=class_weights,
                     ignore_index=int(supervision.get("ignore_index", -1)),
-                )["loss"]
+                )
+                loss = loss_components["loss"]
             ground_truth_mask = (
                 tensor_batch["ground_truth_mask"] & tensor_batch["valid_mask"]
             )
@@ -357,7 +679,34 @@ def main(argv: list[str] | None = None) -> int:
                     (predicted[ground_truth_mask] == target[ground_truth_mask]).sum()
                 )
                 labeled_pixels += int(ground_truth_mask.sum())
-            (loss / accumulation_steps).backward()
+            group_size = min(
+                accumulation_steps,
+                len(loader) - (batches // accumulation_steps) * accumulation_steps,
+            )
+            (loss / group_size).backward()
+            if (
+                overlap_weight > 0
+                and epoch >= int(overlap.get("warmup_epochs", 3))
+                and batches % overlap_interval == 0
+            ):
+                view, top, left = overlapping_view(
+                    tensor_batch, int(overlap.get("crop_margin", 32))
+                )
+                with torch.autocast(
+                    device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
+                ):
+                    cropped_prediction = model(view)
+                    consistency = overlap_consistency_loss(
+                        prediction["fine_logits"],
+                        cropped_prediction["fine_logits"],
+                        view["valid_mask"] & view["core_mask"],
+                        top,
+                        left,
+                    )
+                (overlap_weight * consistency / group_size).backward()
+                overlap_loss_sum += float(consistency.detach())
+                overlap_batches += 1
+                del cropped_prediction, consistency, view
             if (batches + 1) % accumulation_steps == 0:
                 optimizer_step()
             total += float(loss.detach().cpu())
@@ -374,18 +723,30 @@ def main(argv: list[str] | None = None) -> int:
         if ema is not None:
             ema.copy_to(model)
         validation = _evaluate(model, validation_loader, device)
+        (output / f"validation_epoch_{epoch + 1:03d}.json").write_text(
+            json.dumps(validation, indent=2), encoding="utf-8"
+        )
         model.load_state_dict(current_state)
         metrics.append(
             {
                 "epoch": epoch + 1,
                 "loss": epoch_loss,
+                "overlap_loss": overlap_loss_sum / max(overlap_batches, 1),
+                "overlap_batches": overlap_batches,
                 "accuracy": epoch_accuracy,
                 "labeled_pixels": labeled_pixels,
                 "batches": batches,
                 "val_loss": float(validation["loss"]),
                 "val_accuracy": float(validation["accuracy"]),
                 "val_labeled_pixels": int(validation["labeled_pixels"]),
+                "val_macro_recall": validation.get("macro_recall"),
+                "val_unique_point_accuracy": validation.get("unique_point_accuracy"),
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "pretrained_learning_rate": (
+                    float(optimizer.param_groups[1]["lr"])
+                    if len(optimizer.param_groups) > 1
+                    else None
+                ),
                 "optimizer_steps": optimizer_steps,
             }
         )
@@ -393,15 +754,94 @@ def main(argv: list[str] | None = None) -> int:
             best_validation_loss = float(validation["loss"])
             best_epoch = epoch + 1
             stale_epochs = 0
-            best_state = ema.state_dict() if ema is not None else current_state
+            best_state = (
+                {
+                    name: value.detach().cpu().clone()
+                    for name, value in ema.shadow.items()
+                }
+                if ema is not None
+                else current_state
+            )
+            _atomic_save(
+                {"model": best_state, "contract": model_config}, output / "best.pt"
+            )
         else:
             stale_epochs += 1
+        if float(validation["accuracy"]) > max(
+            (float(item["val_accuracy"]) for item in metrics[:-1]), default=-1.0
+        ):
+            accuracy_state = (
+                {name: value.detach().cpu() for name, value in ema.shadow.items()}
+                if ema is not None
+                else current_state
+            )
+            _atomic_save(
+                {"model": accuracy_state, "contract": model_config},
+                output / "best_accuracy.pt",
+            )
+        unique_accuracy = validation.get("unique_point_accuracy")
+        if unique_accuracy is not None and unique_accuracy > max(
+            (
+                item["val_unique_point_accuracy"]
+                for item in metrics[:-1]
+                if item.get("val_unique_point_accuracy") is not None
+            ),
+            default=-1.0,
+        ):
+            unique_state = (
+                {name: value.detach().cpu() for name, value in ema.shadow.items()}
+                if ema is not None
+                else current_state
+            )
+            _atomic_save(
+                {"model": unique_state, "contract": model_config},
+                output / "best_unique_accuracy.pt",
+            )
         train_log.update(
             {
                 "best_epoch": best_epoch,
                 "best_val_loss": best_validation_loss,
                 "optimizer_steps": optimizer_steps,
             }
+        )
+        _atomic_save(
+            {
+                "resume_version": 1,
+                "source_run": str(run),
+                "window_options": {
+                    "window_size": window_size,
+                    "stride": window_stride,
+                    "grid_offset": tuple(args.grid_offset),
+                    "region_fraction": args.region_fraction,
+                },
+                "target_epochs": epochs,
+                "next_epoch": epoch + 1,
+                "model": current_state,
+                "contract": model_config,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "total_steps": total_steps,
+                "warmup_steps": warmup_steps,
+                "ema": {
+                    name: value.detach().cpu() for name, value in ema.shadow.items()
+                }
+                if ema is not None
+                else None,
+                "best_state": best_state,
+                "best_epoch": best_epoch,
+                "best_validation_loss": best_validation_loss,
+                "stale_epochs": stale_epochs,
+                "optimizer_steps": optimizer_steps,
+                "train_log": train_log,
+                "rng": torch.get_rng_state(),
+                "cuda_rng": torch.cuda.get_rng_state_all()
+                if device.type == "cuda"
+                else None,
+                "loader_rng": loader.generator.get_state(),
+                "validation_loader_rng": validation_loader.generator.get_state(),
+                "augmentation_rng": train_transforms._generator.get_state(),
+            },
+            output / "last.pt",
         )
         (output / "train_log.json").write_text(
             json.dumps(train_log, indent=2), encoding="utf-8"
@@ -422,7 +862,7 @@ def main(argv: list[str] | None = None) -> int:
     cpu_state = {
         name: value.detach().cpu() for name, value in model.state_dict().items()
     }
-    torch.save({"model": cpu_state, "contract": model_config}, checkpoint)
+    _atomic_save({"model": cpu_state, "contract": model_config}, checkpoint)
     train_log.update(
         {
             "status": "completed",

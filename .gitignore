@@ -4,6 +4,7 @@
 /experiments/
 /SAM/
 /.pytest_tmp/
+/.pytest_tmp_*/
 /.pytest_cache/
 /.uv-cache/
 __pycache__/

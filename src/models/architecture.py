@@ -253,6 +253,10 @@ class SegFormerUtae(nn.Module):
 
     @classmethod
     def from_contract(cls, contract: dict[str, Any]) -> SegFormerUtae:
+        if contract.get("architecture") == "segformer_utae_pretrained":
+            from models.pretrained_utae import PretrainedSegFormerUTAE
+
+            return PretrainedSegFormerUTAE(contract)
         mapping = contract.get("fine_to_coarse")
         if mapping is None:
             mapping = dict(contract.get("derived", {})).get("fine_to_coarse")

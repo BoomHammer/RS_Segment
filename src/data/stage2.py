@@ -83,6 +83,8 @@ def validate_stage2_config(
     stride = tuple(window.get("stride", size))
     if len(size) != 2 or len(stride) != 2 or min(size) < 1 or min(stride) < 1:
         errors.append("window.size 和 window.stride 必须是两个正整数")
+    elif stride[0] * 2 > size[0] or stride[1] * 2 > size[1]:
+        errors.append("window.stride 不得超过 window.size 的一半")
     missing = str(time_config.get("missing", "mask_nan"))
     if missing not in {"mask_nan", "drop"}:
         errors.append("time.missing 只能是 mask_nan 或 drop")

@@ -4,6 +4,7 @@ import csv
 from pathlib import Path
 
 import numpy as np
+import pytest
 import rasterio
 import torch
 from rasterio.transform import from_origin
@@ -33,6 +34,49 @@ def _write_raster(path: Path, values: np.ndarray) -> None:
         nodata=-9999,
     ) as dataset:
         dataset.write(values, 1)
+
+
+def test_case_insensitive_statistics_and_legacy_snapshot_compatibility(tmp_path):
+    dynamic = tmp_path / "dynamic"
+    static = tmp_path / "static"
+    dynamic.mkdir()
+    static.mkdir()
+    dynamic_path = dynamic / "NDVI230101.tif"
+    _write_raster(dynamic_path, np.full((4, 4), 2, dtype=np.float32))
+    _write_raster(static / "DSM100aspect.tif", np.full((4, 4), 300, dtype=np.float32))
+    index = build_sample_index(
+        dynamic_dir=dynamic,
+        static_dir=static,
+        target_grid=target_grid_from_raster(
+            dynamic_path, target_crs="EPSG:4326", resolution=1
+        ),
+    )
+    statistics = {
+        "groups": [
+            {"category": "NDVI", "statistics": {"mean": 1, "standard_deviation": 2}},
+            {
+                "category": "DSM100ASPECT",
+                "statistics": {"mean": 180, "standard_deviation": 120},
+            },
+        ]
+    }
+    legacy = WindowedSampleDataset(index, window_size=(2, 2), statistics=statistics)
+    corrected = WindowedSampleDataset(
+        index,
+        window_size=(2, 2),
+        statistics=statistics,
+        stage2={
+            "normalization": {"case_insensitive": True, "require_statistics": True}
+        },
+    )
+    torch.testing.assert_close(legacy[0]["static"], torch.full((1, 2, 2), 300.0))
+    torch.testing.assert_close(corrected[0]["static"], torch.ones(1, 2, 2))
+    with pytest.raises(ValueError, match="标准化统计"):
+        WindowedSampleDataset(
+            index,
+            window_size=(2, 2),
+            stage2={"normalization": {"require_statistics": True}},
+        )
 
 
 def test_sample_index_round_trip_and_dataset_reads_both_labels(tmp_path: Path) -> None:

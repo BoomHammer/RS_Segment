@@ -48,6 +48,47 @@ def _load_run(checkpoint: Path) -> Path:
     return run
 
 
+def _load_training_window_config(
+    checkpoint: Path,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """Read window geometry from the checkpoint's training record."""
+
+    metadata_path = checkpoint.parent / "train_log.json"
+    if not metadata_path.is_file():
+        metadata_path = checkpoint.parent / "run.json"
+    metadata = (
+        json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata_path.is_file()
+        else {}
+    )
+    data_config_path = checkpoint.parent / "data.yaml"
+    if not data_config_path.is_file():
+        data_config_path = Path("configs/data.yaml")
+    data_config = load_config(data_config_path)
+    window = dict(data_config.data.stage2.get("window", {}))
+    window_size = tuple(metadata.get("window_size", window.get("size", (256, 256))))
+    stride = tuple(metadata.get("stride", window.get("stride", window_size)))
+    grid_offset = tuple(metadata.get("grid_offset", (0, 0)))
+    if any(len(value) != 2 for value in (window_size, stride, grid_offset)):
+        raise ValueError(f"训练窗口元数据格式错误: {metadata_path}")
+    return window_size, stride, grid_offset
+
+
+def _load_training_halo(checkpoint: Path) -> tuple[int, int]:
+    """Use recorded context; legacy experiments retain zero halo."""
+    for name in ("train_log.json", "run.json"):
+        path = checkpoint.parent / name
+        if path.is_file():
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+            halo = tuple(metadata.get("halo", (0, 0)))
+            if len(halo) != 2 or any(
+                type(value) is not int or value < 0 for value in halo
+            ):
+                raise ValueError(f"训练 halo 元数据格式错误: {path}")
+            return halo
+    return (0, 0)
+
+
 def _gaussian_weights(height: int, width: int, sigma_scale: float) -> np.ndarray:
     """Create a 2-D Gaussian window for weighted overlap blending."""
 
@@ -90,6 +131,8 @@ def predict(
     *,
     window_size: tuple[int, int] = (256, 256),
     stride: tuple[int, int] = (128, 128),
+    halo: tuple[int, int] = (0, 0),
+    grid_offset: tuple[int, int] = (0, 0),
     device: str | None = None,
     sigma_scale: float = 0.35,
     overwrite: bool = False,
@@ -123,8 +166,12 @@ def predict(
         or stride[1] < 1
         or stride[0] >= window_size[0]
         or stride[1] >= window_size[1]
+        or stride[0] * 2 > window_size[0]
+        or stride[1] * 2 > window_size[1]
+        or len(halo) != 2
+        or min(halo) < 0
     ):
-        raise ValueError("无缝推理要求正数窗口且 stride 必须严格小于 window_size")
+        raise ValueError("无缝推理要求正数窗口、非负 halo 且 stride 不得超过窗口的一半")
     if batch_size < 1 or num_workers < 0 or prefetch_factor < 1:
         raise ValueError(
             "batch_size 必须为正数，num_workers 不能为负数，prefetch_factor 必须为正数"
@@ -163,6 +210,8 @@ def predict(
         index_path,
         window_size=window_size,
         stride=stride,
+        grid_offset=grid_offset,
+        halo=halo,
         label_columns=data_config.data.label_columns,
         label_mapping=mapping,
         statistics=statistics_path,
@@ -214,9 +263,13 @@ def predict(
     amp_dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
     if amp_dtype not in amp_dtype_map:
         raise ValueError("amp_dtype 必须是 bfloat16 或 float16")
+    # Halo windows at the outer raster boundary can have different spatial
+    # shapes after clipping. Keep them serial so the existing collator does
+    # not pad spatial tensors and the 4090 memory budget stays predictable.
+    effective_batch_size = 1 if any(halo) else batch_size
     loader = DataLoader(
         dataset,
-        batch_size=batch_size,
+        batch_size=effective_batch_size,
         sampler=SequentialSampler(dataset),
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -230,6 +283,7 @@ def predict(
         with torch.inference_mode():
             for batch in tqdm(loader, desc="全图预测", unit="batch"):
                 windows = batch["window"]
+                input_windows = batch["input_window"]
                 batch = {
                     key: value.to(selected_device, non_blocking=True)
                     if isinstance(value, torch.Tensor)
@@ -247,11 +301,24 @@ def predict(
                 valid_masks = batch["valid_mask"].cpu().numpy()
                 for batch_index, window in enumerate(windows):
                     height, width = int(window.height), int(window.width)
-                    valid = valid_masks[batch_index, :height, :width]
+                    input_window = input_windows[batch_index]
+                    offset_y = int(window.row_off - input_window.row_off)
+                    offset_x = int(window.col_off - input_window.col_off)
+                    probability = probabilities[
+                        batch_index,
+                        :,
+                        offset_y : offset_y + height,
+                        offset_x : offset_x + width,
+                    ]
+                    valid = valid_masks[
+                        batch_index,
+                        offset_y : offset_y + height,
+                        offset_x : offset_x + width,
+                    ]
                     gaussian = _gaussian_weights(height, width, sigma_scale) * valid
                     row, column = int(window.row_off), int(window.col_off)
                     scores[:, row : row + height, column : column + width] += (
-                        probabilities[batch_index, :, :height, :width] * gaussian
+                        probability * gaussian
                     )
                     weights[row : row + height, column : column + width] += gaussian
         assert scores is not None and weights is not None
@@ -321,10 +388,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", type=Path, default=Path("configs/predict.yaml"))
     parser.add_argument("--output", type=Path, default=None)
     parser.add_argument("--mapping-output", type=Path, default=None)
-    parser.add_argument(
-        "--window-size", type=int, nargs=2, default=None, metavar=("WIDTH", "HEIGHT")
-    )
-    parser.add_argument("--stride", type=int, nargs=2, default=None, metavar=("X", "Y"))
     parser.add_argument("--sigma-scale", type=float, default=0.35)
     parser.add_argument("--device", default=None)
     parser.add_argument("--overwrite", action="store_true")
@@ -341,9 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     amp_config = dict(predict_config.get("amp", {}))
     raster_config = dict(predict_config.get("output_raster", {}))
     checkpoint = args.checkpoint.resolve()
-    configured = tuple(predict_config.get("window_size", (256, 256)))
-    window_size = tuple(args.window_size or configured)
-    stride = tuple(args.stride or predict_config.get("stride", window_size))
+    window_size, stride, grid_offset = _load_training_window_config(checkpoint)
     output = args.output or predict_config.get("output")
     mapping_output = args.mapping_output or predict_config.get("mapping_output")
     stem = checkpoint.parent / f"vegetation_{checkpoint.stem}"
@@ -353,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
         mapping_output or stem.with_suffix(".csv"),
         window_size=window_size,
         stride=stride,
+        halo=_load_training_halo(checkpoint),
+        grid_offset=grid_offset,
         device=args.device or predict_config.get("device"),
         sigma_scale=args.sigma_scale
         if args.sigma_scale != 0.35

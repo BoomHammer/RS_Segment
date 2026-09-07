@@ -285,6 +285,15 @@ def _window(row: int, column: int, size: tuple[int, int], grid: TargetGrid) -> W
     return Window(left, top, min(width, grid.width), min(height, grid.height))
 
 
+def _expanded_window(window: Window, halo: tuple[int, int], grid: TargetGrid) -> Window:
+    halo_x, halo_y = halo
+    left = max(0, int(window.col_off) - halo_x)
+    top = max(0, int(window.row_off) - halo_y)
+    right = min(grid.width, int(window.col_off + window.width) + halo_x)
+    bottom = min(grid.height, int(window.row_off + window.height) + halo_y)
+    return Window(left, top, right - left, bottom - top)
+
+
 class WindowedSampleDataset(GeoDataset):
     """TorchGeo dataset that reads every source only for the requested window.
 
@@ -298,6 +307,8 @@ class WindowedSampleDataset(GeoDataset):
         *,
         window_size: tuple[int, int] = (256, 256),
         stride: tuple[int, int] | None = None,
+        grid_offset: tuple[int, int] = (0, 0),
+        halo: tuple[int, int] = (0, 0),
         label_columns: dict[str, str] | None = None,
         label_mapping: dict[str, Any] | None = None,
         statistics: str | Path | dict[str, Any] | None = None,
@@ -312,6 +323,14 @@ class WindowedSampleDataset(GeoDataset):
         self.grid = _grid_from_index(self.sample_index)
         self.window_size = window_size
         self.stride = stride or window_size
+        if len(grid_offset) != 2 or min(grid_offset) < 0:
+            raise ValueError("grid_offset 必须是两个非负整数")
+        if grid_offset[0] >= self.stride[0] or grid_offset[1] >= self.stride[1]:
+            raise ValueError("grid_offset 必须小于 stride")
+        self.grid_offset = grid_offset
+        if len(halo) != 2 or min(halo) < 0:
+            raise ValueError("halo 必须是两个非负整数")
+        self.halo = halo
         self.transforms = transforms
         self.use_weak_labels = use_weak_labels
         self.statistics = load_raster_statistics(statistics)
@@ -320,8 +339,8 @@ class WindowedSampleDataset(GeoDataset):
         self._ground_truth: dict[tuple[int, int], int] = {}
         self._load_ground_truth(label_mapping)
         self._configure_stage2(stage2 or {})
-        rows = range(0, self.grid.height, self.stride[1])
-        columns = range(0, self.grid.width, self.stride[0])
+        rows = range(self.grid_offset[1], self.grid.height, self.stride[1])
+        columns = range(self.grid_offset[0], self.grid.width, self.stride[0])
         records = []
         for row in rows:
             for column in columns:
@@ -348,6 +367,22 @@ class WindowedSampleDataset(GeoDataset):
         self._res = self.grid.resolution
 
     def _configure_stage2(self, config: dict[str, Any]) -> None:
+        normalization = dict(config.get("normalization", {}))
+        # Preserve the input convention of old experiment snapshots. New runs
+        # opt in explicitly and persist the setting alongside their weights.
+        self.normalization_case_insensitive = bool(
+            normalization.get("case_insensitive", False)
+        )
+        self._casefold_statistics = {}
+        for key, value in self.statistics.items():
+            folded = key.casefold()
+            if (
+                self.normalization_case_insensitive
+                and folded in self._casefold_statistics
+                and self._casefold_statistics[folded] != value
+            ):
+                raise ValueError(f"大小写不敏感统计键冲突: {key}")
+            self._casefold_statistics[folded] = value
         features = dict(config.get("features", {}))
         dynamic_assets = [
             asset for asset in self.sample_index.assets if asset.role == "dynamic"
@@ -404,6 +439,12 @@ class WindowedSampleDataset(GeoDataset):
             {_feature_name(asset) for asset in dynamic_assets}
         )
         self._dynamic_times = times
+        if normalization.get("require_statistics", False):
+            keys = [_feature_name(asset) for asset in dynamic_assets]
+            keys.extend(asset.name for asset in static_assets)
+            missing = sorted({key for key in keys if self._statistics_for(key) is None})
+            if missing:
+                raise ValueError(f"输入特征缺少标准化统计: {missing}")
 
     def _load_ground_truth(self, mapping: dict[str, Any] | None) -> None:
         source = self.sample_index.ground_truth
@@ -439,7 +480,18 @@ class WindowedSampleDataset(GeoDataset):
             window = self._window_from_bounds(index)
         else:
             raise TypeError("样本索引必须是整数或 TorchGeo BoundingBox")
-        sample = self._read_window(window)
+        input_window = _expanded_window(window, self.halo, self.grid)
+        sample = self._read_window(input_window)
+        sample["window"] = window
+        sample["input_window"] = input_window
+        core_mask = torch.zeros_like(sample["valid_mask"])
+        offset_y = int(window.row_off - input_window.row_off)
+        offset_x = int(window.col_off - input_window.col_off)
+        core_mask[
+            offset_y : offset_y + int(window.height),
+            offset_x : offset_x + int(window.width),
+        ] = True
+        sample["core_mask"] = core_mask
         if self.transforms is not None:
             sample = self.transforms(sample)
         return sample
@@ -484,11 +536,16 @@ class WindowedSampleDataset(GeoDataset):
         return result
 
     def _normalized(self, values: np.ndarray, key: str) -> np.ndarray:
-        statistics = self.statistics.get(key)
+        statistics = self._statistics_for(key)
         if statistics is None:
             return values
         mean, standard_deviation = statistics
         return (values - mean) / standard_deviation
+
+    def _statistics_for(self, key: str) -> tuple[float, float] | None:
+        if self.normalization_case_insensitive:
+            return self._casefold_statistics.get(key.casefold())
+        return self.statistics.get(key)
 
     def _read_window(self, window: Window) -> dict[str, Any]:
         dynamic_assets = self._dynamic_assets
@@ -660,6 +717,12 @@ def sample_collate_fn(
             [sample["static_valid_mask"] for sample in samples]
         ),
         "valid_mask": torch.stack([sample["valid_mask"] for sample in samples]),
+        "core_mask": torch.stack(
+            [
+                sample.get("core_mask", torch.ones_like(sample["valid_mask"]))
+                for sample in samples
+            ]
+        ),
         "ground_truth": torch.stack([sample["ground_truth"] for sample in samples]),
         "ground_truth_mask": torch.stack(
             [sample["ground_truth_mask"] for sample in samples]
@@ -674,4 +737,5 @@ def sample_collate_fn(
         "crs": [sample["crs"] for sample in samples],
         "bounds": [sample["bounds"] for sample in samples],
         "window": [sample["window"] for sample in samples],
+        "input_window": [sample["input_window"] for sample in samples],
     }

@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 SPATIAL_KEYS = (
+    "core_mask",
     "dynamic",
     "static",
     "ground_truth",
