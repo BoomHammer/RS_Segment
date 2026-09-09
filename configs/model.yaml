@@ -1,12 +1,19 @@
 # 阶段3模型架构配置。
 model:
   # 模型架构标识。
-  architecture: segformer_utae
-  # SegFormer 主干网络。
+  architecture: segformer_utae_pretrained
+  # 使用 Hugging Face 官方 MiT-B1 SegFormer 编码器和完整 U-TAE/L-TAE 动态编码器。
   backbone: mit_b1
+  pretrained:
+    # 相对本配置文件解析；权重由 scripts/download_mit.py 下载。
+    path: ../third_party/pretrained/mit-b1
+    revision: 13ddceec4e8bdf401e7cd7acf5aebc526222518c
+    freeze_stages: 2
   temporal:
     # 动态时序编码器类型。
     type: utae_ltae
+    # 完整 U-TAE 每次编码的帧数；8GB 显卡保持 2，避免更大分块挤占显存。
+    frame_chunk_size: 2
     # 时序特征投影通道数。
     projection_channels: 64
   static:
@@ -17,7 +24,7 @@ model:
     output_channels: 96
   regularization:
     # 解码器 dropout 概率。
-    dropout: 0.1
+    dropout: 0.
     # 随机深度概率。
     drop_path: 0.05
   input:

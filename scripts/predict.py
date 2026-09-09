@@ -21,6 +21,7 @@ from tqdm import tqdm
 from config import load_config
 from data.sample_index import WindowedSampleDataset, sample_collate_fn
 from models.architecture import SegFormerUtae
+from precision import resolve_amp_dtype
 
 
 def _artifact(run: Path, pattern: str) -> Path:
@@ -143,7 +144,7 @@ def predict(
     persistent_workers: bool = False,
     prefetch_factor: int = 2,
     amp_enabled: bool = True,
-    amp_dtype: str = "bfloat16",
+    amp_dtype: str = "auto",
     cpu_threads: int | None = None,
     output_compress: str = "deflate",
     output_predictor: int = 2,
@@ -205,6 +206,9 @@ def predict(
         else device
     )
     model.to(selected_device).eval()
+    resolved_dtype = resolve_amp_dtype(
+        selected_device, amp_dtype if amp_enabled else "none"
+    )
 
     dataset = WindowedSampleDataset(
         index_path,
@@ -259,10 +263,6 @@ def predict(
         raise
     scores[:] = 0
     weights[:] = 0
-    use_amp = selected_device.type == "cuda" and amp_enabled
-    amp_dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
-    if amp_dtype not in amp_dtype_map:
-        raise ValueError("amp_dtype 必须是 bfloat16 或 float16")
     # Halo windows at the outer raster boundary can have different spatial
     # shapes after clipping. Keep them serial so the existing collator does
     # not pad spatial tensors and the 4090 memory budget stays predictable.
@@ -291,9 +291,9 @@ def predict(
                     for key, value in batch.items()
                 }
                 with torch.autocast(
-                    device_type="cuda",
-                    dtype=amp_dtype_map[amp_dtype],
-                    enabled=use_amp,
+                    device_type=selected_device.type,
+                    dtype=resolved_dtype or torch.float32,
+                    enabled=resolved_dtype is not None,
                 ):
                     probabilities = (
                         model(batch)["fine_probability"].float().cpu().numpy()
@@ -438,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
         amp_enabled=(
             args.amp if args.amp is not None else bool(amp_config.get("enabled", True))
         ),
-        amp_dtype=str(amp_config.get("dtype", "bfloat16")),
+        amp_dtype=str(amp_config.get("dtype", "auto")),
         cpu_threads=(
             None
             if predict_config.get("cpu_threads") is None

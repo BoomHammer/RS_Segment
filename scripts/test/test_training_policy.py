@@ -163,7 +163,6 @@ def test_spatial_split_balances_labelled_blocks_and_unique_points():
         "test": 6,
     }
     assert {
-        name: sum(counts.values())
-        for name, counts in manifest.class_counts.items()
+        name: sum(counts.values()) for name, counts in manifest.class_counts.items()
     } == {"train": 77, "validation": 33, "test": 22}
     assert all(len(counts) == 2 for counts in manifest.class_counts.values())

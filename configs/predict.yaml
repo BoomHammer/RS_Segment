@@ -18,10 +18,10 @@ predict:
   # 推理设备；cuda、cpu 或 auto。
   device: cuda
 
-  # CUDA 推理使用 BF16 自动混合精度。
+  # 自动选择显卡原生精度：4090 使用 BF16，2070 使用 FP16。
   amp:
     enabled: true
-    dtype: bfloat16
+    dtype: auto
 
   # 批量推理参数。
   # 当前 predict.py 是单窗口串行推理，batch_size 目前仅作为目标配置记录。

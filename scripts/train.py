@@ -11,6 +11,7 @@ import shutil
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 import torch
 import yaml
@@ -33,6 +34,7 @@ from losses.overlap import overlap_consistency_loss
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
 from models.config import load_model_contract
+from precision import resolve_amp_dtype, scaled_optimizer_step
 from seed import seed_everything
 
 METRICS_CSV_FIELDS = (
@@ -84,9 +86,7 @@ def _assert_resume_split_matches(path: Path, manifest: object) -> None:
     """Compare normalized manifests instead of raw JSON container types."""
 
     if path.is_file() and load_spatial_split(path) != manifest:
-        raise ValueError(
-            "数据集空间划分已改变，旧断点不能用于新划分；请开始新实验"
-        )
+        raise ValueError("数据集空间划分已改变，旧断点不能用于新划分；请开始新实验")
 
 
 def _source_supervision_loss(
@@ -177,10 +177,16 @@ class ModelEMA:
         model.load_state_dict(self.shadow)
 
 
-def _evaluate(model: SegFormerUtae, loader: object, device: torch.device) -> dict:
+def _evaluate(
+    model: SegFormerUtae,
+    loader: object,
+    device: torch.device,
+    amp_dtype: str = "auto",
+) -> dict:
     """Aggregate probabilities by global position, then evaluate every point once."""
 
     model.eval()
+    resolved_dtype = resolve_amp_dtype(device, amp_dtype)
     point_predictions = {}
     with torch.inference_mode():
         for batch in tqdm(loader, desc="验证", unit="batch", dynamic_ncols=True):
@@ -192,8 +198,8 @@ def _evaluate(model: SegFormerUtae, loader: object, device: torch.device) -> dic
             }
             with torch.autocast(
                 device_type=device.type,
-                dtype=torch.bfloat16,
-                enabled=device.type == "cuda",
+                dtype=resolved_dtype or torch.float32,
+                enabled=resolved_dtype is not None,
             ):
                 output = model(tensor_batch)
             if "core_mask" in tensor_batch:
@@ -237,6 +243,7 @@ def _evaluate(model: SegFormerUtae, loader: object, device: torch.device) -> dic
                             )
                         else:
                             point_predictions[key] = (probability, 1, label)
+            del output, tensor_batch
     if not point_predictions:
         return {"loss": 0.0, "accuracy": 0.0, "labeled_pixels": 0}
     probabilities = torch.stack(
@@ -536,10 +543,15 @@ def main(argv: list[str] | None = None) -> int:
         validation_dataset,
         indices=validation_indices,
         batch_size=validation_batch_size,
-        num_workers=num_workers,
-        pin_memory=bool(loader_config.get("pin_memory", True)),
-        persistent_workers=persistent_workers,
-        prefetch_factor=int(loader_config.get("prefetch_factor", 2)),
+        # Validation must not keep a second large worker/pinned-memory pool
+        # alive throughout the following training epoch. Apply these defaults
+        # to old experiment snapshots as well as newly created runs.
+        num_workers=int(
+            loader_config.get("validation_num_workers", min(2, num_workers))
+        ),
+        pin_memory=False,
+        persistent_workers=False,
+        prefetch_factor=1,
         drop_last=False,
         seed=int(training.get("seed", 42)),
     )
@@ -588,8 +600,7 @@ def main(argv: list[str] | None = None) -> int:
         if total_steps != max(1, epochs * steps_per_epoch):
             remaining_epochs = max(epochs - int(resume["next_epoch"]), 0)
             total_steps = max(
-                int(resume["optimizer_steps"])
-                + remaining_epochs * steps_per_epoch,
+                int(resume["optimizer_steps"]) + remaining_epochs * steps_per_epoch,
                 int(resume["optimizer_steps"]) + 1,
             )
             print(
@@ -632,7 +643,11 @@ def main(argv: list[str] | None = None) -> int:
         if bool(ema_config.get("enabled", True))
         else None
     )
-    amp_enabled = device.type == "cuda"
+    amp_dtype = resolve_amp_dtype(device, str(training.get("amp_dtype", "auto")))
+    amp_enabled = amp_dtype is not None
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
+    amp_name = str(amp_dtype).removeprefix("torch.") if amp_enabled else "none"
+    print(f"计算精度: {amp_name}，梯度缩放: {scaler.is_enabled()}")
     overlap = dict(train_config.get("overlap_consistency", {}))
     overlap_weight = float(overlap.get("weight", 0.0))
     overlap_interval = int(overlap.get("every_n_batches", 4))
@@ -688,6 +703,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("模型配置或标签映射与断点不一致")
         model.load_state_dict(resume["model"])
         optimizer.load_state_dict(resume["optimizer"])
+        if scaler.is_enabled() and resume.get("grad_scaler"):
+            scaler.load_state_dict(resume["grad_scaler"])
         scheduler.load_state_dict(resume["scheduler"])
         if ema is not None:
             for name, value in resume["ema"].items():
@@ -711,19 +728,24 @@ def main(argv: list[str] | None = None) -> int:
         print(f"已恢复断点，完成 {start_epoch} 轮，目标共 {epochs} 轮")
         del resume
     train_log["status"] = "running"
+    train_log["precision"] = {
+        "amp_dtype": amp_name,
+        "gradient_scaling": scaler.is_enabled(),
+    }
     (output / "train_log.json").write_text(
         json.dumps(train_log, indent=2), encoding="utf-8"
     )
 
     def optimizer_step() -> None:
         nonlocal optimizer_steps
-        if clipping_enabled:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-        optimizer.step()
-        scheduler.step()
-        optimizer_steps += 1
-        if ema is not None:
-            ema.update(model)
+        updated = scaled_optimizer_step(
+            optimizer, scaler, max_norm if clipping_enabled else None
+        )
+        if updated:
+            scheduler.step()
+            optimizer_steps += 1
+            if ema is not None:
+                ema.update(model)
         optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(start_epoch, epochs):
@@ -749,7 +771,10 @@ def main(argv: list[str] | None = None) -> int:
             unit="batch",
             dynamic_ncols=True,
         )
+        batch_finished_at = perf_counter()
         for batch in progress:
+            step_started_at = perf_counter()
+            data_seconds = step_started_at - batch_finished_at
             tensor_batch = {
                 key: value.to(device, non_blocking=True)
                 if isinstance(value, torch.Tensor)
@@ -757,7 +782,9 @@ def main(argv: list[str] | None = None) -> int:
                 for key, value in batch.items()
             }
             with torch.autocast(
-                device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
+                device_type=device.type,
+                dtype=amp_dtype or torch.float32,
+                enabled=amp_enabled,
             ):
                 prediction = model(tensor_batch)
                 if "core_mask" in tensor_batch:
@@ -786,6 +813,7 @@ def main(argv: list[str] | None = None) -> int:
             ground_truth_mask = (
                 tensor_batch["ground_truth_mask"] & tensor_batch["valid_mask"]
             )
+            source_loss = None
             predicted = prediction["fine_logits"].argmax(dim=1)
             if ground_truth_mask.any():
                 target = tensor_batch["ground_truth"] - 1
@@ -815,7 +843,7 @@ def main(argv: list[str] | None = None) -> int:
                 accumulation_steps,
                 len(loader) - (batches // accumulation_steps) * accumulation_steps,
             )
-            (loss / group_size).backward()
+            scaler.scale(loss / group_size).backward()
             if (
                 overlap_weight > 0
                 and epoch >= int(overlap.get("warmup_epochs", 3))
@@ -825,7 +853,9 @@ def main(argv: list[str] | None = None) -> int:
                     tensor_batch, int(overlap.get("crop_margin", 32))
                 )
                 with torch.autocast(
-                    device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled
+                    device_type=device.type,
+                    dtype=amp_dtype or torch.float32,
+                    enabled=amp_enabled,
                 ):
                     cropped_prediction = model(view)
                     consistency = overlap_consistency_loss(
@@ -835,15 +865,38 @@ def main(argv: list[str] | None = None) -> int:
                         top,
                         left,
                     )
-                (overlap_weight * consistency / group_size).backward()
+                scaler.scale(overlap_weight * consistency / group_size).backward()
                 overlap_loss_sum += float(consistency.detach())
                 overlap_batches += 1
                 del cropped_prediction, consistency, view
             if (batches + 1) % accumulation_steps == 0:
                 optimizer_step()
-            total += float(loss.detach().cpu())
+            loss_value = float(loss.detach())
+            total += loss_value
             batches += 1
-            progress.set_postfix(loss=f"{float(loss.detach().cpu()):.5f}")
+            # Release the previous forward's outputs before fetching/transferring
+            # another window. Backward has already consumed the saved tensors.
+            del (
+                ground_truth_mask,
+                source_loss,
+                loss,
+                loss_components,
+                prediction,
+                predicted,
+                tensor_batch,
+            )
+            status = {
+                "loss": f"{loss_value:.5f}",
+                "data": f"{data_seconds:.2f}s",
+                "step": f"{perf_counter() - step_started_at:.2f}s",
+            }
+            if device.type == "cuda":
+                status["VRAM"] = (
+                    f"{torch.cuda.memory_allocated(device) / 2**30:.2f}/"
+                    f"{torch.cuda.memory_reserved(device) / 2**30:.2f}G"
+                )
+            progress.set_postfix(status)
+            batch_finished_at = perf_counter()
         if batches % accumulation_steps:
             optimizer_step()
         epoch_loss = total / max(batches, 1)
@@ -857,7 +910,13 @@ def main(argv: list[str] | None = None) -> int:
         }
         if ema is not None:
             ema.copy_to(model)
-        validation = _evaluate(model, validation_loader, device)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        validation = _evaluate(model, validation_loader, device, amp_dtype=amp_name)
+        # Inference and training have different allocation patterns. Do not
+        # carry unused validation allocations into the next training epoch.
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
         (output / f"validation_epoch_{epoch + 1:03d}.json").write_text(
             json.dumps(validation, indent=2), encoding="utf-8"
         )
@@ -972,6 +1031,7 @@ def main(argv: list[str] | None = None) -> int:
                 "model": current_state,
                 "contract": model_config,
                 "optimizer": optimizer.state_dict(),
+                "grad_scaler": scaler.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "total_steps": total_steps,
                 "warmup_steps": warmup_steps,

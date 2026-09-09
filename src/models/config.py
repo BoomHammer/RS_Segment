@@ -78,6 +78,13 @@ def load_model_contract(config_path: str | Path, run: str | Path) -> dict[str, A
     with Path(config_path).open(encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
     model = dict(raw.get("model", {}))
+    pretrained = dict(model.get("pretrained", {}))
+    if pretrained.get("path") is not None:
+        path = Path(pretrained["path"])
+        pretrained["path"] = str(
+            path if path.is_absolute() else (Path(config_path).parent / path).resolve()
+        )
+    model["pretrained"] = pretrained
     artifacts = dict(model.get("artifacts", {}))
     sample_index = artifacts.get("sample_index", "auto")
     label_mapping = artifacts.get("label_mapping", "auto")

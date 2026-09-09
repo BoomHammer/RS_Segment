@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from datetime import datetime
@@ -42,28 +43,41 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--max-windows", type=int, default=None)
+    parser.add_argument(
+        "--resume", type=Path, default=None, help="last.pt；跳过准备数据并续训后预测"
+    )
     args = parser.parse_args(argv)
     root = Path.cwd().resolve()
     config = args.data_config.resolve()
-    processed = load_config(config).data.processed
-    before = (
-        {path.resolve() for path in processed.iterdir()}
-        if processed.is_dir()
-        else set()
-    )
-    _run(root, "preprocess", ["--config", str(config)])
-    run = _latest_run(processed, before)
-    _run(
-        root,
-        "datasets",
-        [
-            str(run),
-            "--config",
-            str(config),
-            "--train-config",
-            str(args.train_config.resolve()),
-        ],
-    )
+    if args.resume is not None:
+        resume = args.resume.resolve()
+        metadata_path = resume.parent / "train_log.json"
+        if not metadata_path.is_file():
+            raise FileNotFoundError(f"断点目录缺少 train_log.json: {resume.parent}")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        run = Path(metadata["source_run"]).resolve()
+        if not run.is_dir():
+            raise NotADirectoryError(f"训练数据目录不存在: {run}")
+    else:
+        processed = load_config(config).data.processed
+        before = (
+            {path.resolve() for path in processed.iterdir()}
+            if processed.is_dir()
+            else set()
+        )
+        _run(root, "preprocess", ["--config", str(config)])
+        run = _latest_run(processed, before)
+        _run(
+            root,
+            "datasets",
+            [
+                str(run),
+                "--config",
+                str(config),
+                "--train-config",
+                str(args.train_config.resolve()),
+            ],
+        )
     train_args = [
         str(run),
         "--data-config",
@@ -77,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
         train_args.extend(["--epochs", str(args.epochs)])
     if args.device is not None:
         train_args.extend(["--device", args.device])
+    if args.resume is not None:
+        train_args.extend(["--resume", str(args.resume.resolve())])
     _run(root, "train", train_args)
     experiments = root / "experiments"
     experiment_candidates = sorted(

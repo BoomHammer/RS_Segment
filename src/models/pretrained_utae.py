@@ -47,7 +47,7 @@ class MaskedUTAE(UTAE):
         heads, batch, time = attention.shape[:3]
         height, width = features.shape[-2:]
         weights = F.interpolate(
-            attention.flatten(0, 1),
+            attention.flatten(0, 1).float(),
             size=(height, width),
             mode="bilinear",
             align_corners=False,
@@ -82,9 +82,12 @@ class MaskedUTAE(UTAE):
                     ]
                 )
                 continue
-            values = sequence[sample : sample + 1, active]
-            valid = present[sample : sample + 1, active]
-            dates = positions[sample : sample + 1, active]
+            # Boolean indexing copies the entire sequence. The common case
+            # without padded dates can keep a view of the checkpoint inputs.
+            selection = slice(None) if active.all() else active
+            values = sequence[sample : sample + 1, selection]
+            valid = present[sample : sample + 1, selection]
+            dates = positions[sample : sample + 1, selection]
             features = [self._encode(self.in_conv, values)]
             for block in self.down_blocks:
                 features.append(self._encode(block, features[-1]))
@@ -92,7 +95,7 @@ class MaskedUTAE(UTAE):
                 F.adaptive_max_pool2d(
                     valid.flatten(0, 1).float(), features[-1].shape[-2:]
                 )
-                .unflatten(0, (1, int(active.sum())))
+                .unflatten(0, (1, values.shape[1]))
                 .squeeze(2)
                 .bool()
             )
@@ -102,7 +105,17 @@ class MaskedUTAE(UTAE):
             output = output * coarse_valid.any(dim=1)[:, None]
             maps = [output]
             for i, block in enumerate(self.up_blocks):
-                skip = self._aggregate(features[-i - 2], attention, valid)
+                skip = (
+                    checkpoint(
+                        self._aggregate,
+                        features[-i - 2],
+                        attention,
+                        valid,
+                        use_reentrant=False,
+                    )
+                    if self.training and torch.is_grad_enabled()
+                    else self._aggregate(features[-i - 2], attention, valid)
+                )
                 output = block(output, skip)
                 maps.append(output)
             per_sample.append(list(reversed(maps)))
@@ -205,11 +218,24 @@ class PretrainedSegFormerUTAE(nn.Module):
 
     def forward(self, batch):
         clean = sanitize_batch(batch)
+        device_type = clean["dynamic"].device.type
+        input_dtype = (
+            torch.get_autocast_dtype(device_type)
+            if torch.is_autocast_enabled(device_type)
+            else clean["dynamic"].dtype
+        )
+        # Checkpoint inputs live until backward. Store frame chunks in the same
+        # dtype their convolutions use instead of retaining a full FP32 copy.
         dynamic = torch.cat(
-            [clean["dynamic"], clean["dynamic_value_mask"].float()], dim=2
+            [
+                clean["dynamic"].to(input_dtype),
+                clean["dynamic_value_mask"].to(input_dtype),
+            ],
+            dim=2,
         )
         present = clean["dynamic_value_mask"].any(dim=2, keepdim=True)
         present = present & clean["dynamic_time_mask"][:, :, None, None, None]
+        del clean["dynamic"], clean["dynamic_value_mask"]
         static = torch.cat([clean["static"], clean["static_value_mask"].float()], dim=1)
         height, width = static.shape[-2:]
         # U-TAE transposed convolutions require matching sizes at all four scales.

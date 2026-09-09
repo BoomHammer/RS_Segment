@@ -91,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     inferencer = SAM2Inferencer(
         args.checkpoint
         or config.data.sam2_checkpoint
-        or Path("SAM/sam2.1_hiera_small.pt"),
+        or Path("third_party/SAM/sam2.1_hiera_small.pt"),
         device=args.device,
         input_range=(0.0, 255.0),
         use_video=True,

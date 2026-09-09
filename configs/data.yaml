@@ -1,7 +1,7 @@
 # 数据检查、预处理和训练共用的数据配置。
 data:
   # SAM2 权重文件；相对本配置文件所在目录解析，也可被命令行 --checkpoint 覆盖。
-  sam2_checkpoint: ../SAM/sam2.1_hiera_small.pt
+  sam2_checkpoint: ../third_party/SAM/sam2.1_hiera_small.pt
   # 数据总目录及各类数据子目录。
   root: ../data
   labels: ../data/labels

@@ -9,7 +9,9 @@ from huggingface_hub import model_info, snapshot_download
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("data/pretrained/mit-b1"))
+    parser.add_argument(
+        "--output", type=Path, default=Path("third_party/pretrained/mit-b1")
+    )
     parser.add_argument(
         "--revision", default="13ddceec4e8bdf401e7cd7acf5aebc526222518c"
     )

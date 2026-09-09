@@ -18,6 +18,7 @@ from data.sample_index import WindowedSampleDataset
 from data.sampling import build_dataloader
 from data.spatial_split import load_spatial_split
 from models.architecture import SegFormerUtae
+from precision import resolve_amp_dtype
 
 
 def _roc_curve(
@@ -211,9 +212,7 @@ def main(argv: list[str] | None = None) -> int:
     if not data_config_path.is_file():
         data_config_path = Path("configs/data.yaml")
     data_config = load_config(data_config_path)
-    train_config_path = experiment_dir / str(
-        metadata.get("train_config", "train.yaml")
-    )
+    train_config_path = experiment_dir / str(metadata.get("train_config", "train.yaml"))
     if not train_config_path.is_file():
         train_config_path = Path("configs/train.yaml")
     with train_config_path.open(encoding="utf-8") as stream:
@@ -252,6 +251,9 @@ def main(argv: list[str] | None = None) -> int:
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     model.to(device).eval()
+    amp_dtype = resolve_amp_dtype(
+        device, str(train_config.get("training", {}).get("amp_dtype", "auto"))
+    )
     loader_config = dict(train_config.get("dataloader", {}))
     num_workers = int(loader_config.get("num_workers", 0))
     loader = build_dataloader(
@@ -276,7 +278,12 @@ def main(argv: list[str] | None = None) -> int:
                 else value
                 for key, value in batch.items()
             }
-            output = model(tensor_batch)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype or torch.float32,
+                enabled=amp_dtype is not None,
+            ):
+                output = model(tensor_batch)
             mask = tensor_batch["ground_truth_mask"] & tensor_batch["valid_mask"]
             target = (tensor_batch["ground_truth"] - 1).masked_fill(~mask, -1)
             if mask.any():

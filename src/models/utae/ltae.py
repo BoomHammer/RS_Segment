@@ -108,14 +108,11 @@ class LTAE2d(nn.Module):
             out = self.inconv(out.permute(0, 2, 1)).permute(0, 2, 1)
 
         if self.positional_encoder is not None:
-            bp = (
-                batch_positions.unsqueeze(-1)
-                .repeat((1, 1, h))
-                .unsqueeze(-1)
-                .repeat((1, 1, 1, w))
-            )  # BxTxHxW
-            bp = bp.permute(0, 2, 3, 1).contiguous().view(sz_b * h * w, seq_len)
-            out = out + self.positional_encoder(bp)
+            # Dates are shared by all pixels: compute sin/cos once per date.
+            position = self.positional_encoder(batch_positions)
+            out = (
+                out.reshape(sz_b, h * w, seq_len, self.d_model) + position[:, None]
+            ).reshape(sz_b * h * w, seq_len, self.d_model)
 
         out, attn = self.attention_heads(out, pad_mask=pad_mask)
 
@@ -159,9 +156,7 @@ class MultiHeadAttention(nn.Module):
         d_k, d_in, n_head = self.d_k, self.d_in, self.n_head
         sz_b, seq_len, _ = v.size()
 
-        q = torch.stack([self.Q for _ in range(sz_b)], dim=1).view(
-            -1, d_k
-        )  # (n*b) x d_k
+        q = self.Q[:, None].expand(-1, sz_b, -1).reshape(-1, d_k)
 
         k = self.fc1_k(v).view(sz_b, seq_len, n_head, d_k)
         k = k.permute(2, 0, 1, 3).contiguous().view(-1, seq_len, d_k)  # (n*b) x lk x dk
@@ -213,7 +208,9 @@ class ScaledDotProductAttention(nn.Module):
         if return_comp:
             comp = attn
         # compat = attn
-        attn = self.softmax(attn)
+        # FP16 cannot represent the 1e-8 denominator for fully masked pixels.
+        # Keep normalization in FP32, including its backward computation.
+        attn = self.softmax(attn.float())
         if pad_mask is not None:
             attn = attn.masked_fill(pad_mask.unsqueeze(1), 0.0)
             attn = attn / attn.sum(dim=2, keepdim=True).clamp_min(1e-8)
