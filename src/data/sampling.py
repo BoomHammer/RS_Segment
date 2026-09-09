@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Sampler, get_worker_info
 
 from .sample_index import WindowedSampleDataset, sample_collate_fn
 from .spatial_split import SpatialSplitManifest, load_spatial_split
+from .training_policy import point_owner
 
 
 class SpatialWeightedSampler(Sampler[int]):
@@ -33,9 +34,11 @@ class SpatialWeightedSampler(Sampler[int]):
             indices = loaded.splits[split]
             class_weights = loaded.class_weights
             block_size = loaded.block_size
+            point_manifest = loaded
         else:
             class_weights = {}
             block_size = (2048, 2048)
+            point_manifest = None
         self.dataset = dataset
         self.indices = list(range(len(dataset))) if indices is None else list(indices)
         if not self.indices:
@@ -46,6 +49,8 @@ class SpatialWeightedSampler(Sampler[int]):
             raise ValueError("replacement=False 时 num_samples 不能超过索引数量")
         self.seed = seed
         self.epoch = 0
+        self.point_manifest = point_manifest
+        self.split = split
         self.weights = self._build_weights(
             self.indices,
             class_weights,
@@ -62,6 +67,11 @@ class SpatialWeightedSampler(Sampler[int]):
     ) -> torch.Tensor:
         window_classes: dict[int, Counter[str]] = {}
         for (row, column), code in self.dataset.ground_truth_pixels.items():
+            if (
+                self.point_manifest is not None
+                and point_owner(row, column, self.point_manifest) != self.split
+            ):
+                continue
             for window_id in self.dataset.query_windows_for_pixel(row, column):
                 if window_id in indices:
                     window_classes.setdefault(window_id, Counter())[str(code)] += 1

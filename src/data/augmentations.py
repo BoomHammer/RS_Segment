@@ -11,6 +11,7 @@ from torch import Tensor
 
 SPATIAL_KEYS = (
     "core_mask",
+    "supervision_split_mask",
     "dynamic",
     "static",
     "ground_truth",

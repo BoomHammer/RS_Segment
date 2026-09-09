@@ -91,3 +91,45 @@ def test_compute_stats_groups_dynamic_series_and_static_files(tmp_path: Path) ->
     assert groups["SR_B1"]["files"][0]["date"] == "2023-01-01"
     assert "date" not in groups["DSM"]["files"][0]
     assert groups["DSM"]["statistics"]["mean"] == 11.0
+
+
+def test_compute_stats_applies_configured_product_range_and_scale(
+    tmp_path: Path,
+) -> None:
+    dynamic_directory = tmp_path / "dynamic"
+    dynamic_directory.mkdir()
+    with rasterio.open(
+        dynamic_directory / "LST230101.tif",
+        "w",
+        driver="GTiff",
+        width=3,
+        height=1,
+        count=1,
+        dtype="uint16",
+        transform=from_origin(0, 1, 1, 1),
+    ) as dataset:
+        dataset.write(np.array([[0, 7500, 10000]], dtype=np.uint16), 1)
+    range_path = tmp_path / "ranges.csv"
+    range_path.write_text("Data,Min,Max,Scale\nLST,7500,65535,0.02\n", encoding="utf-8")
+    config_path = tmp_path / "dataset.yaml"
+    config_path.write_text(
+        "data:\n"
+        f"  dynamic: {dynamic_directory.as_posix()}\n"
+        "  stage2:\n"
+        f"    value_range_file: {range_path.as_posix()}\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "stats.json"
+
+    assert main(["--config", str(config_path), "--output", str(output_path)]) == 0
+
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    group = payload["groups"][0]
+    assert payload["schema_version"] == 4
+    assert group["statistics"]["count"] == 2
+    assert group["statistics"]["mean"] == 175
+    assert group["value_range"] == {
+        "minimum": 7500.0,
+        "maximum": 65535.0,
+        "scale": 0.02,
+    }

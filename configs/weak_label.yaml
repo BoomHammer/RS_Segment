@@ -30,7 +30,7 @@ weak_label:
   reject_boundary_touch: true
   # 冲突类别之间的最小置信度差。
   conflict_margin: 0.05
-  # 输入影像拉伸前的固定值范围。
+  # 输入影像拉伸前的固定值范围。(多光谱影像的有效值范围)
   input_range: [-100.0, 16000.0]
   # 百分位拉伸范围。
   stretch_percentiles: [2.0, 98.0]

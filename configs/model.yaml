@@ -28,6 +28,8 @@ model:
     ground_truth_weight: 1.0
     # 伪标签损失权重；仅用于训练。
     weak_label_weight: 0.5
+    # Focal Loss 聚焦参数；作为层级交叉熵的辅助调制项，0 表示普通交叉熵。
+    focal_gamma: 2.0
     # 无效标签的忽略值。
     ignore_index: -1
   artifacts:

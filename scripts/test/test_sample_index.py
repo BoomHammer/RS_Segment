@@ -17,7 +17,7 @@ from data.sample_index import (
     sample_collate_fn,
 )
 from data.sampling import SpatialWeightedSampler, build_dataloader
-from data.spatial_split import build_spatial_split
+from data.spatial_split import SpatialSplitManifest, build_spatial_split
 
 
 def _write_raster(path: Path, values: np.ndarray) -> None:
@@ -196,3 +196,57 @@ def test_valid_mask_survives_partial_static_nodata(tmp_path: Path) -> None:
     index = build_sample_index(dynamic_dir=dynamic, static_dir=static, target_grid=grid)
     sample = WindowedSampleDataset(index, window_size=(2, 2))[0]
     assert sample["valid_mask"].tolist() == [[True, True], [True, True]]
+
+
+def test_fixed_split_ownership_masks_ground_truth_and_weak_labels(tmp_path: Path):
+    dynamic = tmp_path / "dynamic"
+    static = tmp_path / "static"
+    dynamic.mkdir()
+    static.mkdir()
+    dynamic_path = dynamic / "NDVI230101.tif"
+    _write_raster(dynamic_path, np.ones((4, 4), dtype=np.float32))
+    _write_raster(static / "DEM.tif", np.ones((4, 4), dtype=np.float32))
+    weak_path = tmp_path / "weak.tif"
+    _write_raster(weak_path, np.ones((4, 4), dtype=np.int16))
+    grid = target_grid_from_raster(dynamic_path, target_crs="EPSG:4326", resolution=1)
+    index = build_sample_index(
+        dynamic_dir=dynamic,
+        static_dir=static,
+        target_grid=grid,
+        weak_label_file=weak_path,
+    )
+    train = WindowedSampleDataset(index, window_size=(4, 4))
+    validation = WindowedSampleDataset(index, window_size=(4, 4), use_weak_labels=False)
+    train._ground_truth = {(0, 0): 1, (1, 0): 1, (0, 2): 1}
+    validation._ground_truth = dict(train._ground_truth)
+    manifest = SpatialSplitManifest(
+        schema_version=1,
+        seed=1,
+        block_size=(2, 2),
+        ratios=(0.5, 0.5, 0),
+        splits={"train": [0], "validation": [0], "test": []},
+        blocks={
+            "0:0": "train",
+            "0:1": "validation",
+            "1:0": "train",
+            "1:1": "validation",
+        },
+        class_counts={},
+        class_weights={},
+        sampling_weights={},
+    )
+    train.configure_supervision_split(manifest, "train", mask_weak_labels=True)
+    validation.configure_supervision_split(
+        manifest, "validation", mask_weak_labels=False
+    )
+    train_sample = train[0]
+    validation_sample = validation[0]
+    assert train_sample["ground_truth_mask"].nonzero().tolist() == [[0, 0], [1, 0]]
+    selected_sample = train[(0, (0, 0))]
+    assert selected_sample["ground_truth_mask"].nonzero().tolist() == [[0, 0]]
+    assert validation_sample["ground_truth_mask"].nonzero().tolist() == [[0, 2]]
+    assert not (
+        train_sample["ground_truth_mask"] & validation_sample["ground_truth_mask"]
+    ).any()
+    assert train_sample["weak_label_mask"][:, :2].all()
+    assert not train_sample["weak_label_mask"][:, 2:].any()

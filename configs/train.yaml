@@ -21,6 +21,8 @@ training:
 dataloader:
   # 训练/验证每个 batch 包含的窗口数量。增大可提高 GPU 吞吐，但会增加显存占用。
   batch_size: 2
+  # 验证没有反向传播；即使训练因 halo 降为单窗口，验证仍可按此批量前向。
+  validation_batch_size: 2
   # 数据加载子进程数量。大于 0 时可并行读取和预处理 GeoTIFF，减少 GPU 等待。
   # 建议从 2~4 开始测试；过大可能造成磁盘争用和内存占用增加。
   num_workers: 6
@@ -32,6 +34,21 @@ dataloader:
   prefetch_factor: 2
   # 最后一个不完整 batch 是否丢弃。训练时可保持 batch 尺寸稳定，验证时通常关闭。
   drop_last: false
+
+# 默认仅采样核心区域包含实测点的训练窗口。窗口内的无标签像素和 halo
+# 仍作为上下文输入，但完全没有实测监督的窗口不进入训练和验证。
+supervision_policy:
+  # 真实点按空间块获得唯一 train/validation/test 归属，跨界窗口不得改变点的归属。
+  fixed_spatial_supervision: true
+  # 是否丢弃输入范围（含 halo）触及其他划分空间块的窗口。
+  # 当前关闭：稀疏样点靠近块边界时，严格丢弃会让部分训练类没有可用窗口。
+  # 关闭不影响监督隔离；非训练块的真实标签和伪标签仍始终为 ignore_index。
+  isolate_spatial_splits: false
+  measured_windows_only: true
+  skip_unlabeled_validation: true
+  # 每轮让训练划分中的全部独立真实点各作为锚点一次，并按类别交错排序；
+  # 每个锚点随机选择一个覆盖窗口，训练伪标签也只保留训练块内像元。
+  class_balanced_point_sampling: true
 
 optimizer:
   # 优化器名称；当前训练入口使用 AdamW。

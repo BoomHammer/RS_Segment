@@ -8,6 +8,8 @@ import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from losses.focal import focal_cross_entropy
+
 
 def effective_number_weights(
     counts: Sequence[int] | Tensor, beta: float = 0.9999
@@ -36,12 +38,6 @@ def _coarse_labels(
     return output
 
 
-def _safe_cross_entropy(logits: Tensor, labels: Tensor, **kwargs: object) -> Tensor:
-    if labels.ne(kwargs.get("ignore_index", -100)).any():
-        return F.cross_entropy(logits, labels, **kwargs)
-    return logits.sum() * 0.0
-
-
 def hierarchical_supervision_loss(
     outputs: dict[str, Tensor],
     batch: dict[str, Tensor],
@@ -50,6 +46,7 @@ def hierarchical_supervision_loss(
     ground_truth_weight: float = 1.0,
     weak_label_weight: float = 0.5,
     hierarchy_weight: float = 0.2,
+    focal_gamma: float = 0.0,
     class_weights: Tensor | None = None,
     ignore_index: int = -1,
 ) -> dict[str, Tensor]:
@@ -70,14 +67,18 @@ def hierarchical_supervision_loss(
         mask = batch[f"{source}_mask"] & valid_pixels
         fine_labels = _zero_based(labels, mask, ignore_index)
         coarse_labels = _coarse_labels(labels, mask, mapping, ignore_index)
-        fine_loss = _safe_cross_entropy(
+        fine_loss = focal_cross_entropy(
             outputs["fine_logits"],
             fine_labels,
+            gamma=focal_gamma,
             weight=class_weights,
             ignore_index=ignore_index,
         )
-        coarse_loss = _safe_cross_entropy(
-            outputs["coarse_logits"], coarse_labels, ignore_index=ignore_index
+        coarse_loss = focal_cross_entropy(
+            outputs["coarse_logits"],
+            coarse_labels,
+            gamma=focal_gamma,
+            ignore_index=ignore_index,
         )
         source_losses[f"{source}_fine_loss"] = fine_loss
         source_losses[f"{source}_coarse_loss"] = coarse_loss

@@ -407,7 +407,7 @@ def train(output, activation, four_hidden, epochs, batch_size, seed):
                 "activation": activation,
                 "four_hidden": four_hidden,
             },
-            folder / "best.pt",
+            folder / "best_loss.pt",
         )
         write_json(folder / "metrics.json", result)
         results[name] = result

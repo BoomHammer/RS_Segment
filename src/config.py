@@ -67,7 +67,7 @@ def load_config(path: str | Path) -> AppConfig:
     if not isinstance(data, dict):
         raise ValueError("配置中的 data 必须是对象")
     stage2 = dict(data.get("stage2", {}))
-    for key in ("statistics_file", "split_file"):
+    for key in ("statistics_file", "split_file", "value_range_file"):
         if stage2.get(key) is not None:
             stage2[key] = str(_resolve_path(stage2[key], config_path.parent))
     return AppConfig(

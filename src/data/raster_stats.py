@@ -109,12 +109,22 @@ def stream_raster_statistics(
     band: int = 1,
     window_size: tuple[int, int] = (1024, 1024),
     nodata: float | int | None = None,
+    valid_minimum: float | None = None,
+    valid_maximum: float | None = None,
+    scale: float = 1.0,
 ) -> RasterStatistics:
     """Calculate statistics for one band by reading bounded raster windows.
 
     ``nodata=None`` uses the GeoTIFF's declared NoData value. Regardless of
-    metadata, NaN and infinite values are always excluded.
+    metadata, NaN and infinite values are always excluded. Product ranges are
+    evaluated on raw values before the retained values are multiplied by ``scale``.
     """
+
+    if valid_minimum is not None and valid_maximum is not None:
+        if valid_minimum > valid_maximum:
+            raise ValueError("valid_minimum 不得大于 valid_maximum")
+    if not np.isfinite(scale) or scale == 0:
+        raise ValueError("scale 必须是非零有限数值")
 
     statistics = RasterStatistics()
     with rasterio.open(path) as dataset:
@@ -127,7 +137,11 @@ def stream_raster_statistics(
             valid = ~np.ma.getmaskarray(masked) & np.isfinite(values)
             if missing_value is not None:
                 valid &= values != missing_value
-            statistics.update(values[valid])
+            if valid_minimum is not None:
+                valid &= values >= valid_minimum
+            if valid_maximum is not None:
+                valid &= values <= valid_maximum
+            statistics.update(values[valid].astype(np.float64) * scale)
     return statistics
 
 

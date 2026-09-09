@@ -22,6 +22,12 @@ from torchgeo.datasets.utils import BoundingBox
 from .filename_parser import RasterMetadata, scan_dynamic_directory
 from .labels import LabelRecord, build_label_mapping, iter_encoded_labels
 from .raster_alignment import TargetGrid, aligned_raster, locate_points
+from .value_ranges import (
+    ValueRange,
+    load_value_ranges,
+    valid_and_scaled,
+    value_range_for,
+)
 
 INDEX_SCHEMA_VERSION = 2
 
@@ -264,6 +270,40 @@ def load_raster_statistics(
     return result
 
 
+def _statistics_payload(source: str | Path | dict[str, Any] | None) -> dict[str, Any]:
+    if source is None:
+        return {}
+    return (
+        json.loads(Path(source).read_text(encoding="utf-8"))
+        if isinstance(source, (str, Path))
+        else source
+    )
+
+
+def _validate_statistics_value_ranges(
+    payload: dict[str, Any], ranges: dict[str, ValueRange]
+) -> None:
+    """Reject raw-DN statistics when scaled product rules are configured."""
+
+    if not payload:
+        return
+    if int(payload.get("schema_version", 0)) < 4:
+        raise ValueError("栅格统计量未应用有效值范围和 Scale，请重新生成统计量")
+    for group in payload.get("groups", []):
+        category = str(group["category"])
+        expected = value_range_for(category, ranges)
+        recorded = group.get("value_range")
+        if expected is None or recorded is None:
+            raise ValueError(f"栅格统计量缺少有效值规则: {category}")
+        actual = ValueRange(
+            float(recorded["minimum"]),
+            float(recorded["maximum"]),
+            float(recorded["scale"]),
+        )
+        if actual != expected:
+            raise ValueError(f"栅格统计量有效值规则已变化: {category}")
+
+
 def _grid_from_index(index: SampleIndex) -> TargetGrid:
     from affine import Affine
 
@@ -333,12 +373,21 @@ class WindowedSampleDataset(GeoDataset):
         self.halo = halo
         self.transforms = transforms
         self.use_weak_labels = use_weak_labels
-        self.statistics = load_raster_statistics(statistics)
+        self._supervision_split: str | None = None
+        self._supervision_block_size: tuple[int, int] | None = None
+        self._supervision_blocks: dict[str, str] = {}
+        self._mask_weak_labels_by_split = False
+        stage2_config = stage2 or {}
+        self.value_ranges = load_value_ranges(stage2_config.get("value_range_file"))
+        statistics_payload = _statistics_payload(statistics)
+        if self.value_ranges:
+            _validate_statistics_value_ranges(statistics_payload, self.value_ranges)
+        self.statistics = load_raster_statistics(statistics_payload)
         self.nodata = float(nodata)
         self._label_columns = label_columns or {}
         self._ground_truth: dict[tuple[int, int], int] = {}
         self._load_ground_truth(label_mapping)
-        self._configure_stage2(stage2 or {})
+        self._configure_stage2(stage2_config)
         rows = range(self.grid_offset[1], self.grid.height, self.stride[1])
         columns = range(self.grid_offset[0], self.grid.width, self.stride[0])
         records = []
@@ -439,6 +488,16 @@ class WindowedSampleDataset(GeoDataset):
             {_feature_name(asset) for asset in dynamic_assets}
         )
         self._dynamic_times = times
+        if self.value_ranges:
+            missing_ranges = sorted(
+                {
+                    self._value_range_key(asset)
+                    for asset in (*dynamic_assets, *static_assets)
+                    if self._value_range_for_asset(asset) is None
+                }
+            )
+            if missing_ranges:
+                raise ValueError(f"输入特征缺少有效值范围: {missing_ranges}")
         if normalization.get("require_statistics", False):
             keys = [_feature_name(asset) for asset in dynamic_assets]
             keys.extend(asset.name for asset in static_assets)
@@ -472,7 +531,51 @@ class WindowedSampleDataset(GeoDataset):
             if item["inside"]
         }
 
-    def __getitem__(self, index: int | BoundingBox) -> dict[str, Any]:
+    def configure_supervision_split(
+        self, manifest: Any, split: str, *, mask_weak_labels: bool
+    ) -> None:
+        """Expose supervision owned by one fixed spatial split only."""
+
+        if split not in manifest.splits:
+            raise ValueError(f"未知监督划分: {split}")
+        self._supervision_split = split
+        self._supervision_block_size = tuple(manifest.block_size)
+        self._supervision_blocks = dict(manifest.blocks)
+        self._mask_weak_labels_by_split = mask_weak_labels
+
+    def _owner(self, row: int, column: int) -> str | None:
+        if self._supervision_block_size is None:
+            return None
+        width, height = self._supervision_block_size
+        return self._supervision_blocks.get(f"{row // height}:{column // width}")
+
+    def _owned_mask(self, window: Window) -> np.ndarray:
+        shape = (int(window.height), int(window.width))
+        if self._supervision_split is None or self._supervision_block_size is None:
+            return np.ones(shape, dtype=bool)
+        rows = np.arange(int(window.row_off), int(window.row_off + window.height))
+        columns = np.arange(int(window.col_off), int(window.col_off + window.width))
+        width, height = self._supervision_block_size
+        block_rows = rows // height
+        block_columns = columns // width
+        result = np.zeros(shape, dtype=bool)
+        for block_row in np.unique(block_rows):
+            for block_column in np.unique(block_columns):
+                if (
+                    self._supervision_blocks.get(f"{block_row}:{block_column}")
+                    == self._supervision_split
+                ):
+                    result[
+                        np.ix_(block_rows == block_row, block_columns == block_column)
+                    ] = True
+        return result
+
+    def __getitem__(
+        self, index: int | tuple[int, tuple[int, int]] | BoundingBox
+    ) -> dict[str, Any]:
+        selected_ground_truth = None
+        if isinstance(index, tuple):
+            index, selected_ground_truth = index
         if isinstance(index, int):
             row = self.index.iloc[index]
             window = _window(int(row.row), int(row.column), self.window_size, self.grid)
@@ -481,7 +584,11 @@ class WindowedSampleDataset(GeoDataset):
         else:
             raise TypeError("样本索引必须是整数或 TorchGeo BoundingBox")
         input_window = _expanded_window(window, self.halo, self.grid)
-        sample = self._read_window(input_window)
+        sample = (
+            self._read_window(input_window)
+            if selected_ground_truth is None
+            else self._read_window(input_window, selected_ground_truth)
+        )
         sample["window"] = window
         sample["input_window"] = input_window
         core_mask = torch.zeros_like(sample["valid_mask"])
@@ -533,7 +640,19 @@ class WindowedSampleDataset(GeoDataset):
             invalid |= result == float(asset.nodata)
         invalid |= result == self.nodata
         result[invalid] = np.nan
+        value_range = self._value_range_for_asset(asset)
+        if value_range is not None:
+            result = valid_and_scaled(result, value_range)
         return result
+
+    @staticmethod
+    def _value_range_key(asset: RasterAsset) -> str:
+        return _feature_name(asset) if asset.role == "dynamic" else asset.name
+
+    def _value_range_for_asset(self, asset: RasterAsset) -> ValueRange | None:
+        if asset.role not in {"dynamic", "static"}:
+            return None
+        return value_range_for(self._value_range_key(asset), self.value_ranges)
 
     def _normalized(self, values: np.ndarray, key: str) -> np.ndarray:
         statistics = self._statistics_for(key)
@@ -547,7 +666,9 @@ class WindowedSampleDataset(GeoDataset):
             return self._casefold_statistics.get(key.casefold())
         return self.statistics.get(key)
 
-    def _read_window(self, window: Window) -> dict[str, Any]:
+    def _read_window(
+        self, window: Window, selected_ground_truth: tuple[int, int] | None = None
+    ) -> dict[str, Any]:
         dynamic_assets = self._dynamic_assets
         dynamic_features = self._dynamic_features
         dynamic_times = self._dynamic_times
@@ -595,6 +716,7 @@ class WindowedSampleDataset(GeoDataset):
         dynamic_valid = np.isfinite(dynamic_array).any(axis=(0, 1))
         static_valid = np.isfinite(static_array).any(axis=0)
         shape = dynamic_array.shape[-2:]
+        supervision_split_mask = self._owned_mask(window)
         weak = np.full(shape, -1, dtype=np.int64)
         if self.use_weak_labels and self.sample_index.weak_label is not None:
             weak_values = self._read_asset(
@@ -608,9 +730,21 @@ class WindowedSampleDataset(GeoDataset):
                 window,
             )
             weak = np.where(np.isfinite(weak_values), weak_values, -1).astype(np.int64)
+            if self._mask_weak_labels_by_split:
+                weak = np.where(supervision_split_mask, weak, -1)
         ground_truth = np.full(shape, -1, dtype=np.int64)
         row_start, col_start = int(window.row_off), int(window.col_off)
         for (row, column), code in self._ground_truth.items():
+            if (
+                selected_ground_truth is not None
+                and (row, column) != selected_ground_truth
+            ):
+                continue
+            if (
+                self._supervision_split is not None
+                and self._owner(row, column) != self._supervision_split
+            ):
+                continue
             local_row, local_column = row - row_start, column - col_start
             if 0 <= local_row < shape[0] and 0 <= local_column < shape[1]:
                 ground_truth[local_row, local_column] = code
@@ -632,6 +766,7 @@ class WindowedSampleDataset(GeoDataset):
             "dynamic_valid_mask": torch.from_numpy(dynamic_valid),
             "static_valid_mask": torch.from_numpy(static_valid),
             "valid_mask": torch.from_numpy(dynamic_valid | static_valid),
+            "supervision_split_mask": torch.from_numpy(supervision_split_mask),
             "ground_truth": torch.from_numpy(ground_truth),
             "ground_truth_mask": torch.from_numpy(ground_truth >= 0),
             "weak_label": torch.from_numpy(weak),
@@ -717,6 +852,14 @@ def sample_collate_fn(
             [sample["static_valid_mask"] for sample in samples]
         ),
         "valid_mask": torch.stack([sample["valid_mask"] for sample in samples]),
+        "supervision_split_mask": torch.stack(
+            [
+                sample.get(
+                    "supervision_split_mask", torch.ones_like(sample["valid_mask"])
+                )
+                for sample in samples
+            ]
+        ),
         "core_mask": torch.stack(
             [
                 sample.get("core_mask", torch.ones_like(sample["valid_mask"]))

@@ -7,13 +7,49 @@ from data.sample_index import WindowedSampleDataset
 from data.spatial_split import SpatialSplitManifest
 
 
-def point_windows(dataset: WindowedSampleDataset) -> dict[int, Counter]:
+def point_owner(row: int, column: int, manifest: SpatialSplitManifest) -> str | None:
+    """Return the single split owning a target-grid position."""
+
+    width, height = manifest.block_size
+    return manifest.blocks.get(f"{row // height}:{column // width}")
+
+
+def point_windows(
+    dataset: WindowedSampleDataset,
+    manifest: SpatialSplitManifest | None = None,
+    split: str | None = None,
+) -> dict[int, Counter]:
     """Index measured labels in window cores without reading raster imagery."""
+
+    if (manifest is None) != (split is None):
+        raise ValueError("manifest 和 split 必须同时提供")
     result: dict[int, Counter] = {}
     for pixel, code in dataset.ground_truth_pixels.items():
+        if manifest is not None and point_owner(*pixel, manifest) != split:
+            continue
         for index in dataset.query_windows_for_pixel(*pixel):
             result.setdefault(index, Counter())[str(code)] += 1
     return result
+
+
+def assert_supervision_isolated(
+    dataset: WindowedSampleDataset, manifest: SpatialSplitManifest
+) -> None:
+    """Assert fixed point ownership makes train and validation supervision disjoint."""
+
+    train = {
+        pixel
+        for pixel in dataset.ground_truth_pixels
+        if point_owner(*pixel, manifest) == "train"
+    }
+    validation = {
+        pixel
+        for pixel in dataset.ground_truth_pixels
+        if point_owner(*pixel, manifest) == "validation"
+    }
+    overlap = train & validation
+    if overlap:
+        raise AssertionError(f"训练监督与验证标签位置存在交集: {len(overlap)}")
 
 
 def isolate_splits(
@@ -47,24 +83,27 @@ def isolate_splits(
 
 
 def supervision_summary(dataset, manifest) -> dict:
-    """Count independent points separately from overlapping-window occurrences."""
-    windows = point_windows(dataset)
+    """Count fixed-owner points separately from window occurrences."""
+
     split_sets = {name: set(ids) for name, ids in manifest.splits.items()}
     counts = {name: Counter() for name in split_sets}
-    shared = Counter()
+    point_window_counts = Counter()
     for pixel, code in dataset.ground_truth_pixels.items():
+        owner = point_owner(*pixel, manifest)
+        if owner not in split_sets:
+            continue
+        counts[owner][str(code)] += 1
         covering = set(dataset.query_windows_for_pixel(*pixel))
-        names = [name for name, ids in split_sets.items() if covering & ids]
-        for name in names:
-            counts[name][str(code)] += 1
-        if len(names) > 1:
-            shared["/".join(names)] += 1
+        if covering & split_sets[owner]:
+            point_window_counts[owner] += 1
     return {
         "windows": {name: len(ids) for name, ids in split_sets.items()},
         "point_windows": {
-            name: len(ids & windows.keys()) for name, ids in split_sets.items()
+            name: len(ids & point_windows(dataset, manifest, name).keys())
+            for name, ids in split_sets.items()
         },
         "unique_points": {name: sum(c.values()) for name, c in counts.items()},
         "unique_class_counts": {name: dict(c) for name, c in counts.items()},
-        "shared_points": dict(shared),
+        "points_covered_by_owned_windows": dict(point_window_counts),
+        "shared_points": {},
     }

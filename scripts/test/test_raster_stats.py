@@ -62,6 +62,32 @@ def test_statistics_support_explicit_nodata_override(tmp_path: Path) -> None:
     assert np.isclose(result.mean, (1 - 9999 + 3) / 3)
 
 
+def test_statistics_apply_raw_range_before_scale(tmp_path: Path) -> None:
+    path = tmp_path / "lst.tif"
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=3,
+        height=1,
+        count=1,
+        dtype="uint16",
+        transform=from_origin(0, 1, 1, 1),
+    ) as dataset:
+        dataset.write(np.array([[0, 7500, 10000]], dtype=np.uint16), 1)
+
+    result = stream_raster_statistics(
+        path,
+        valid_minimum=7500,
+        valid_maximum=65535,
+        scale=0.02,
+    )
+
+    assert result.count == 2
+    assert result.mean == 175
+    assert result.standard_deviation == 25
+
+
 def test_all_invalid_windows_return_zero_count_and_null_json_values(
     tmp_path: Path,
 ) -> None:

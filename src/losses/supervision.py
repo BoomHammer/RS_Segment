@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from torch import Tensor
-from torch.nn import functional as F
 
+from losses.focal import focal_cross_entropy
 from losses.hierarchical import hierarchical_supervision_loss
 
 
@@ -16,15 +16,21 @@ def masked_cross_entropy(
     mask: Tensor,
     *,
     ignore_index: int = -1,
+    focal_gamma: float = 0.0,
+    class_weights: Tensor | None = None,
 ) -> Tensor:
     """Calculate cross entropy only on valid label pixels."""
 
     effective_mask = mask.bool() & labels.ne(ignore_index)
-    if not effective_mask.any():
-        return logits.sum() * 0.0
     # The data contract uses class IDs 1..N; PyTorch cross entropy uses 0..N-1.
     safe_labels = labels.sub(1).masked_fill(~effective_mask, ignore_index)
-    return F.cross_entropy(logits, safe_labels, ignore_index=ignore_index)
+    return focal_cross_entropy(
+        logits,
+        safe_labels,
+        gamma=focal_gamma,
+        weight=class_weights,
+        ignore_index=ignore_index,
+    )
 
 
 def combined_supervision_loss(
@@ -36,6 +42,7 @@ def combined_supervision_loss(
     ignore_index: int = -1,
     fine_to_coarse: list[int] | None = None,
     hierarchy_weight: float = 0.2,
+    focal_gamma: float = 0.0,
     class_weights: Tensor | None = None,
 ) -> dict[str, Tensor]:
     """Use ground truth and weak labels as two masked supervision sources."""
@@ -50,6 +57,7 @@ def combined_supervision_loss(
             ground_truth_weight=ground_truth_weight,
             weak_label_weight=weak_label_weight,
             hierarchy_weight=hierarchy_weight,
+            focal_gamma=focal_gamma,
             class_weights=class_weights,
             ignore_index=ignore_index,
         )
@@ -61,12 +69,16 @@ def combined_supervision_loss(
         batch["ground_truth"].long(),
         batch["ground_truth_mask"] & batch["valid_mask"],
         ignore_index=ignore_index,
+        focal_gamma=focal_gamma,
+        class_weights=class_weights,
     )
     weak_label_loss = masked_cross_entropy(
         logits,
         batch["weak_label"].long(),
         batch["weak_label_mask"] & batch["valid_mask"],
         ignore_index=ignore_index,
+        focal_gamma=focal_gamma,
+        class_weights=class_weights,
     )
     total = (
         ground_truth_weight * ground_truth_loss + weak_label_weight * weak_label_loss

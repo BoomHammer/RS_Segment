@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from .sample_index import WindowedSampleDataset
 
 
@@ -85,68 +87,122 @@ def _stratified_block_assignment(
     ratios: tuple[float, float, float],
     seed: int,
 ) -> dict[tuple[int, int], str]:
-    """Assign blocks while keeping measured classes in every requested split.
-
-    A block is the atomic unit, so exact per-class ratios are not always
-    possible. The greedy objective minimizes deviation from the requested
-    class pixel counts and strongly prefers filling a class that is currently
-    absent from a split. This retains the leakage-safe block boundary.
-    """
+    """Optimize labelled-point ratios while keeping every block indivisible."""
 
     names = ("train", "validation", "test")
-    sizes = _split_sizes(len(grouped), ratios)
-    capacities = dict(zip(names, sizes, strict=True))
-    rng = random.Random(seed)
-    blocks = list(grouped)
-    rng.shuffle(blocks)
-    class_totals = sum(block_classes.values(), Counter())
-    class_targets = {
-        code: [class_totals[code] * ratio for ratio in ratios] for code in class_totals
-    }
-    class_presence = Counter(
-        code for classes in block_classes.values() for code in classes
-    )
-    blocks.sort(
-        key=lambda block: (
-            -len(block_classes[block]),
-            min(class_presence[code] for code in block_classes[block])
-            if block_classes[block]
-            else len(blocks),
+    total_sizes = _split_sizes(len(grouped), ratios)
+    labelled = [block for block in grouped if block_classes[block]]
+    unlabelled = [block for block in grouped if not block_classes[block]]
+    labelled_sizes = _split_sizes(len(labelled), ratios)
+    if any(labelled_sizes[index] > total_sizes[index] for index in range(3)):
+        raise ValueError("有标签空间块配额超过对应划分的总空间块容量")
+    if not labelled:
+        shuffled = list(unlabelled)
+        random.Random(seed).shuffle(shuffled)
+        assigned = {}
+        start = 0
+        for name, size in zip(names, total_sizes, strict=True):
+            for block in shuffled[start : start + size]:
+                assigned[block] = name
+            start += size
+        return assigned
+
+    codes = sorted(sum(block_classes.values(), Counter()))
+    code_index = {code: index for index, code in enumerate(codes)}
+    matrix = np.zeros((len(labelled), len(codes)), dtype=np.int64)
+    for row, block in enumerate(labelled):
+        for code, count in block_classes[block].items():
+            matrix[row, code_index[code]] = count
+    ratio_array = np.asarray(ratios, dtype=np.float64)
+    class_totals = matrix.sum(axis=0)
+    class_targets = ratio_array[:, None] * class_totals
+    point_targets = ratio_array * class_totals.sum()
+    class_presence = (matrix > 0).sum(axis=0)
+    active_splits = int(np.sum(ratio_array > 0))
+
+    def cost(counts: np.ndarray) -> float:
+        class_error = np.sum(
+            (counts - class_targets) ** 2 / (class_targets + 1.0)
         )
-    )
-    assigned: dict[tuple[int, int], str] = {}
-    counts = {name: Counter() for name in names}
-    for block in blocks:
-        candidates = [name for name in names if capacities[name] > 0]
-        if not candidates:
-            raise RuntimeError("空间块分配失败：剩余空间块没有可用划分")
+        point_error = 10.0 * np.sum(
+            (counts.sum(axis=1) - point_targets) ** 2 / (point_targets + 1.0)
+        )
+        train_missing = (
+            1_000_000.0 * np.sum(counts[0] == 0) if ratios[0] > 0 else 0.0
+        )
+        feasible_everywhere = class_presence >= active_splits
+        split_missing = 10_000.0 * sum(
+            np.sum((counts[index] == 0) & feasible_everywhere)
+            for index, ratio in enumerate(ratios)
+            if ratio > 0
+        )
+        return float(class_error + point_error + train_missing + split_missing)
 
-        def score(
-            name: str, current_block: tuple[int, int] = block
-        ) -> tuple[float, int]:
-            missing = sum(
-                1
-                for code in block_classes[current_block]
-                if counts[name][code] == 0 and class_presence[code] > 1
-            )
-            deviation = 0.0
-            for code, value in block_classes[current_block].items():
-                target = class_targets[code][names.index(name)]
-                deviation += (counts[name][code] + value - target) ** 2 / max(
-                    target, 1.0
-                )
-            return (-missing * 1000.0 + deviation, capacities[name])
+    best: tuple[float, np.ndarray, np.ndarray] | None = None
+    iterations = max(2_000, len(labelled) * 50)
+    for restart in range(8):
+        generator = np.random.default_rng(seed + restart)
+        order = generator.permutation(len(labelled))
+        assignment = np.empty(len(labelled), dtype=np.int8)
+        start = 0
+        for split, size in enumerate(labelled_sizes):
+            assignment[order[start : start + size]] = split
+            start += size
+        counts = np.stack(
+            [matrix[assignment == split].sum(axis=0) for split in range(3)]
+        )
+        current_cost = cost(counts)
+        temperature = 5.0
+        for _ in range(iterations):
+            left, right = generator.integers(0, len(labelled), size=2)
+            left_split = int(assignment[left])
+            right_split = int(assignment[right])
+            if left_split == right_split:
+                continue
+            candidate = counts.copy()
+            candidate[left_split] += matrix[right] - matrix[left]
+            candidate[right_split] += matrix[left] - matrix[right]
+            candidate_cost = cost(candidate)
+            difference = candidate_cost - current_cost
+            if difference < 0 or generator.random() < np.exp(
+                -difference / temperature
+            ):
+                assignment[left], assignment[right] = right_split, left_split
+                counts = candidate
+                current_cost = candidate_cost
+            temperature = max(0.02, temperature * 0.9997)
+        if best is None or current_cost < best[0]:
+            best = (current_cost, assignment.copy(), counts.copy())
 
-        selected = min(candidates, key=score)
-        assigned[block] = selected
-        capacities[selected] -= 1
-        counts[selected].update(block_classes[block])
+    if best is None:
+        raise RuntimeError("空间块优化没有产生有效划分")
+    _, assignment, counts_array = best
+    assigned = {
+        block: names[int(assignment[index])]
+        for index, block in enumerate(labelled)
+    }
+    random.Random(seed).shuffle(unlabelled)
+    start = 0
+    for index, name in enumerate(names):
+        remaining = total_sizes[index] - labelled_sizes[index]
+        for block in unlabelled[start : start + remaining]:
+            assigned[block] = name
+        start += remaining
+    counts = {
+        name: Counter(
+            {
+                code: int(counts_array[index, code_index[code]]) for code in codes
+            }
+        )
+        for index, name in enumerate(names)
+    }
 
     missing = {
         name: {
             code
-            for code in class_totals
-            if class_presence[code] >= 3 and counts[name][code] == 0
+            for code in codes
+            if class_presence[code_index[code]] >= active_splits
+            and counts[name][code] == 0
         }
         for name in names
         if ratios[names.index(name)] > 0
@@ -209,15 +265,15 @@ def build_spatial_split(
         for name in names
     }
 
-    window_to_split = {window_id: name for name in names for window_id in splits[name]}
     counts_by_split: dict[str, Counter[str]] = {name: Counter() for name in names}
     window_classes: dict[int, Counter[str]] = defaultdict(Counter)
     for (row, column), code in dataset.ground_truth_pixels.items():
+        owner = split_blocks[(int(row) // block_size[1], int(column) // block_size[0])]
+        counts_by_split[owner][str(code)] += 1
         window_ids = dataset.query_windows_for_pixel(row, column)
         for window_id in window_ids:
-            split = window_to_split[window_id]
-            counts_by_split[split][str(code)] += 1
-            window_classes[window_id][str(code)] += 1
+            if window_id in splits[owner]:
+                window_classes[window_id][str(code)] += 1
     total_counts = sum(counts_by_split.values(), Counter())
     class_weights = {code: 1.0 / (count**0.5) for code, count in total_counts.items()}
     if class_weights:

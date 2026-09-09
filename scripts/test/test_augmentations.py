@@ -9,6 +9,7 @@ def _sample() -> dict[str, object]:
     values = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]]]])
     labels = torch.tensor([[1, 2], [3, 4]])
     mask = torch.ones((2, 2), dtype=torch.bool)
+    split_mask = torch.tensor([[True, False], [False, False]])
     return {
         "dynamic": values.clone(),
         "static": values[0].clone(),
@@ -19,6 +20,7 @@ def _sample() -> dict[str, object]:
         "dynamic_valid_mask": mask.clone(),
         "static_valid_mask": mask.clone(),
         "valid_mask": mask.clone(),
+        "supervision_split_mask": split_mask,
     }
 
 
@@ -32,10 +34,12 @@ def test_spatial_transform_is_shared_by_rasters_labels_and_masks() -> None:
     )(sample)
     expected_values = torch.tensor([[[[2.0, 1.0], [4.0, 3.0]]]])
     expected_labels = torch.tensor([[2, 1], [4, 3]])
+    expected_split_mask = torch.tensor([[False, True], [False, False]])
     assert torch.equal(augmented["dynamic"], expected_values)
     assert torch.equal(augmented["static"], expected_values[0])
     assert torch.equal(augmented["ground_truth"], expected_labels)
     assert torch.equal(augmented["weak_label"], expected_labels)
+    assert torch.equal(augmented["supervision_split_mask"], expected_split_mask)
     assert augmented["augmentation"]["horizontal_flip"] is True
 
 

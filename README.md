@@ -116,6 +116,11 @@ data/processed/<YYYYMMDD_HHMMSS>/
 ```text
 experiments/<YYYYMMDD_HHMMSS>/
 ├── model_<YYYYMMDD_HHMMSS>.pt
+├── last.pt
+├── best_loss.pt
+├── best_accuracy.pt
+├── best_unique_accuracy.pt
+├── epoch_metrics.csv
 ├── train_log.json
 ├── train.yaml
 ├── model.yaml
@@ -124,6 +129,24 @@ experiments/<YYYYMMDD_HHMMSS>/
 ```
 
 每次训练均使用训练启动时间创建独立实验目录，因此同一数据集可以重复训练。`train_log.json` 合并保存训练元数据、每个 epoch 的 loss/accuracy、验证指标、学习率、最佳 epoch 和早停信息。
+
+#### 断点续训
+
+每轮验证完成后，训练入口会将完整训练状态原子写入实验目录中的 `last.pt`。中断后使用原数据集目录和该文件继续训练：
+
+```bash
+uv run python scripts/train.py \
+  data/processed/<原数据集时间戳> \
+  --resume experiments/<原训练实验时间戳>/last.pt
+```
+
+`last.pt` 包含当前模型、AdamW 优化器、学习率调度器、EMA、历史最佳权重、早停计数、随机数状态和最近完成的 epoch。续训从最近完整结束的下一轮开始；如果中断发生在某轮训练或验证过程中，该轮没有写入断点，需要重新执行。第一轮验证完成前不会生成可用的 `last.pt`。
+
+续训会自动使用原实验目录中的 `train.yaml`、`model.yaml`、`data.yaml` 配置快照，以及断点保存的窗口参数和原定总 epoch 数。传入的数据集目录必须与断点记录完全一致，不能通过 `--epochs` 改变原定总轮数，也不能把续训输出写入另一个实验目录。
+
+`model_*.pt`、`best_loss.pt`、`best_accuracy.pt` 和 `best_unique_accuracy.pt` 只保存推理权重，不能用于 `--resume`；只有完整断点 `last.pt` 可以恢复训练。多进程 DataLoader worker 内部的随机状态不会保存，因此续训后的结果不保证与从未中断的训练逐位完全一致。
+
+恢复训练时，`epoch_metrics.csv` 会继续逐轮追加且不会重复写同一个 epoch。旧实验没有该 CSV 时，只能从恢复后的下一轮开始记录，无法补算之前各轮的训练真实标签和伪标签独立指标。
 
 训练完成后，只需将 checkpoint 作为测试入口参数。程序会从同目录的 `train_log.json` 自动找到训练数据和配置：
 

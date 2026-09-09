@@ -18,7 +18,8 @@ def test_load_config_resolves_stage2_artifact_paths(tmp_path: Path) -> None:
         "data:\n"
         "  stage2:\n"
         "    statistics_file: stats.json\n"
-        "    split_file: split.json\n",
+        "    split_file: split.json\n"
+        "    value_range_file: ranges.csv\n",
         encoding="utf-8",
     )
 
@@ -28,3 +29,6 @@ def test_load_config_resolves_stage2_artifact_paths(tmp_path: Path) -> None:
         (tmp_path / "stats.json").resolve()
     )
     assert config.data.stage2["split_file"] == str((tmp_path / "split.json").resolve())
+    assert config.data.stage2["value_range_file"] == str(
+        (tmp_path / "ranges.csv").resolve()
+    )

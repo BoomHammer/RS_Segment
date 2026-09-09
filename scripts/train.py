@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -13,22 +14,37 @@ from pathlib import Path
 
 import torch
 import yaml
-from torch.nn import functional as F
 from tqdm import tqdm
 
 from config import load_config
 from data.augmentations import SynchronizedAugmentation
-from data.balanced_sampling import CappedClassSampler
+from data.balanced_sampling import CappedClassSampler, ClassBalancedPointSampler
 from data.overlap import overlapping_view
 from data.sample_index import WindowedSampleDataset
 from data.sampling import SpatialWeightedSampler, build_dataloader
 from data.spatial_split import build_spatial_split, load_spatial_split
-from data.training_policy import isolate_splits, point_windows, supervision_summary
+from data.training_policy import (
+    assert_supervision_isolated,
+    isolate_splits,
+    point_windows,
+    supervision_summary,
+)
 from losses.overlap import overlap_consistency_loss
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
 from models.config import load_model_contract
 from seed import seed_everything
+
+METRICS_CSV_FIELDS = (
+    "epoch",
+    "train_ground_truth_loss",
+    "train_ground_truth_accuracy",
+    "train_weak_label_loss",
+    "train_weak_label_accuracy",
+    "validation_ground_truth_loss",
+    "validation_ground_truth_accuracy",
+    "validation_ground_truth_macro_f1",
+)
 
 
 def _atomic_save(payload: dict, path: Path) -> None:
@@ -39,6 +55,53 @@ def _atomic_save(payload: dict, path: Path) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(path)
+
+
+def _append_metrics_csv(path: Path, row: dict[str, float | int]) -> None:
+    """Append one validated epoch, without duplicating it after a resume."""
+
+    has_header = path.is_file() and path.stat().st_size > 0
+    if has_header:
+        with path.open(newline="", encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+        if rows:
+            last_epoch = int(rows[-1]["epoch"])
+            current_epoch = int(row["epoch"])
+            if last_epoch == current_epoch:
+                return
+            if last_epoch > current_epoch:
+                raise ValueError(
+                    f"CSV 中最后一轮 {last_epoch} 晚于待写入轮次 {current_epoch}"
+                )
+    with path.open("a", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=METRICS_CSV_FIELDS)
+        if not has_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _assert_resume_split_matches(path: Path, manifest: object) -> None:
+    """Compare normalized manifests instead of raw JSON container types."""
+
+    if path.is_file() and load_spatial_split(path) != manifest:
+        raise ValueError(
+            "数据集空间划分已改变，旧断点不能用于新划分；请开始新实验"
+        )
+
+
+def _source_supervision_loss(
+    components: dict[str, torch.Tensor], source: str
+) -> torch.Tensor | None:
+    """Return one source's unweighted supervised loss across available heads."""
+
+    direct = components.get(f"{source}_loss")
+    if direct is not None:
+        return direct
+    fine = components.get(f"{source}_fine_loss")
+    coarse = components.get(f"{source}_coarse_loss")
+    if fine is None:
+        return None
+    return fine if coarse is None else fine + coarse
 
 
 def _restrict_manifest_to_region(
@@ -115,13 +178,9 @@ class ModelEMA:
 
 
 def _evaluate(model: SegFormerUtae, loader: object, device: torch.device) -> dict:
-    """Evaluate fine-label loss and accuracy on the validation split."""
+    """Aggregate probabilities by global position, then evaluate every point once."""
 
     model.eval()
-    loss_sum = 0.0
-    correct_pixels = 0
-    labeled_pixels = 0
-    confusion = None
     point_predictions = {}
     with torch.inference_mode():
         for batch in tqdm(loader, desc="验证", unit="batch", dynamic_ncols=True):
@@ -141,78 +200,79 @@ def _evaluate(model: SegFormerUtae, loader: object, device: torch.device) -> dic
                 tensor_batch["valid_mask"] = (
                     tensor_batch["valid_mask"] & tensor_batch["core_mask"]
                 )
+            split_mask = tensor_batch.get("supervision_split_mask")
+            if (
+                split_mask is not None
+                and (tensor_batch["ground_truth_mask"] & ~split_mask).any()
+            ):
+                raise AssertionError("验证批次包含非验证归属的真实标签")
             mask = tensor_batch["ground_truth_mask"] & tensor_batch["valid_mask"]
             target = (tensor_batch["ground_truth"] - 1).masked_fill(~mask, -1)
-            if mask.any():
-                pixel_loss = F.cross_entropy(
-                    output["fine_logits"].float(),
-                    target,
-                    reduction="none",
-                    ignore_index=-1,
-                )
-                prediction = output["fine_logits"].argmax(dim=1)
-                loss_sum += float(pixel_loss[mask].sum())
-                correct_pixels += int((prediction[mask] == target[mask]).sum())
-                labeled_pixels += int(mask.sum())
-                classes = output["fine_logits"].shape[1]
-                counts = torch.bincount(
-                    target[mask] * classes + prediction[mask],
-                    minlength=classes * classes,
-                ).reshape(classes, classes)
-                confusion = counts if confusion is None else confusion + counts
-                if "input_window" in batch:
-                    for sample, window in enumerate(batch["input_window"]):
-                        local_mask = mask[sample]
-                        positions = local_mask.nonzero().cpu().tolist()
-                        probabilities = (
-                            output["fine_logits"][sample, :, local_mask]
-                            .float()
-                            .softmax(dim=0)
-                            .T.cpu()
+            if mask.any() and "input_window" in batch:
+                for sample, window in enumerate(batch["input_window"]):
+                    local_mask = mask[sample]
+                    positions = local_mask.nonzero().cpu().tolist()
+                    probabilities = (
+                        output["fine_logits"][sample, :, local_mask]
+                        .float()
+                        .softmax(dim=0)
+                        .T.cpu()
+                    )
+                    targets = target[sample][local_mask].cpu().tolist()
+                    for position, probability, label in zip(
+                        positions, probabilities, targets, strict=True
+                    ):
+                        key = (
+                            int(window.row_off) + position[0],
+                            int(window.col_off) + position[1],
                         )
-                        targets = target[sample][local_mask].cpu().tolist()
-                        for position, probability, label in zip(
-                            positions, probabilities, targets, strict=True
-                        ):
-                            key = (
-                                int(window.row_off) + position[0],
-                                int(window.col_off) + position[1],
+                        if key in point_predictions:
+                            previous, count, previous_label = point_predictions[key]
+                            if label != previous_label:
+                                raise ValueError("同一验证位置存在冲突标签")
+                            point_predictions[key] = (
+                                previous + probability,
+                                count + 1,
+                                label,
                             )
-                            if key in point_predictions:
-                                previous, count, previous_label = point_predictions[key]
-                                if label != previous_label:
-                                    raise ValueError(
-                                        "同一实测像元在验证窗口中出现冲突标签"
-                                    )
-                                point_predictions[key] = (
-                                    previous + probability,
-                                    count + 1,
-                                    label,
-                                )
-                            else:
-                                point_predictions[key] = (probability, 1, label)
-    diagnostics = {}
-    if confusion is not None:
-        support = confusion.sum(dim=1)
-        recall = confusion.diag().float() / support.clamp_min(1)
-        diagnostics = {
-            "confusion_matrix": confusion.cpu().tolist(),
-            "class_support": support.cpu().tolist(),
-            "per_class_recall": recall.cpu().tolist(),
-            "macro_recall": float(recall[support > 0].mean()),
-            "majority_baseline": float(support.max() / support.sum()),
-        }
-    if point_predictions:
-        correct = sum(
-            int(probability.argmax()) == label
-            for probability, _, label in point_predictions.values()
-        )
-        diagnostics["unique_point_count"] = len(point_predictions)
-        diagnostics["unique_point_accuracy"] = correct / len(point_predictions)
+                        else:
+                            point_predictions[key] = (probability, 1, label)
+    if not point_predictions:
+        return {"loss": 0.0, "accuracy": 0.0, "labeled_pixels": 0}
+    probabilities = torch.stack(
+        [value[0] / value[1] for value in point_predictions.values()]
+    )
+    targets = torch.tensor([value[2] for value in point_predictions.values()])
+    predictions = probabilities.argmax(dim=1)
+    classes = probabilities.shape[1]
+    confusion = torch.bincount(
+        targets * classes + predictions, minlength=classes * classes
+    ).reshape(classes, classes)
+    support = confusion.sum(dim=1)
+    predicted_support = confusion.sum(dim=0)
+    true_positive = confusion.diag().float()
+    recall = true_positive / support.clamp_min(1)
+    f1_denominator = support + predicted_support
+    per_class_f1 = 2 * true_positive / f1_denominator.clamp_min(1)
+    present = f1_denominator > 0
+    loss = -probabilities[torch.arange(len(targets)), targets].clamp_min(1e-8).log()
+    diagnostics = {
+        "confusion_matrix": confusion.tolist(),
+        "class_support": support.tolist(),
+        "per_class_recall": recall.tolist(),
+        "macro_recall": float(recall[support > 0].mean()),
+        "macro_f1": float(per_class_f1[present].mean()),
+        "majority_baseline": float(support.max() / support.sum()),
+        "unique_point_count": len(point_predictions),
+        "unique_point_accuracy": float((predictions == targets).float().mean()),
+        "window_label_occurrences": sum(
+            value[1] for value in point_predictions.values()
+        ),
+    }
     return {
-        "loss": loss_sum / max(labeled_pixels, 1),
-        "accuracy": correct_pixels / max(labeled_pixels, 1),
-        "labeled_pixels": labeled_pixels,
+        "loss": float(loss.mean()),
+        "accuracy": float((predictions == targets).float().mean()),
+        "labeled_pixels": len(point_predictions),
         **diagnostics,
     }
 
@@ -264,6 +324,8 @@ def main(argv: list[str] | None = None) -> int:
     training = dict(train_config.get("training", {}))
     seed_everything(int(training.get("seed", 42)))
     policy = dict(train_config.get("supervision_policy", {}))
+    if resume is not None and not policy.get("fixed_spatial_supervision", False):
+        raise ValueError("旧断点缺少固定空间监督隔离，不能继续用于正式训练；请重新训练")
     epochs = args.epochs if args.epochs is not None else int(training.get("epochs", 1))
     if epochs < 1:
         raise ValueError("epochs 必须是正整数")
@@ -357,6 +419,9 @@ def main(argv: list[str] | None = None) -> int:
         manifest = _restrict_manifest_to_region(dataset, manifest, args.region_fraction)
     if policy.get("isolate_spatial_splits", False):
         manifest = isolate_splits(dataset, manifest)
+    experiment_split = output / "spatial_split.json"
+    if resume is not None:
+        _assert_resume_split_matches(experiment_split, manifest)
     supervision_audit = None
     if policy:
         supervision_audit = supervision_summary(dataset, manifest)
@@ -374,16 +439,27 @@ def main(argv: list[str] | None = None) -> int:
                 )
     train_indices = manifest.splits.get("train", [])
     validation_indices = manifest.splits.get("validation", [])
+    assert_supervision_isolated(dataset, manifest)
+    dataset.configure_supervision_split(manifest, "train", mask_weak_labels=True)
+    validation_dataset.configure_supervision_split(
+        manifest, "validation", mask_weak_labels=False
+    )
     if policy.get("measured_windows_only", False):
-        measured = point_windows(dataset)
+        measured = point_windows(dataset, manifest, "train")
         train_indices = [index for index in train_indices if index in measured]
     if policy.get("skip_unlabeled_validation", False):
-        measured = point_windows(validation_dataset)
+        measured = point_windows(validation_dataset, manifest, "validation")
         validation_indices = [
             index for index in validation_indices if index in measured
         ]
     if not train_indices:
-        raise ValueError(f"空间划分中的 train 集为空: {split_path}")
+        detail = (
+            "；严格输入窗口隔离过滤掉了所有含训练点的窗口，"
+            "请关闭 isolate_spatial_splits，监督标签仍会按空间块屏蔽"
+            if policy.get("isolate_spatial_splits", False)
+            else ""
+        )
+        raise ValueError(f"空间划分中的 train 集为空: {split_path}{detail}")
     if not validation_indices:
         raise ValueError(f"空间划分中的 validation 集为空: {split_path}")
     model_config = load_model_contract(args.config, run)
@@ -400,16 +476,30 @@ def main(argv: list[str] | None = None) -> int:
     if configured_batch_size < 1:
         raise ValueError("batch_size 必须为正整数")
     effective_batch_size = 1 if any(halo) else configured_batch_size
+    validation_batch_size = int(
+        loader_config.get("validation_batch_size", configured_batch_size)
+    )
+    if validation_batch_size < 1:
+        raise ValueError("validation_batch_size 必须为正整数")
     num_workers = int(loader_config.get("num_workers", 0))
     persistent_workers = bool(loader_config.get("persistent_workers", False))
     if num_workers == 0:
         persistent_workers = False
     sampling_config = dict(stage2.get("sampling", {}))
-    if policy.get("capped_class_sampling", False):
+    if policy.get("class_balanced_point_sampling", False):
+        train_sampler = ClassBalancedPointSampler(
+            dataset,
+            manifest,
+            train_indices,
+            seed=int(training.get("seed", 42)),
+        )
+        train_loader_indices = None
+    elif policy.get("capped_class_sampling", False):
         train_sampler = CappedClassSampler(
             dataset,
             train_indices,
             supervision_audit["unique_class_counts"]["train"],
+            manifest=manifest,
             extra_fraction=float(policy.get("extra_fraction", 0.25)),
             seed=int(training.get("seed", 42)),
         )
@@ -424,7 +514,6 @@ def main(argv: list[str] | None = None) -> int:
             dataset,
             manifest=manifest,
             split="train",
-            num_samples=sampling_config.get("num_samples"),
             seed=int(training.get("seed", 42)),
         )
         train_loader_indices = None
@@ -446,7 +535,7 @@ def main(argv: list[str] | None = None) -> int:
     validation_loader = build_dataloader(
         validation_dataset,
         indices=validation_indices,
-        batch_size=effective_batch_size,
+        batch_size=validation_batch_size,
         num_workers=num_workers,
         pin_memory=bool(loader_config.get("pin_memory", True)),
         persistent_workers=persistent_workers,
@@ -487,7 +576,8 @@ def main(argv: list[str] | None = None) -> int:
         betas=tuple(optimizer_config.get("betas", (0.9, 0.999))),
     )
     scheduler_config = dict(train_config.get("scheduler", {}))
-    total_steps = max(1, epochs * math.ceil(len(loader) / accumulation_steps))
+    steps_per_epoch = math.ceil(len(loader) / accumulation_steps)
+    total_steps = max(1, epochs * steps_per_epoch)
     warmup_ratio = float(scheduler_config.get("warmup_ratio", 0.05))
     if not 0.0 <= warmup_ratio < 1.0:
         raise ValueError("scheduler.warmup_ratio 必须位于 [0, 1)")
@@ -495,6 +585,17 @@ def main(argv: list[str] | None = None) -> int:
     if resume is not None:
         total_steps = resume["total_steps"]
         warmup_steps = resume["warmup_steps"]
+        if total_steps != max(1, epochs * steps_per_epoch):
+            remaining_epochs = max(epochs - int(resume["next_epoch"]), 0)
+            total_steps = max(
+                int(resume["optimizer_steps"])
+                + remaining_epochs * steps_per_epoch,
+                int(resume["optimizer_steps"]) + 1,
+            )
+            print(
+                "每轮训练样本数已改变；学习率计划已按剩余全量训练步数续接，"
+                f"总优化步数调整为 {total_steps}"
+            )
 
     def learning_rate(step: int) -> float:
         if step < warmup_steps:
@@ -633,6 +734,12 @@ def main(argv: list[str] | None = None) -> int:
         batches = 0
         correct_pixels = 0
         labeled_pixels = 0
+        ground_truth_loss_sum = 0.0
+        ground_truth_loss_batches = 0
+        weak_label_loss_sum = 0.0
+        weak_label_loss_batches = 0
+        weak_label_correct_pixels = 0
+        weak_label_pixels = 0
         overlap_loss_sum = 0.0
         overlap_batches = 0
         optimizer.zero_grad(set_to_none=True)
@@ -657,6 +764,12 @@ def main(argv: list[str] | None = None) -> int:
                     tensor_batch["valid_mask"] = (
                         tensor_batch["valid_mask"] & tensor_batch["core_mask"]
                     )
+                split_mask = tensor_batch.get("supervision_split_mask")
+                if split_mask is not None and (
+                    (tensor_batch["ground_truth_mask"] & ~split_mask).any()
+                    or (tensor_batch["weak_label_mask"] & ~split_mask).any()
+                ):
+                    raise AssertionError("实际训练监督越过了训练空间归属边界")
                 loss_components = combined_supervision_loss(
                     prediction,
                     tensor_batch,
@@ -664,6 +777,7 @@ def main(argv: list[str] | None = None) -> int:
                         supervision.get("ground_truth_weight", 1.0)
                     ),
                     weak_label_weight=float(supervision.get("weak_label_weight", 0.5)),
+                    focal_gamma=float(supervision.get("focal_gamma", 0.0)),
                     fine_to_coarse=derived["fine_to_coarse"],
                     class_weights=class_weights,
                     ignore_index=int(supervision.get("ignore_index", -1)),
@@ -672,13 +786,31 @@ def main(argv: list[str] | None = None) -> int:
             ground_truth_mask = (
                 tensor_batch["ground_truth_mask"] & tensor_batch["valid_mask"]
             )
+            predicted = prediction["fine_logits"].argmax(dim=1)
             if ground_truth_mask.any():
                 target = tensor_batch["ground_truth"] - 1
-                predicted = prediction["fine_logits"].argmax(dim=1)
                 correct_pixels += int(
                     (predicted[ground_truth_mask] == target[ground_truth_mask]).sum()
                 )
                 labeled_pixels += int(ground_truth_mask.sum())
+                source_loss = _source_supervision_loss(loss_components, "ground_truth")
+                if source_loss is not None:
+                    ground_truth_loss_sum += float(source_loss.detach())
+                    ground_truth_loss_batches += 1
+            weak_label_mask = (
+                tensor_batch.get("weak_label_mask", torch.zeros_like(ground_truth_mask))
+                & tensor_batch["valid_mask"]
+            )
+            if weak_label_mask.any():
+                weak_target = tensor_batch["weak_label"] - 1
+                weak_label_correct_pixels += int(
+                    (predicted[weak_label_mask] == weak_target[weak_label_mask]).sum()
+                )
+                weak_label_pixels += int(weak_label_mask.sum())
+                source_loss = _source_supervision_loss(loss_components, "weak_label")
+                if source_loss is not None:
+                    weak_label_loss_sum += float(source_loss.detach())
+                    weak_label_loss_batches += 1
             group_size = min(
                 accumulation_steps,
                 len(loader) - (batches // accumulation_steps) * accumulation_steps,
@@ -716,6 +848,9 @@ def main(argv: list[str] | None = None) -> int:
             optimizer_step()
         epoch_loss = total / max(batches, 1)
         epoch_accuracy = correct_pixels / max(labeled_pixels, 1)
+        ground_truth_loss = ground_truth_loss_sum / max(ground_truth_loss_batches, 1)
+        weak_label_loss = weak_label_loss_sum / max(weak_label_loss_batches, 1)
+        weak_label_accuracy = weak_label_correct_pixels / max(weak_label_pixels, 1)
         current_state = {
             name: value.detach().cpu().clone()
             for name, value in model.state_dict().items()
@@ -727,28 +862,45 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(validation, indent=2), encoding="utf-8"
         )
         model.load_state_dict(current_state)
-        metrics.append(
+        epoch_metrics = {
+            "epoch": epoch + 1,
+            "loss": epoch_loss,
+            "ground_truth_loss": ground_truth_loss,
+            "weak_label_loss": weak_label_loss,
+            "weak_label_accuracy": weak_label_accuracy,
+            "weak_label_pixels": weak_label_pixels,
+            "overlap_loss": overlap_loss_sum / max(overlap_batches, 1),
+            "overlap_batches": overlap_batches,
+            "accuracy": epoch_accuracy,
+            "labeled_pixels": labeled_pixels,
+            "batches": batches,
+            "val_loss": float(validation["loss"]),
+            "val_accuracy": float(validation["accuracy"]),
+            "val_labeled_pixels": int(validation["labeled_pixels"]),
+            "val_macro_f1": validation.get("macro_f1"),
+            "val_macro_recall": validation.get("macro_recall"),
+            "val_unique_point_accuracy": validation.get("unique_point_accuracy"),
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "pretrained_learning_rate": (
+                float(optimizer.param_groups[1]["lr"])
+                if len(optimizer.param_groups) > 1
+                else None
+            ),
+            "optimizer_steps": optimizer_steps,
+        }
+        metrics.append(epoch_metrics)
+        _append_metrics_csv(
+            output / "epoch_metrics.csv",
             {
                 "epoch": epoch + 1,
-                "loss": epoch_loss,
-                "overlap_loss": overlap_loss_sum / max(overlap_batches, 1),
-                "overlap_batches": overlap_batches,
-                "accuracy": epoch_accuracy,
-                "labeled_pixels": labeled_pixels,
-                "batches": batches,
-                "val_loss": float(validation["loss"]),
-                "val_accuracy": float(validation["accuracy"]),
-                "val_labeled_pixels": int(validation["labeled_pixels"]),
-                "val_macro_recall": validation.get("macro_recall"),
-                "val_unique_point_accuracy": validation.get("unique_point_accuracy"),
-                "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                "pretrained_learning_rate": (
-                    float(optimizer.param_groups[1]["lr"])
-                    if len(optimizer.param_groups) > 1
-                    else None
-                ),
-                "optimizer_steps": optimizer_steps,
-            }
+                "train_ground_truth_loss": ground_truth_loss,
+                "train_ground_truth_accuracy": epoch_accuracy,
+                "train_weak_label_loss": weak_label_loss,
+                "train_weak_label_accuracy": weak_label_accuracy,
+                "validation_ground_truth_loss": float(validation["loss"]),
+                "validation_ground_truth_accuracy": float(validation["accuracy"]),
+                "validation_ground_truth_macro_f1": float(validation["macro_f1"]),
+            },
         )
         if float(validation["loss"]) < best_validation_loss - min_delta:
             best_validation_loss = float(validation["loss"])
@@ -763,7 +915,8 @@ def main(argv: list[str] | None = None) -> int:
                 else current_state
             )
             _atomic_save(
-                {"model": best_state, "contract": model_config}, output / "best.pt"
+                {"model": best_state, "contract": model_config},
+                output / "best_loss.pt",
             )
         else:
             stale_epochs += 1
