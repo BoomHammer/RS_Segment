@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from datetime import datetime
@@ -29,6 +30,35 @@ def _latest_run(processed: Path, before: set[Path]) -> Path:
     return candidates[-1]
 
 
+def _resume_source_run(resume: Path) -> Path:
+    """Read the prepared dataset path recorded alongside a training checkpoint."""
+    metadata_path = resume.parent / "train_log.json"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"续训实验目录缺少 train_log.json: {resume.parent}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    source_run = metadata.get("source_run")
+    if not source_run:
+        raise ValueError(f"训练日志缺少 source_run: {metadata_path}")
+    run = Path(source_run).resolve()
+    if not run.is_dir():
+        raise NotADirectoryError(f"续训所需的数据集目录不存在: {run}")
+    return run
+
+
+def _experiment_checkpoint(experiment: Path) -> Path:
+    """Return the inference checkpoint produced by a training run."""
+    metadata_path = experiment / "train_log.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    checkpoint_name = metadata.get("checkpoint")
+    checkpoint = experiment / checkpoint_name if checkpoint_name else None
+    if checkpoint is None or not checkpoint.is_file():
+        checkpoints = sorted(experiment.glob("model_*.pt"))
+        checkpoint = checkpoints[-1] if checkpoints else None
+    if checkpoint is None:
+        raise RuntimeError(f"训练未生成推理 checkpoint: {experiment}")
+    return checkpoint
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="一键完成数据准备、弱标签、数据集、训练、测试和全图预测"
@@ -42,53 +72,104 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--max-windows", type=int, default=None)
-    args = parser.parse_args(argv)
-    root = Path.cwd().resolve()
-    config = args.data_config.resolve()
-    processed = load_config(config).data.processed
-    before = (
-        {path.resolve() for path in processed.iterdir()}
-        if processed.is_dir()
-        else set()
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="从 experiments/<时间戳>/last.pt 续训，并在完成后测试和预测",
     )
-    _run(root, "preprocess", ["--config", str(config)])
-    run = _latest_run(processed, before)
-    _run(
-        root,
-        "datasets",
-        [
+    parser.add_argument(
+        "--retrain",
+        type=Path,
+        default=None,
+        help="使用已有 data/processed run 从头训练，并在完成后测试和预测",
+    )
+    args = parser.parse_args(argv)
+    if args.resume is not None and args.retrain is not None:
+        parser.error("--resume 和 --retrain 不能同时使用")
+    root = Path.cwd().resolve()
+    resume = args.resume.resolve() if args.resume is not None else None
+    retrain = args.retrain.resolve() if args.retrain is not None else None
+    if resume is not None:
+        if not resume.is_file() or resume.name != "last.pt":
+            raise FileNotFoundError("--resume 必须指向实验目录中的 last.pt")
+        run = _resume_source_run(resume)
+        experiment = resume.parent
+        train_args = [str(run), "--resume", str(resume)]
+    elif retrain is not None:
+        if not retrain.is_dir():
+            raise NotADirectoryError(f"重新训练所需的数据集目录不存在: {retrain}")
+        run = retrain
+        experiments = root / "experiments"
+        before_experiments = (
+            {path.resolve() for path in experiments.iterdir()}
+            if experiments.is_dir()
+            else set()
+        )
+        config = args.data_config.resolve()
+        train_args = [
             str(run),
-            "--config",
+            "--data-config",
             str(config),
+            "--config",
+            str(args.model_config.resolve()),
             "--train-config",
             str(args.train_config.resolve()),
-        ],
-    )
-    train_args = [
-        str(run),
-        "--data-config",
-        str(config),
-        "--config",
-        str(args.model_config.resolve()),
-        "--train-config",
-        str(args.train_config.resolve()),
-    ]
+        ]
+    else:
+        config = args.data_config.resolve()
+        processed = load_config(config).data.processed
+        experiments = root / "experiments"
+        before_experiments = (
+            {path.resolve() for path in experiments.iterdir()}
+            if experiments.is_dir()
+            else set()
+        )
+        before = (
+            {path.resolve() for path in processed.iterdir()}
+            if processed.is_dir()
+            else set()
+        )
+        _run(root, "preprocess", ["--config", str(config)])
+        run = _latest_run(processed, before)
+        _run(
+            root,
+            "datasets",
+            [
+                str(run),
+                "--config",
+                str(config),
+                "--train-config",
+                str(args.train_config.resolve()),
+            ],
+        )
+        train_args = [
+            str(run),
+            "--data-config",
+            str(config),
+            "--config",
+            str(args.model_config.resolve()),
+            "--train-config",
+            str(args.train_config.resolve()),
+        ]
     if args.epochs is not None:
         train_args.extend(["--epochs", str(args.epochs)])
     if args.device is not None:
         train_args.extend(["--device", args.device])
     _run(root, "train", train_args)
-    experiments = root / "experiments"
-    experiment_candidates = sorted(
-        (path for path in experiments.iterdir() if path.is_dir()),
-        key=lambda path: path.stat().st_mtime,
-    )
-    if not experiment_candidates:
-        raise RuntimeError("训练未生成 experiments 实验目录")
-    experiment = experiment_candidates[-1]
-    checkpoint = next(iter(sorted(experiment.glob("model_*.pt"))), None)
-    if checkpoint is None:
-        raise RuntimeError(f"训练未生成 checkpoint: {experiment}")
+    if resume is None:
+        experiment_candidates = sorted(
+            (
+                path
+                for path in (root / "experiments").iterdir()
+                if path.is_dir() and path.resolve() not in before_experiments
+            ),
+            key=lambda path: path.stat().st_mtime,
+        )
+        if not experiment_candidates:
+            raise RuntimeError("训练未生成新的 experiments 实验目录")
+        experiment = experiment_candidates[-1]
+    checkpoint = _experiment_checkpoint(experiment)
     test_args = [str(checkpoint)]
     if args.device is not None:
         test_args.extend(["--device", args.device])
