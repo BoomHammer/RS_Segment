@@ -23,8 +23,15 @@ class MaskedUTAE(UTAE):
     Whole padded dates are removed per sample before temporal normalization.
     """
 
-    def __init__(self, input_dim: int, chunk_size: int = 2):
-        super().__init__(input_dim=input_dim, encoder=True, pad_value=None)
+    def __init__(
+        self, input_dim: int, chunk_size: int = 2, normalization: str = "batch"
+    ):
+        super().__init__(
+            input_dim=input_dim,
+            encoder=True,
+            pad_value=None,
+            normalization=normalization,
+        )
         if chunk_size < 1:
             raise ValueError("frame_chunk_size 必须为正整数")
         self.chunk_size = chunk_size
@@ -159,6 +166,9 @@ class PretrainedSegFormerUTAE(nn.Module):
         self.dynamic_encoder = MaskedUTAE(
             2 * derived["dynamic_features_count"],
             chunk_size=int(contract.get("temporal", {}).get("frame_chunk_size", 2)),
+            normalization=str(
+                contract.get("temporal", {}).get("normalization", "batch")
+            ),
         )
         widths = self.dynamic_encoder.decoder_widths
         self.static_projections = nn.ModuleList(
@@ -177,6 +187,20 @@ class PretrainedSegFormerUTAE(nn.Module):
             )
         )
         self.decoder.classifier = nn.Identity()
+        # Hugging Face's SegformerDecodeHead contains a hard-coded BN after
+        # feature fusion; encoder_norm does not affect this layer.
+        normalization = str(contract.get("temporal", {}).get("normalization", "batch"))
+        if normalization == "group":
+            self.decoder.batch_norm = nn.GroupNorm(
+                num_groups=min(8, decoder_width), num_channels=decoder_width
+            )
+        self.pixel_bypass_enabled = bool(
+            contract.get("temporal", {}).get("pixel_bypass", False)
+        )
+        if self.pixel_bypass_enabled:
+            self.pixel_bypass = nn.Conv2d(
+                derived["dynamic_features_count"], decoder_width, kernel_size=1
+            )
         self.heads = HierarchicalHeads(
             decoder_width, derived["num_coarse_classes"], derived["fine_to_coarse"]
         )
@@ -233,6 +257,15 @@ class PretrainedSegFormerUTAE(nn.Module):
             ],
             dim=2,
         )
+        if self.pixel_bypass_enabled:
+            values = clean["dynamic"]
+            value_mask = clean["dynamic_value_mask"]
+            time_mask = clean["dynamic_time_mask"][:, :, None, None, None]
+            value_mask = value_mask & time_mask
+            pixel_count = value_mask.sum(dim=1).clamp_min(1)
+            pixel_mean = (values * value_mask).sum(dim=1) / pixel_count
+        else:
+            pixel_mean = None
         present = clean["dynamic_value_mask"].any(dim=2, keepdim=True)
         present = present & clean["dynamic_time_mask"][:, :, None, None, None]
         del clean["dynamic"], clean["dynamic_value_mask"]
@@ -243,6 +276,8 @@ class PretrainedSegFormerUTAE(nn.Module):
         static = F.pad(static, (0, right, 0, bottom))
         dynamic = F.pad(dynamic, (0, right, 0, bottom))
         present = F.pad(present, (0, right, 0, bottom))
+        if pixel_mean is not None:
+            pixel_mean = F.pad(pixel_mean, (0, right, 0, bottom))
         stem = self.static_stem(static)
 
         def spatial(value):
@@ -278,6 +313,12 @@ class PretrainedSegFormerUTAE(nn.Module):
         ]
         # Classify at final resolution so the conditional hierarchy stays normalized.
         features = self.decoder(fused)[..., :height, :width]
+        if pixel_mean is not None:
+            bypass = self.pixel_bypass(pixel_mean)
+            bypass = F.interpolate(
+                bypass, size=features.shape[-2:], mode="bilinear", align_corners=False
+            )
+            features = features + bypass
         with torch.autocast(device_type=features.device.type, enabled=False):
             output = self.heads(features.float())
         output["valid_mask"] = clean["valid_mask"][:, None]

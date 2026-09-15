@@ -7,6 +7,14 @@ import torch.nn as nn
 from .positional_encoding import PositionalEncoder
 
 
+def _normalization_1d(kind: str, channels: int) -> nn.Module:
+    if kind == "batch":
+        return nn.BatchNorm1d(channels)
+    if kind == "layer":
+        return nn.LayerNorm(channels)
+    raise ValueError("normalization 必须是 batch 或 layer")
+
+
 class LTAE2d(nn.Module):
     def __init__(
         self,
@@ -19,6 +27,7 @@ class LTAE2d(nn.Module):
         T=1000,
         return_att=False,
         positional_encoding=True,
+        normalization="batch",
     ):
         """
         Lightweight Temporal Attention Encoder (L-TAE) for image time series.
@@ -79,7 +88,7 @@ class LTAE2d(nn.Module):
             layers.extend(
                 [
                     nn.Linear(self.mlp[i], self.mlp[i + 1]),
-                    nn.BatchNorm1d(self.mlp[i + 1]),
+                    _normalization_1d(normalization, self.mlp[i + 1]),
                     nn.ReLU(),
                 ]
             )

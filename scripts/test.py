@@ -21,6 +21,48 @@ from models.architecture import SegFormerUtae
 from precision import resolve_amp_dtype
 
 
+def _select_checkpoint_state(payload: dict, weights: str) -> dict:
+    """Select ordinary or EMA weights from a training checkpoint."""
+
+    if weights == "model":
+        state = payload.get("model")
+    elif weights == "ema":
+        state = payload.get("ema")
+    else:
+        raise ValueError("weights 必须是 model 或 ema")
+    if not isinstance(state, dict):
+        raise ValueError(f"checkpoint 缺少 {weights} 权重")
+    return state
+
+
+def _reestimate_batch_norm(
+    model: torch.nn.Module, loader: object, device: torch.device
+) -> None:
+    """Re-estimate BatchNorm running statistics without changing parameters."""
+
+    model.eval()
+    batch_norms = [
+        module
+        for module in model.modules()
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
+    ]
+    if not batch_norms:
+        return
+    for module in batch_norms:
+        module.reset_running_stats()
+        module.train()
+    with torch.inference_mode():
+        for batch in tqdm(loader, desc="重估 BN 统计量", unit="batch"):
+            tensor_batch = {
+                key: value.to(device, non_blocking=True)
+                if isinstance(value, torch.Tensor)
+                else value
+                for key, value in batch.items()
+            }
+            model(tensor_batch)
+    model.eval()
+
+
 def _roc_curve(
     scores: torch.Tensor, positive: torch.Tensor
 ) -> tuple[dict[str, Any], float | None]:
@@ -183,6 +225,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--split", default="test", choices=("validation", "test"))
     parser.add_argument("--max-windows", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--weights",
+        choices=("model", "ema"),
+        default="model",
+        help="checkpoint 中的普通模型或 EMA 权重",
+    )
+    parser.add_argument(
+        "--reestimate-bn",
+        action="store_true",
+        help="用训练窗口重新估计 BatchNorm 统计量；通常与 --weights ema 联用",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="指标 JSON 输出路径；默认写入 checkpoint 目录",
+    )
     args = parser.parse_args(argv)
 
     checkpoint_path = args.checkpoint.resolve()
@@ -246,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     if contract is None:
         raise ValueError("checkpoint 缺少训练时保存的模型 contract")
     model = SegFormerUtae.from_contract(contract)
-    model.load_state_dict(payload["model"])
+    model.load_state_dict(_select_checkpoint_state(payload, args.weights), strict=True)
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
@@ -266,6 +325,18 @@ def main(argv: list[str] | None = None) -> int:
         and num_workers > 0,
         prefetch_factor=int(loader_config.get("prefetch_factor", 2)),
     )
+    if args.reestimate_bn:
+        train_loader = build_dataloader(
+            dataset,
+            indices=manifest.splits["train"],
+            batch_size=int(loader_config.get("batch_size", 1)),
+            num_workers=num_workers,
+            pin_memory=bool(loader_config.get("pin_memory", True)),
+            persistent_workers=bool(loader_config.get("persistent_workers", False))
+            and num_workers > 0,
+            prefetch_factor=int(loader_config.get("prefetch_factor", 2)),
+        )
+        _reestimate_batch_norm(model, train_loader, device)
     fine_to_coarse = list(contract["derived"]["fine_to_coarse"])
     loss_sum = 0.0
     targets: list[torch.Tensor] = []
@@ -316,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
             "created_at": datetime.now().isoformat(),
         }
     )
-    report_path = experiment_dir / "test_metrics.json"
+    report_path = args.output or (experiment_dir / "test_metrics.json")
     report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )

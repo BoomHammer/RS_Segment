@@ -1,0 +1,41 @@
+# Reproduction control: main-branch training settings.
+training:
+  epochs: 30
+  amp_dtype: bfloat16
+  gradient_accumulation_steps: 2
+  seed: 42
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    patience: 5
+    min_delta: 0.0001
+dataloader:
+  batch_size: 2
+  validation_batch_size: 2
+  num_workers: 6
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  drop_last: false
+supervision_policy:
+  fixed_spatial_supervision: true
+  isolate_spatial_splits: false
+  measured_windows_only: true
+  skip_unlabeled_validation: true
+  class_balanced_point_sampling: true
+optimizer:
+  name: adamw
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+scheduler:
+  name: cosine
+  warmup_ratio: 0.05
+gradient_clipping:
+  enabled: true
+  max_norm: 1.0
+ema:
+  enabled: true
+  decay: 0.99
+checkpoint:
+  filename: model_{timestamp}.pt
