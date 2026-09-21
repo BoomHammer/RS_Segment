@@ -1,4 +1,4 @@
-"""Train SegFormer-U-TAE from a prepared processed run directory."""
+"""Train MAESTRO-S (or a legacy model) from a prepared run directory."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def _initialize_weights(model, contract, path):
     """Start a new optimizer from compatible trained weights, never a resume."""
     payload = torch.load(path, map_location="cpu", weights_only=True)
     previous = payload["contract"]
-    for key in ("architecture", "backbone", "temporal", "static", "fusion"):
+    for key in ("architecture", "backbone", "temporal", "static", "fusion", "maestro"):
         if previous.get(key) != contract.get(key):
             raise ValueError(f"Initialization architecture mismatch: {key}")
     for key in ("dynamic_features", "static_features", "fine_to_coarse"):
@@ -199,7 +199,7 @@ class ModelEMA:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="训练 SegFormer-U-TAE 模型")
+    parser = argparse.ArgumentParser(description="训练 MAESTRO-S 遥感分割模型")
     parser.add_argument("run", type=Path, help="datasets.py 生成的数据集目录")
     parser.add_argument("--data-config", type=Path, default=Path("configs/data.yaml"))
     parser.add_argument("--config", type=Path, default=Path("configs/model.yaml"))
@@ -386,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"空间划分中的 train 集为空: {split_path}{detail}")
     if not validation_indices:
         raise ValueError(f"空间划分中的 validation 集为空: {split_path}")
-    model_config = load_model_contract(args.config, run)
+    model_config = load_model_contract(args.config, run, stage2)
     model = SegFormerUtae.from_contract(model_config)
     pretrained_initialization = None
     weight_initialization = None

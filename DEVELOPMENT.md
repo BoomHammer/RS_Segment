@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | 阶段 1 | 数据准备与弱监督标签生成 | 已完成 |
 | 阶段 2 | 数据加载与多分辨率融合 | 已完成 |
-| 阶段 3 | SegFormer-U-TAE 模型、训练与验证 | 已完成 |
+| 阶段 3 | MAESTRO-S 模型、训练与验证（保留旧架构读取） | 已完成 |
 | 阶段 4 | 层级化损失与长尾类别处理 | 已完成 |
 | 阶段 5 | 重叠滑窗无缝推理与全图预测 | 已完成 |
 
@@ -56,7 +56,7 @@ uv run python scripts/datasets.py data/processed/<YYYYMMDD_HHMMSS>
 
 训练和测试功能已实现，可以进行多次独立训练比较：
 
-- [x] SegFormer-U-TAE 风格多尺度模型、动态时序编码和静态特征融合。
+- [x] MAESTRO-S 分组时空编码、末三层跨组融合及层级分割；见 [适配说明](docs/maestro.md)。
 - [x] 层级 coarse/fine 输出、实测标签与弱标签掩码监督。
 - [x] 伪标签仅参与训练；验证和测试只使用地面实测标签。
 - [x] AdamW、Linear Warmup + Cosine Decay、BF16 AMP、梯度累积。

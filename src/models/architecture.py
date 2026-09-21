@@ -198,7 +198,7 @@ class HierarchicalHeads(nn.Module):
         coarse_logits = self.coarse(features)
         coarse_log_probability = coarse_logits.log_softmax(dim=1)
         expert_log_probability = torch.full(
-            (features.shape[0], len(self.fine_to_coarse), *features.shape[-2:]),
+            (features.shape[0], len(self.fine_to_coarse), *coarse_logits.shape[-2:]),
             torch.finfo(features.dtype).min,
             dtype=features.dtype,
             device=features.device,
@@ -253,6 +253,10 @@ class SegFormerUtae(nn.Module):
 
     @classmethod
     def from_contract(cls, contract: dict[str, Any]) -> SegFormerUtae:
+        if contract.get("architecture") == "maestro_s":
+            from models.maestro import MaestroS
+
+            return MaestroS(contract)
         if contract.get("architecture") in {
             "segformer_utae_dynamic_ablation",
             "segformer_utae_static_ablation",

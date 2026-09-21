@@ -82,6 +82,13 @@ ema:
   # EMA 衰减率，越接近 1 越平滑。
   decay: 0.99
 
+# 训练期间约束重叠区域的预测，配合 halo/高斯融合缓解 patch 接缝。
+overlap_consistency:
+  weight: 0.1
+  every_n_batches: 4
+  warmup_epochs: 0
+  crop_margin: 32
+
 checkpoint:
   # checkpoint 文件名模板；{timestamp} 由训练入口替换。
   filename: model_{timestamp}.pt

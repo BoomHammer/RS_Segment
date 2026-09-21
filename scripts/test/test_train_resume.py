@@ -273,6 +273,21 @@ def test_weight_initialization_rejects_reordered_class_mapping(tmp_path):
         )
 
 
+def test_weight_initialization_rejects_changed_maestro_sampling(tmp_path):
+    model = TinyModel()
+    contract = {
+        "architecture": "maestro_s",
+        "maestro": {"temporal_bins": 4},
+        "derived": {"fine_to_coarse": [0, 1]},
+    }
+    path = tmp_path / "model.pt"
+    torch.save({"model": model.state_dict(), "contract": contract}, path)
+    with pytest.raises(ValueError, match="maestro"):
+        train._initialize_weights(
+            model, {**contract, "maestro": {"temporal_bins": 8}}, path
+        )
+
+
 def test_evaluate_reports_macro_f1():
     logits = torch.tensor(
         [

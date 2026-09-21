@@ -1,6 +1,6 @@
 # RS-Segment
 
-基于弱监督学习的遥感植被语义分割项目。主流程采用 PointSAM 生成伪标签、窗口化数据集切分，以及 SegFormer-U-TAE 训练；所有大栅格均按窗口流式读取。
+基于弱监督学习的遥感植被语义分割项目。主流程采用 PointSAM 生成伪标签、窗口化数据集切分，以及 MAESTRO-S 层级分割训练；所有大栅格均按窗口流式读取。
 
 ## 环境准备
 
@@ -31,7 +31,7 @@ scripts/preprocess.py  数据校验、流式统计、PointSAM 弱标签及质量
         ↓
 scripts/datasets.py    窗口索引、多源对齐、空间划分
         ↓
-scripts/train.py       SegFormer MiT-B1 + U-TAE/L-TAE、层级监督训练
+scripts/train.py       MAESTRO-S 分组时空 Transformer、层级监督训练
         ↓
 scripts/test.py        空间测试集实测样点评估
         ↓
@@ -49,7 +49,7 @@ RTX 4090（24GB）。当前目标网格为 EPSG:4326、0.00225°，属于近似
 | `scripts/validate_labels.py` | 单独运行样点读取、校验和类别映射 | 可用 |
 | `scripts/weak_label.py` | 使用 PointSAM 生成伪标签及质量报告 | 可用 |
 | `scripts/datasets.py` | 根据伪标签 run 生成样本索引、空间划分、验证和基准报告 | 可用 |
-| `scripts/train.py` | 使用准备好的窗口数据集训练 SegFormer-U-TAE | 可用 |
+| `scripts/train.py` | 使用准备好的窗口数据集训练 MAESTRO-S | 可用 |
 | `scripts/stage2.py` | `datasets.py` 的历史兼容入口 | 兼容 |
 | `scripts/predict.py` | 重叠滑窗全图推理和 GeoTIFF 输出 | 可用 |
 | `scripts/test.py` | 在空间测试集上评估 checkpoint | 可用 |
@@ -127,7 +127,7 @@ uv run python scripts/datasets.py data/processed/<数据集时间戳>
 
 #### 1.4 训练模型
 
-使用准备好的窗口数据集训练 SegFormer-U-TAE，产物写入 `experiments/<训练实验时间戳>`：
+使用准备好的窗口数据集训练 MAESTRO-S，产物写入 `experiments/<训练实验时间戳>`：
 
 ```bash
 uv run python scripts/train.py data/processed/<数据集时间戳>
@@ -136,13 +136,19 @@ uv run python scripts/train.py data/processed/<数据集时间戳>
 `configs/train.yaml` 的 `training.amp_dtype: auto` 会在 RTX 4090 上选择
 BF16，在 RTX 2070 SUPER 上选择 FP16 并启用梯度缩放；CPU 使用 FP32。
 训练启动时会打印实际精度，验证使用同一设置。旧配置指定 BF16 但显卡不支持
-原生 BF16 时，也会自动回退到 FP16。8GB 显卡保持
-`configs/model.yaml` 中的 `temporal.frame_chunk_size: 2`。
-完整 U-TAE 保留所有时相和空间尺度，使用分帧与跳接重算控制显存，halo 和重叠窗口照常生效。
+原生 BF16 时，也会自动回退到 FP16。MAESTRO-S 使用梯度检查点和 SDPA，
+默认 `patch_size: 32`、各产品 `temporal_bins: 4`，320×320 的含 halo 窗口
+在当前 9 种动态产品下共有 3700 个 token；`max_tokens: 4096` 防止超预算。
+增大时间分箱数或减小 patch_size 前须重新检查显存。
+训练启用重叠一致性损失，预测沿用 halo 中心裁剪与高斯融合。
 验证使用独立的小型 worker 池（`validation_num_workers`），结束后退出，
 不启用页锁定预取；返回训练前释放空闲 CUDA 缓存。训练进度显示 `data`（等待数据）、
 `step`（传输及训练计算）和 `VRAM`（当前张量占用 / CUDA 缓存保留，GiB），
 用于排查跨轮次速度下降。VRAM 数字不是显卡总占用，也不是单步峰值。
+
+架构、数据适配、与论文的差异和真实窗口检查命令见
+[MAESTRO-S 说明](docs/maestro.md)。新模型默认随机初始化，需要重新训练；
+已有 SegFormer-U-TAE checkpoint 仍按保存的架构读取，不能迁移为 MAESTRO-S 权重。
 
 训练中断后可使用 `last.pt` 续训；续训必须使用原数据集和实验配置：
 

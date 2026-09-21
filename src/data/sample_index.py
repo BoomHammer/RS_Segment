@@ -766,6 +766,7 @@ class WindowedSampleDataset(GeoDataset):
             "dynamic_times": dynamic_times,
             "dynamic_features": dynamic_features,
             "static": torch.from_numpy(static_array),
+            "static_features": [asset.name for asset in static],
             "dynamic_valid_mask": torch.from_numpy(dynamic_valid),
             "static_valid_mask": torch.from_numpy(static_valid),
             "valid_mask": torch.from_numpy(dynamic_valid | static_valid),
@@ -880,6 +881,11 @@ def sample_collate_fn(
         ),
         "dynamic_times": [sample["dynamic_times"] for sample in samples],
         "dynamic_features": [sample["dynamic_features"] for sample in samples],
+        **(
+            {"static_features": [sample["static_features"] for sample in samples]}
+            if all("static_features" in sample for sample in samples)
+            else {}
+        ),
         "sample_status": [sample["sample_status"] for sample in samples],
         "crs": [sample["crs"] for sample in samples],
         "bounds": [sample["bounds"] for sample in samples],

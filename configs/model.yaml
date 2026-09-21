@@ -1,27 +1,23 @@
 # 阶段3模型架构配置。
 model:
   # 模型架构标识。
-  architecture: segformer_utae_pretrained
-  # 使用 Hugging Face 官方 MiT-B1 SegFormer 编码器和完整 U-TAE/L-TAE 动态编码器。
-  backbone: mit_b1
-  pretrained:
-    # 相对本配置文件解析；权重由 scripts/download_mit.py 下载。
-    path: ../third_party/pretrained/mit-b1
-    revision: 13ddceec4e8bdf401e7cd7acf5aebc526222518c
-    freeze_stages: 2
-  temporal:
-    # 动态时序编码器类型。
-    type: utae_ltae
-    # 完整 U-TAE 每次编码的帧数；8GB 显卡保持 2，避免更大分块挤占显存。
-    frame_chunk_size: 2
-    # 时序特征投影通道数。
-    projection_channels: 64
-  static:
-    # 静态特征投影通道数。
-    projection_channels: 32
-  fusion:
-    # 动静态特征融合后的通道数。
-    output_channels: 96
+  architecture: maestro_s
+  maestro:
+    # Small 尺寸来自 IGNF/MAESTRO 官方实现；默认随机初始化。
+    embed_dim: 384
+    depth: 12
+    heads: 6
+    mlp_ratio: 2
+    inter_depth: 3
+    # 320×320（含 halo）→ 10×10 网格；9 个动态产品各 4 帧
+    # 加 1 份静态输入，共 3700 tokens。超过预算立即报错。
+    patch_size: 32
+    temporal_bins: 4
+    max_tokens: 4096
+    gradient_checkpointing: true
+    # 默认按产品分别 token 化；光学/植被、环境、静态变量三组。
+    # 可配置 modalities: [{name, role, group, features, temporal_bins}]。
+    # features 必须按名称恰好覆盖输入；不把不同时刻堆成通道。
   regularization:
     # 解码器 dropout 概率。
     dropout: 0.2
