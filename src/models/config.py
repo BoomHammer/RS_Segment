@@ -87,6 +87,16 @@ def load_model_contract(
             path if path.is_absolute() else (Path(config_path).parent / path).resolve()
         )
     model["pretrained"] = pretrained
+    if model.get("architecture") == "anysat":
+        settings = dict(model.get("anysat", {}))
+        if settings.get("pretrained_path"):
+            path = Path(settings["pretrained_path"])
+            settings["pretrained_path"] = str(
+                path
+                if path.is_absolute()
+                else (Path(config_path).parent / path).resolve()
+            )
+        model["anysat"] = settings
     artifacts = dict(model.get("artifacts", {}))
     sample_index = artifacts.get("sample_index", "auto")
     label_mapping = artifacts.get("label_mapping", "auto")
@@ -101,7 +111,13 @@ def load_model_contract(
         else _discover(run, "label_mapping*.json")
     )
     derived = derive_model_contract(sample_index_path, label_mapping_path)
-    if model.get("architecture") == "maestro_s":
+    if model.get("architecture") == "anysat":
+        from data.anysat import resolve_resolution
+
+        grid = _read_json(sample_index_path).get("target_grid", {})
+        derived["target_grid"] = grid
+        model["anysat"]["resolution_m"] = resolve_resolution(model["anysat"], grid)
+    if model.get("architecture") in {"maestro_s", "anysat"}:
         # Keep legacy contract ordering unchanged for old checkpoint resumes.
         # MAESTRO binds static tokenizers to actual dataset/index channel order.
         derived["static_features"] = list(

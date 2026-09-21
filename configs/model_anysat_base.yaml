@@ -1,10 +1,10 @@
-# 阶段3模型架构配置。
+# AnySat Base 官方核心微调：先运行 scripts/download_anysat.py。
 model:
   # 模型架构标识。
   architecture: anysat
   anysat:
-    # 官方 tiny: 256维、4头、空间编码器/融合器各2层；base: 768/12/6。
-    size: tiny
+    # 官方 base: 768维、12头、空间编码器/融合器各6层。
+    size: base
     # 单位均为目标网格像元；不是官方 Hub 接口的米。
     patch_size: 32
     subpatch_size: 4
@@ -20,9 +20,9 @@ model:
     decoder_channels: 64
     # 保留 SR 子块稠密特征，与融合结果拼接后逐像元解码。
     dense_modality: SR
-    # 默认随机初始化。官方预训练核心请使用 model_anysat_base.yaml。
+    # 加载完整官方共享核心；必须先下载权重。
     # 新传感器投影器独立学习，不把气候、地形等当成光学波段。
-    pretrained_path: null
+    pretrained_path: ../third_party/pretrained/anysat/models/AnySat.pth
     # 自动按产品名绑定动态特征，静态特征作为独立模态。
     # 可配置 modalities: [{name, role, features}]，每个特征恰好覆盖一次。
   regularization:

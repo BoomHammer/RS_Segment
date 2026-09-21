@@ -56,7 +56,15 @@ def _initialize_weights(model, contract, path):
     """Start a new optimizer from compatible trained weights, never a resume."""
     payload = torch.load(path, map_location="cpu", weights_only=True)
     previous = payload["contract"]
-    for key in ("architecture", "backbone", "temporal", "static", "fusion", "maestro"):
+    for key in (
+        "architecture",
+        "backbone",
+        "temporal",
+        "static",
+        "fusion",
+        "maestro",
+        "anysat",
+    ):
         if previous.get(key) != contract.get(key):
             raise ValueError(f"Initialization architecture mismatch: {key}")
     for key in ("dynamic_features", "static_features", "fine_to_coarse"):
@@ -506,6 +514,22 @@ def main(argv: list[str] | None = None) -> int:
                 "lr": float(optimizer_config.get("pretrained_learning_rate", 1e-5)),
             },
         ]
+    if model_config.get("architecture") == "anysat" and model_config.get(
+        "anysat", {}
+    ).get("pretrained_path"):
+        parameters = [
+            {
+                "params": [
+                    p
+                    for name, p in model.named_parameters()
+                    if not name.startswith("core.") and p.requires_grad
+                ]
+            },
+            {
+                "params": model.core.parameters(),
+                "lr": float(optimizer_config.get("pretrained_learning_rate", 1e-5)),
+            },
+        ]
     optimizer = torch.optim.AdamW(
         parameters,
         lr=float(optimizer_config.get("learning_rate", 1e-4)),
@@ -616,6 +640,21 @@ def main(argv: list[str] | None = None) -> int:
     if resume is None:
         shutil.copy2(args.train_config, output / "train.yaml")
         shutil.copy2(args.config, output / "model.yaml")
+        if model_config.get("architecture") == "anysat":
+            # Persist resolved initialization paths: the snapshot lives elsewhere.
+            (output / "model.yaml").write_text(
+                yaml.safe_dump(
+                    {
+                        "model": {
+                            key: value
+                            for key, value in model_config.items()
+                            if key != "derived"
+                        }
+                    },
+                    allow_unicode=True,
+                ),
+                encoding="utf-8",
+            )
         # Absolute paths keep the snapshot valid in the experiment directory.
         data_payload = yaml.safe_load(args.data_config.read_text(encoding="utf-8"))
         for name in (

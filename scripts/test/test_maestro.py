@@ -150,7 +150,8 @@ def test_token_budget_and_configuration_fail_early():
         MaestroS(config)
 
 
-def test_contract_feature_subset_and_order_match_dataset(tmp_path):
+@pytest.mark.parametrize("architecture", ["maestro_s", "anysat"])
+def test_contract_feature_subset_and_order_match_dataset(tmp_path, architecture):
     (tmp_path / "sample_index.json").write_text(
         json.dumps(
             {
@@ -169,7 +170,9 @@ def test_contract_feature_subset_and_order_match_dataset(tmp_path):
         '{"minor_count": 1, "classes": []}', encoding="utf-8"
     )
     configuration = tmp_path / "model.yaml"
-    configuration.write_text("model:\n  architecture: maestro_s\n", encoding="utf-8")
+    configuration.write_text(
+        f"model:\n  architecture: {architecture}\n", encoding="utf-8"
+    )
     settings = {
         "features": {
             "dynamic": ["SR_B1", "SR_B2"],
