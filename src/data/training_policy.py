@@ -7,6 +7,21 @@ from data.sample_index import WindowedSampleDataset
 from data.spatial_split import SpatialSplitManifest
 
 
+def training_class_weights(counts: dict[str, int], num_classes: int) -> list[float]:
+    """Inverse-square-root weights with mean one over real training points.
+
+    No held-out label frequencies enter the weights. Normalizing over points
+    keeps the expected loss scale comparable to the unweighted control.
+    """
+    values = [int(counts.get(str(code), 0)) for code in range(1, num_classes + 1)]
+    if min(values) < 0 or sum(values) == 0:
+        raise ValueError("训练类别计数必须非负且总数大于零")
+    raw = [count**-0.5 if count else 0.0 for count in values]
+    mean = sum(count * weight for count, weight in zip(values, raw, strict=True))
+    mean /= sum(values)
+    return [weight / mean for weight in raw]
+
+
 def point_owner(row: int, column: int, manifest: SpatialSplitManifest) -> str | None:
     """Return the single split owning a target-grid position."""
 

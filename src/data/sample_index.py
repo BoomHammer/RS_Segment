@@ -21,7 +21,8 @@ from torchgeo.datasets.utils import BoundingBox
 
 from .filename_parser import RasterMetadata, scan_dynamic_directory
 from .labels import LabelRecord, build_label_mapping, iter_encoded_labels
-from .raster_alignment import TargetGrid, aligned_raster, locate_points
+from .raster_alignment import TargetGrid, locate_points
+from .raster_pool import RasterReaderPool
 from .value_ranges import (
     ValueRange,
     load_value_ranges,
@@ -337,8 +338,8 @@ def _expanded_window(window: Window, halo: tuple[int, int], grid: TargetGrid) ->
 class WindowedSampleDataset(GeoDataset):
     """TorchGeo dataset that reads every source only for the requested window.
 
-    Rasterio handles are deliberately scoped to one read. This makes dataset
-    copies in multiprocessing workers independent and avoids inherited handles.
+    Rasterio handles are scoped to one read by default. Optional bounded pools
+    reuse metadata within each worker; handles are never serialized to workers.
     """
 
     def __init__(
@@ -378,6 +379,10 @@ class WindowedSampleDataset(GeoDataset):
         self._supervision_blocks: dict[str, str] = {}
         self._mask_weak_labels_by_split = False
         stage2_config = stage2 or {}
+        self._raster_pool = RasterReaderPool(
+            self.grid,
+            max_items=int(stage2_config.get("io", {}).get("max_open_rasters", 0)),
+        )
         self.value_ranges = load_value_ranges(stage2_config.get("value_range_file"))
         statistics_payload = _statistics_payload(statistics)
         if self.value_ranges:
@@ -623,9 +628,7 @@ class WindowedSampleDataset(GeoDataset):
         )
 
     def _read_asset(self, asset: RasterAsset, window: Window) -> np.ndarray:
-        with aligned_raster(
-            asset.path, self.grid, resampling=asset.resampling
-        ) as dataset:
+        with self._raster_pool.borrow(asset.path, asset.resampling) as dataset:
             # ``asset.band`` is the spectral identifier in filenames such as
             # SR230218B2.tif; each such file is itself a single-band GeoTIFF.
             band = asset.band if asset.count > 1 and asset.band else 1
@@ -810,7 +813,8 @@ class WindowedSampleDataset(GeoDataset):
         return len(self.index)
 
     def close(self) -> None:
-        """Close worker-local resources; reads currently use scoped handles."""
+        """Close only this dataset's worker-local raster readers."""
+        self._raster_pool.close()
 
 
 def sample_collate_fn(

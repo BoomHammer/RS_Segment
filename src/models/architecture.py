@@ -253,6 +253,13 @@ class SegFormerUtae(nn.Module):
 
     @classmethod
     def from_contract(cls, contract: dict[str, Any]) -> SegFormerUtae:
+        if contract.get("architecture") in {
+            "segformer_utae_dynamic_ablation",
+            "segformer_utae_static_ablation",
+        }:
+            from models.branch_ablation import BranchAblation
+
+            return BranchAblation(contract)
         if contract.get("architecture") == "segformer_utae_pretrained":
             from models.pretrained_utae import PretrainedSegFormerUTAE
 

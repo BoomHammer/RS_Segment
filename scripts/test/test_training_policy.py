@@ -13,7 +13,11 @@ from rasterio.windows import Window
 
 from data.balanced_sampling import ClassBalancedPointSampler
 from data.spatial_split import SpatialSplitManifest, build_spatial_split
-from data.training_policy import assert_supervision_isolated, isolate_splits
+from data.training_policy import (
+    assert_supervision_isolated,
+    isolate_splits,
+    training_class_weights,
+)
 
 
 def test_isolation_removes_cross_split_inputs_and_keeps_same_split_overlap():
@@ -70,6 +74,35 @@ def test_validation_aggregates_overlapping_windows_by_position():
     assert result["unique_point_accuracy"] == pytest.approx(2 / 3)
     assert result["window_label_occurrences"] == 4
     assert result["confusion_matrix"] == [[2, 0], [1, 0]]
+
+
+def test_training_weights_preserve_expected_loss_scale():
+    weights = training_class_weights({"1": 100, "2": 4}, 3)
+    assert weights[1] / weights[0] == pytest.approx(5)
+    assert (100 * weights[0] + 4 * weights[1]) / 104 == pytest.approx(1)
+    assert weights[2] == 0
+
+
+def test_evaluation_excludes_halo_and_rejects_foreign_supervision():
+    from evaluation import evaluate_points
+
+    class Model(torch.nn.Module):
+        def forward(self, batch):
+            return {"fine_logits": torch.tensor([[[[2.0, 2.0]], [[0.0, 0.0]]]])}
+
+    batch = {
+        "ground_truth": torch.tensor([[[1, 2]]]),
+        "ground_truth_mask": torch.ones(1, 1, 2, dtype=torch.bool),
+        "valid_mask": torch.ones(1, 1, 2, dtype=torch.bool),
+        "core_mask": torch.tensor([[[True, False]]]),
+        "input_window": [Window(0, 0, 2, 1)],
+    }
+    result = evaluate_points(Model(), [batch], torch.device("cpu"))
+    assert result["labeled_pixels"] == 1
+    assert result["accuracy"] == 1
+    batch["supervision_split_mask"] = torch.tensor([[[False, True]]])
+    with pytest.raises(AssertionError):
+        evaluate_points(Model(), [batch], torch.device("cpu"))
 
 
 def test_class_balanced_point_sampler_uses_every_point_once():

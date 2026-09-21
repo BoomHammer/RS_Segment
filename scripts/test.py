@@ -10,15 +10,15 @@ from typing import Any
 
 import torch
 import yaml
-from torch.nn import functional as F
 from tqdm import tqdm
 
 from config import load_config
 from data.sample_index import WindowedSampleDataset
 from data.sampling import build_dataloader
 from data.spatial_split import load_spatial_split
+from data.training_policy import point_windows
+from evaluation import collect_point_predictions, point_metrics
 from models.architecture import SegFormerUtae
-from precision import resolve_amp_dtype
 
 
 def _select_checkpoint_state(payload: dict, weights: str) -> dict:
@@ -262,7 +262,9 @@ def main(argv: list[str] | None = None) -> int:
         raise NotADirectoryError(f"训练数据目录不存在: {run}")
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"模型权重不存在: {checkpoint_path}")
-    split_path = run / "spatial_split.json"
+    split_path = experiment_dir / "spatial_split.json"
+    if not split_path.is_file():
+        split_path = run / "spatial_split.json"
     mapping_path = next(iter(sorted(run.glob("label_mapping*.json"))), None)
     if not split_path.is_file() or mapping_path is None:
         raise FileNotFoundError("数据集目录缺少 spatial_split.json 或标签映射")
@@ -277,13 +279,17 @@ def main(argv: list[str] | None = None) -> int:
     with train_config_path.open(encoding="utf-8") as stream:
         train_config = yaml.safe_load(stream) or {}
     stage2 = dict(data_config.data.stage2)
+    if "input_normalization" in train_config:
+        stage2["normalization"] = dict(train_config["input_normalization"])
     window = dict(stage2.get("window", {}))
     statistics = next(iter(sorted(run.glob("raster_stats*.json"))), None)
     mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
     dataset = WindowedSampleDataset(
         run / "sample_index.json",
-        window_size=tuple(window.get("size", (256, 256))),
-        stride=tuple(window.get("stride", window.get("size", (256, 256)))),
+        window_size=tuple(metadata.get("window_size", window.get("size", (256, 256)))),
+        stride=tuple(metadata.get("stride", window.get("stride", (128, 128)))),
+        halo=tuple(metadata.get("halo", window.get("halo", (0, 0)))),
+        grid_offset=tuple(metadata.get("grid_offset", (0, 0))),
         label_columns=data_config.data.label_columns,
         label_mapping=mapping,
         statistics=statistics,
@@ -292,7 +298,9 @@ def main(argv: list[str] | None = None) -> int:
         use_weak_labels=False,
     )
     manifest = load_spatial_split(split_path)
-    indices = manifest.splits[args.split]
+    dataset.configure_supervision_split(manifest, args.split, mask_weak_labels=False)
+    measured = point_windows(dataset, manifest, args.split)
+    indices = [index for index in manifest.splits[args.split] if index in measured]
     if args.max_windows is not None:
         if args.max_windows < 1:
             raise ValueError("max-windows 必须是正整数")
@@ -310,20 +318,16 @@ def main(argv: list[str] | None = None) -> int:
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     )
     model.to(device).eval()
-    amp_dtype = resolve_amp_dtype(
-        device, str(train_config.get("training", {}).get("amp_dtype", "auto"))
-    )
     loader_config = dict(train_config.get("dataloader", {}))
-    num_workers = int(loader_config.get("num_workers", 0))
+    num_workers = int(loader_config.get("validation_num_workers", 2))
     loader = build_dataloader(
         dataset,
         indices=indices,
-        batch_size=int(loader_config.get("batch_size", 1)),
+        batch_size=int(loader_config.get("validation_batch_size", 1)),
         num_workers=num_workers,
-        pin_memory=bool(loader_config.get("pin_memory", True)),
-        persistent_workers=bool(loader_config.get("persistent_workers", False))
-        and num_workers > 0,
-        prefetch_factor=int(loader_config.get("prefetch_factor", 2)),
+        pin_memory=False,
+        persistent_workers=False,
+        prefetch_factor=1,
     )
     if args.reestimate_bn:
         train_loader = build_dataloader(
@@ -338,47 +342,34 @@ def main(argv: list[str] | None = None) -> int:
         )
         _reestimate_batch_norm(model, train_loader, device)
     fine_to_coarse = list(contract["derived"]["fine_to_coarse"])
-    loss_sum = 0.0
-    targets: list[torch.Tensor] = []
-    probabilities: list[torch.Tensor] = []
-    with torch.inference_mode():
-        for batch in tqdm(loader, desc=f"测试 ({args.split})", unit="batch"):
-            tensor_batch = {
-                key: value.to(device, non_blocking=True)
-                if isinstance(value, torch.Tensor)
-                else value
-                for key, value in batch.items()
-            }
-            with torch.autocast(
-                device_type=device.type,
-                dtype=amp_dtype or torch.float32,
-                enabled=amp_dtype is not None,
-            ):
-                output = model(tensor_batch)
-            mask = tensor_batch["ground_truth_mask"] & tensor_batch["valid_mask"]
-            target = (tensor_batch["ground_truth"] - 1).masked_fill(~mask, -1)
-            if mask.any():
-                pixel_loss = F.cross_entropy(
-                    output["fine_logits"],
-                    target,
-                    reduction="none",
-                    ignore_index=-1,
-                )
-                loss_sum += float(pixel_loss[mask].sum())
-                targets.append(target[mask].cpu())
-                probabilities.append(
-                    output["fine_logits"].softmax(dim=1).permute(0, 2, 3, 1)[mask].cpu()
-                )
-
-    if not targets:
-        raise ValueError("测试划分中没有有效的实测标签像元")
-
-    report = _metrics(
-        torch.cat(targets),
-        torch.cat(probabilities),
-        fine_to_coarse=fine_to_coarse,
-        loss_sum=loss_sum,
+    targets, probabilities, positions, occurrences = collect_point_predictions(
+        model,
+        loader,
+        device,
+        amp_dtype=str(train_config.get("training", {}).get("amp_dtype", "auto")),
     )
+    summary = point_metrics(targets, probabilities, occurrences)
+    report = _metrics(
+        targets,
+        probabilities,
+        fine_to_coarse=fine_to_coarse,
+        loss_sum=summary["loss"] * len(targets),
+    )
+    report.update(summary)
+    report["metric_protocol"] = "owned_unique_points_mean_probability_v1"
+    report["partial_evaluation"] = args.max_windows is not None
+    report["point_predictions"] = [
+        {
+            "row": row,
+            "column": column,
+            "target": int(target) + 1,
+            "prediction": int(probability.argmax()) + 1,
+            "probabilities": probability.tolist(),
+        }
+        for (row, column), target, probability in zip(
+            positions, targets, probabilities, strict=True
+        )
+    ]
     report.update(
         {
             "split": args.split,

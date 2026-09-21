@@ -80,6 +80,7 @@ class TinyLoader(list):
 
 
 @pytest.mark.parametrize("halo", [0, 1])
+@pytest.mark.parametrize("monitor", ["val_loss", "val_accuracy"])
 @pytest.mark.parametrize(
     "device",
     [
@@ -92,7 +93,9 @@ class TinyLoader(list):
         ),
     ],
 )
-def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, halo, device):
+def test_resume_matches_uninterrupted_training(
+    tmp_path, monkeypatch, halo, device, monitor
+):
     run = tmp_path / "data"
     run.mkdir()
     (run / "label_mapping.json").write_text("{}")
@@ -120,7 +123,11 @@ def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, halo, devi
                     "epochs": 3,
                     "amp_dtype": "float16",
                     "gradient_accumulation_steps": 2,
-                    "early_stopping": {"enabled": False},
+                    "early_stopping": {
+                        "enabled": False,
+                        "monitor": monitor,
+                        "min_delta": 0.0,
+                    },
                 },
                 "supervision_policy": {"fixed_spatial_supervision": True},
                 "dataloader": {
@@ -225,6 +232,7 @@ def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, halo, devi
     assert recovered["grad_scaler"] == expected["grad_scaler"]
     assert recovered["optimizer_steps"] == expected["optimizer_steps"] == 3
     assert recovered["train_log"]["epochs"] == expected["train_log"]["epochs"]
+    assert recovered["best_epoch"] == (1 if monitor == "val_accuracy" else 3)
     log = json.loads((output / "train_log.json").read_text())
     assert log["status"] == "completed"
     assert len(log["epochs"]) == 3
@@ -247,6 +255,22 @@ def test_failed_save_preserves_previous_checkpoint(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         train._atomic_save({"epoch": 2}, path)
     assert torch.load(path, weights_only=True) == {"epoch": 1}
+
+
+def test_weight_initialization_rejects_reordered_class_mapping(tmp_path):
+    model = TinyModel()
+    contract = {"architecture": "tiny", "derived": {"fine_to_coarse": [0, 1]}}
+    path = tmp_path / "model.pt"
+    torch.save({"model": model.state_dict(), "contract": contract}, path)
+    with torch.no_grad():
+        model.logits.add_(1)
+    metadata = train._initialize_weights(model, contract, path)
+    assert torch.count_nonzero(model.logits) == 0
+    assert metadata["optimizer"] == "fresh"
+    with pytest.raises(ValueError, match="fine_to_coarse"):
+        train._initialize_weights(
+            model, {**contract, "derived": {"fine_to_coarse": [1, 0]}}, path
+        )
 
 
 def test_evaluate_reports_macro_f1():

@@ -18,6 +18,7 @@ def masked_cross_entropy(
     ignore_index: int = -1,
     focal_gamma: float = 0.0,
     class_weights: Tensor | None = None,
+    weight_normalization: str = "weighted_mean",
 ) -> Tensor:
     """Calculate cross entropy only on valid label pixels."""
 
@@ -29,6 +30,7 @@ def masked_cross_entropy(
         safe_labels,
         gamma=focal_gamma,
         weight=class_weights,
+        weight_normalization=weight_normalization,
         ignore_index=ignore_index,
     )
 
@@ -44,6 +46,7 @@ def combined_supervision_loss(
     hierarchy_weight: float = 0.2,
     focal_gamma: float = 0.0,
     class_weights: Tensor | None = None,
+    weight_normalization: str = "weighted_mean",
 ) -> dict[str, Tensor]:
     """Use ground truth and weak labels as two masked supervision sources."""
 
@@ -59,6 +62,7 @@ def combined_supervision_loss(
             hierarchy_weight=hierarchy_weight,
             focal_gamma=focal_gamma,
             class_weights=class_weights,
+            weight_normalization=weight_normalization,
             ignore_index=ignore_index,
         )
 
@@ -71,6 +75,7 @@ def combined_supervision_loss(
         ignore_index=ignore_index,
         focal_gamma=focal_gamma,
         class_weights=class_weights,
+        weight_normalization=weight_normalization,
     )
     weak_label_loss = masked_cross_entropy(
         logits,
@@ -79,6 +84,7 @@ def combined_supervision_loss(
         ignore_index=ignore_index,
         focal_gamma=focal_gamma,
         class_weights=class_weights,
+        weight_normalization=weight_normalization,
     )
     total = (
         ground_truth_weight * ground_truth_loss + weak_label_weight * weak_label_loss

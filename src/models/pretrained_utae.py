@@ -11,7 +11,7 @@ from transformers import SegformerConfig, SegformerModel
 from transformers.models.segformer.modeling_segformer import SegformerDecodeHead
 
 from models.architecture import GatedScaleFusion, HierarchicalHeads
-from models.input_adapter import sanitize_batch
+from models.input_adapter import TemporalAttentionEncoder, sanitize_batch
 from models.utae.utae import UTAE
 
 
@@ -198,8 +198,18 @@ class PretrainedSegFormerUTAE(nn.Module):
             contract.get("temporal", {}).get("pixel_bypass", False)
         )
         if self.pixel_bypass_enabled:
+            pixel_channels = int(
+                contract.get("temporal", {}).get("projection_channels", 64)
+            )
+            self.pixel_temporal = TemporalAttentionEncoder(
+                derived["dynamic_features_count"], channels=pixel_channels
+            )
             self.pixel_bypass = nn.Conv2d(
-                derived["dynamic_features_count"], decoder_width, kernel_size=1
+                pixel_channels, decoder_width, kernel_size=1
+            )
+            self.pixel_fusion = nn.Sequential(
+                nn.Conv2d(decoder_width * 2, decoder_width, kernel_size=1),
+                nn.GELU(),
             )
         self.heads = HierarchicalHeads(
             decoder_width, derived["num_coarse_classes"], derived["fine_to_coarse"]
@@ -258,14 +268,15 @@ class PretrainedSegFormerUTAE(nn.Module):
             dim=2,
         )
         if self.pixel_bypass_enabled:
-            values = clean["dynamic"]
-            value_mask = clean["dynamic_value_mask"]
-            time_mask = clean["dynamic_time_mask"][:, :, None, None, None]
-            value_mask = value_mask & time_mask
-            pixel_count = value_mask.sum(dim=1).clamp_min(1)
-            pixel_mean = (values * value_mask).sum(dim=1) / pixel_count
+            pixel_temporal, _ = self.pixel_temporal(
+                clean["dynamic"],
+                clean["dynamic_mask"],
+                clean["dynamic_time_mask"],
+                clean["time_encoding"],
+                clean["dynamic_value_mask"],
+            )
         else:
-            pixel_mean = None
+            pixel_temporal = None
         present = clean["dynamic_value_mask"].any(dim=2, keepdim=True)
         present = present & clean["dynamic_time_mask"][:, :, None, None, None]
         del clean["dynamic"], clean["dynamic_value_mask"]
@@ -276,8 +287,8 @@ class PretrainedSegFormerUTAE(nn.Module):
         static = F.pad(static, (0, right, 0, bottom))
         dynamic = F.pad(dynamic, (0, right, 0, bottom))
         present = F.pad(present, (0, right, 0, bottom))
-        if pixel_mean is not None:
-            pixel_mean = F.pad(pixel_mean, (0, right, 0, bottom))
+        if pixel_temporal is not None:
+            pixel_temporal = F.pad(pixel_temporal, (0, right, 0, bottom))
         stem = self.static_stem(static)
 
         def spatial(value):
@@ -313,12 +324,12 @@ class PretrainedSegFormerUTAE(nn.Module):
         ]
         # Classify at final resolution so the conditional hierarchy stays normalized.
         features = self.decoder(fused)[..., :height, :width]
-        if pixel_mean is not None:
-            bypass = self.pixel_bypass(pixel_mean)
+        if pixel_temporal is not None:
+            bypass = self.pixel_bypass(pixel_temporal)
             bypass = F.interpolate(
                 bypass, size=features.shape[-2:], mode="bilinear", align_corners=False
             )
-            features = features + bypass
+            features = self.pixel_fusion(torch.cat((features, bypass), dim=1))
         with torch.autocast(device_type=features.device.type, enabled=False):
             output = self.heads(features.float())
         output["valid_mask"] = clean["valid_mask"][:, None]

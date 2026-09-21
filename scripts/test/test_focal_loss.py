@@ -36,3 +36,37 @@ def test_focal_loss_returns_differentiable_zero_for_empty_target() -> None:
 
     assert loss == 0
     assert torch.count_nonzero(logits.grad) == 0
+
+
+def test_sample_mean_preserves_class_weight_in_single_point_gradient() -> None:
+    logits = torch.tensor([[[[1.0]], [[0.0]]]], requires_grad=True)
+    labels = torch.ones(1, 1, 1, dtype=torch.long)
+    plain = focal_cross_entropy(logits, labels)
+    weighted = focal_cross_entropy(
+        logits,
+        labels,
+        weight=torch.tensor([1.0, 3.0]),
+        weight_normalization="sample_mean",
+    )
+    plain_gradient = torch.autograd.grad(plain, logits, retain_graph=True)[0]
+    weighted_gradient = torch.autograd.grad(weighted, logits)[0]
+    torch.testing.assert_close(weighted, 3 * plain)
+    torch.testing.assert_close(weighted_gradient, 3 * plain_gradient)
+
+
+def test_accumulated_single_points_match_joint_weighted_batch() -> None:
+    logits = torch.randn(4, 3, 1, 1, requires_grad=True)
+    labels = torch.tensor([0, 0, 1, 2]).reshape(4, 1, 1)
+    weights = torch.tensor([0.5, 1.5, 2.0])
+    options = {"weight": weights, "weight_normalization": "sample_mean"}
+    joint = focal_cross_entropy(logits, labels, **options)
+    accumulated = (
+        sum(
+            focal_cross_entropy(logits[i : i + 1], labels[i : i + 1], **options)
+            for i in range(4)
+        )
+        / 4
+    )
+    joint_gradient = torch.autograd.grad(joint, logits, retain_graph=True)[0]
+    accumulated_gradient = torch.autograd.grad(accumulated, logits)[0]
+    torch.testing.assert_close(accumulated_gradient, joint_gradient)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -29,7 +30,9 @@ from data.training_policy import (
     isolate_splits,
     point_windows,
     supervision_summary,
+    training_class_weights,
 )
+from evaluation import evaluate_points as _evaluate
 from losses.overlap import overlap_consistency_loss
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
@@ -47,6 +50,24 @@ METRICS_CSV_FIELDS = (
     "validation_ground_truth_accuracy",
     "validation_ground_truth_macro_f1",
 )
+
+
+def _initialize_weights(model, contract, path):
+    """Start a new optimizer from compatible trained weights, never a resume."""
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    previous = payload["contract"]
+    for key in ("architecture", "backbone", "temporal", "static", "fusion"):
+        if previous.get(key) != contract.get(key):
+            raise ValueError(f"Initialization architecture mismatch: {key}")
+    for key in ("dynamic_features", "static_features", "fine_to_coarse"):
+        if previous["derived"].get(key) != contract["derived"].get(key):
+            raise ValueError(f"Initialization input/label mismatch: {key}")
+    model.load_state_dict(payload["model"], strict=True)
+    return {
+        "checkpoint": str(path.resolve()),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "optimizer": "fresh",
+    }
 
 
 def _atomic_save(payload: dict, path: Path) -> None:
@@ -177,113 +198,6 @@ class ModelEMA:
         model.load_state_dict(self.shadow)
 
 
-def _evaluate(
-    model: SegFormerUtae,
-    loader: object,
-    device: torch.device,
-    amp_dtype: str = "auto",
-) -> dict:
-    """Aggregate probabilities by global position, then evaluate every point once."""
-
-    model.eval()
-    resolved_dtype = resolve_amp_dtype(device, amp_dtype)
-    point_predictions = {}
-    with torch.inference_mode():
-        for batch in tqdm(loader, desc="验证", unit="batch", dynamic_ncols=True):
-            tensor_batch = {
-                key: value.to(device, non_blocking=True)
-                if isinstance(value, torch.Tensor)
-                else value
-                for key, value in batch.items()
-            }
-            with torch.autocast(
-                device_type=device.type,
-                dtype=resolved_dtype or torch.float32,
-                enabled=resolved_dtype is not None,
-            ):
-                output = model(tensor_batch)
-            if "core_mask" in tensor_batch:
-                tensor_batch["valid_mask"] = (
-                    tensor_batch["valid_mask"] & tensor_batch["core_mask"]
-                )
-            split_mask = tensor_batch.get("supervision_split_mask")
-            if (
-                split_mask is not None
-                and (tensor_batch["ground_truth_mask"] & ~split_mask).any()
-            ):
-                raise AssertionError("验证批次包含非验证归属的真实标签")
-            mask = tensor_batch["ground_truth_mask"] & tensor_batch["valid_mask"]
-            target = (tensor_batch["ground_truth"] - 1).masked_fill(~mask, -1)
-            if mask.any() and "input_window" in batch:
-                for sample, window in enumerate(batch["input_window"]):
-                    local_mask = mask[sample]
-                    positions = local_mask.nonzero().cpu().tolist()
-                    probabilities = (
-                        output["fine_logits"][sample, :, local_mask]
-                        .float()
-                        .softmax(dim=0)
-                        .T.cpu()
-                    )
-                    targets = target[sample][local_mask].cpu().tolist()
-                    for position, probability, label in zip(
-                        positions, probabilities, targets, strict=True
-                    ):
-                        key = (
-                            int(window.row_off) + position[0],
-                            int(window.col_off) + position[1],
-                        )
-                        if key in point_predictions:
-                            previous, count, previous_label = point_predictions[key]
-                            if label != previous_label:
-                                raise ValueError("同一验证位置存在冲突标签")
-                            point_predictions[key] = (
-                                previous + probability,
-                                count + 1,
-                                label,
-                            )
-                        else:
-                            point_predictions[key] = (probability, 1, label)
-            del output, tensor_batch
-    if not point_predictions:
-        return {"loss": 0.0, "accuracy": 0.0, "labeled_pixels": 0}
-    probabilities = torch.stack(
-        [value[0] / value[1] for value in point_predictions.values()]
-    )
-    targets = torch.tensor([value[2] for value in point_predictions.values()])
-    predictions = probabilities.argmax(dim=1)
-    classes = probabilities.shape[1]
-    confusion = torch.bincount(
-        targets * classes + predictions, minlength=classes * classes
-    ).reshape(classes, classes)
-    support = confusion.sum(dim=1)
-    predicted_support = confusion.sum(dim=0)
-    true_positive = confusion.diag().float()
-    recall = true_positive / support.clamp_min(1)
-    f1_denominator = support + predicted_support
-    per_class_f1 = 2 * true_positive / f1_denominator.clamp_min(1)
-    present = f1_denominator > 0
-    loss = -probabilities[torch.arange(len(targets)), targets].clamp_min(1e-8).log()
-    diagnostics = {
-        "confusion_matrix": confusion.tolist(),
-        "class_support": support.tolist(),
-        "per_class_recall": recall.tolist(),
-        "macro_recall": float(recall[support > 0].mean()),
-        "macro_f1": float(per_class_f1[present].mean()),
-        "majority_baseline": float(support.max() / support.sum()),
-        "unique_point_count": len(point_predictions),
-        "unique_point_accuracy": float((predictions == targets).float().mean()),
-        "window_label_occurrences": sum(
-            value[1] for value in point_predictions.values()
-        ),
-    }
-    return {
-        "loss": float(loss.mean()),
-        "accuracy": float((predictions == targets).float().mean()),
-        "labeled_pixels": len(point_predictions),
-        **diagnostics,
-    }
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="训练 SegFormer-U-TAE 模型")
     parser.add_argument("run", type=Path, help="datasets.py 生成的数据集目录")
@@ -293,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--resume", type=Path, help="完整训练断点 last.pt 的路径")
+    parser.add_argument("--init-checkpoint", type=Path, help="新实验的初始模型权重")
     parser.add_argument("--region-fraction", type=float, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--window-size", type=int, nargs=2, default=None)
@@ -300,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--halo", type=int, nargs=2, default=None)
     parser.add_argument("--grid-offset", type=int, nargs=2, default=(0, 0))
     args = parser.parse_args(argv)
+    if args.resume is not None and args.init_checkpoint is not None:
+        parser.error("--resume and --init-checkpoint are mutually exclusive")
     run = args.run.resolve()
     if not run.is_dir():
         raise NotADirectoryError(f"数据集目录不存在: {run}")
@@ -472,7 +389,12 @@ def main(argv: list[str] | None = None) -> int:
     model_config = load_model_contract(args.config, run)
     model = SegFormerUtae.from_contract(model_config)
     pretrained_initialization = None
-    if resume is None and hasattr(model, "initialize_pretrained"):
+    weight_initialization = None
+    if args.init_checkpoint is not None:
+        weight_initialization = _initialize_weights(
+            model, model_config, args.init_checkpoint
+        )
+    elif resume is None and hasattr(model, "initialize_pretrained"):
         pretrained_initialization = model.initialize_pretrained()
     device = torch.device(
         args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -563,7 +485,10 @@ def main(argv: list[str] | None = None) -> int:
         accumulation_steps *= configured_batch_size
         print(f"halo={halo}，单窗口训练，梯度累积={accumulation_steps}")
     parameters = model.parameters()
-    if model_config.get("architecture") == "segformer_utae_pretrained":
+    if model_config.get("architecture") in {
+        "segformer_utae_pretrained",
+        "segformer_utae_static_ablation",
+    }:
         encoder_parameters = [
             parameter
             for name, parameter in model.named_parameters()
@@ -621,12 +546,25 @@ def main(argv: list[str] | None = None) -> int:
         class_index = int(code) - 1
         if 0 <= class_index < len(class_weights):
             class_weights[class_index] = float(weight)
+    if policy.get("class_weighting") == "train_inverse_sqrt":
+        class_weights = torch.tensor(
+            training_class_weights(
+                supervision_audit["unique_class_counts"]["train"],
+                int(derived["num_classes"]),
+            ),
+            device=device,
+        )
     if policy.get("class_weighting") == "none":
         class_weights = None
     supervision = dict(model_config.get("supervision", {}))
     if policy.get("disable_weak_labels", False):
         supervision["weak_label_weight"] = 0.0
     early_stopping = dict(training.get("early_stopping", {}))
+    monitor = str(early_stopping.get("monitor", "val_loss"))
+    if monitor not in {"val_loss", "val_accuracy", "val_macro_f1"}:
+        raise ValueError("Unsupported early-stopping monitor: " + monitor)
+    minimize_monitor = monitor == "val_loss"
+    best_monitor_value = float("inf") if minimize_monitor else -float("inf")
     early_stopping_enabled = bool(early_stopping.get("enabled", True))
     patience = int(early_stopping.get("patience", 8))
     min_delta = float(early_stopping.get("min_delta", 1e-4))
@@ -668,8 +606,12 @@ def main(argv: list[str] | None = None) -> int:
         "started_at": experiment_started_at,
         "supervision_policy": policy,
         "pretrained_initialization": pretrained_initialization,
+        "weight_initialization": weight_initialization,
         "supervision_audit": supervision_audit,
         "epochs": metrics,
+        "class_weights": class_weights.tolist() if class_weights is not None else None,
+        "metric_protocol": "owned_unique_points_mean_probability_v1",
+        "checkpoint_monitor": monitor,
     }
     if resume is None:
         shutil.copy2(args.train_config, output / "train.yaml")
@@ -713,6 +655,7 @@ def main(argv: list[str] | None = None) -> int:
         best_state = resume["best_state"]
         best_validation_loss = resume["best_validation_loss"]
         best_epoch = resume["best_epoch"]
+        best_monitor_value = resume.get("best_monitor_value", best_validation_loss)
         stale_epochs = resume["stale_epochs"]
         optimizer_steps = resume["optimizer_steps"]
         train_log = resume["train_log"]
@@ -807,6 +750,9 @@ def main(argv: list[str] | None = None) -> int:
                     focal_gamma=float(supervision.get("focal_gamma", 0.0)),
                     fine_to_coarse=derived["fine_to_coarse"],
                     class_weights=class_weights,
+                    weight_normalization=str(
+                        supervision.get("weight_normalization", "weighted_mean")
+                    ),
                     ignore_index=int(supervision.get("ignore_index", -1)),
                 )
                 loss = loss_components["loss"]
@@ -961,22 +907,28 @@ def main(argv: list[str] | None = None) -> int:
                 "validation_ground_truth_macro_f1": float(validation["macro_f1"]),
             },
         )
-        if float(validation["loss"]) < best_validation_loss - min_delta:
+        selected_state = (
+            {name: value.detach().cpu().clone() for name, value in ema.shadow.items()}
+            if ema is not None
+            else current_state
+        )
+        if float(validation["loss"]) < best_validation_loss:
             best_validation_loss = float(validation["loss"])
-            best_epoch = epoch + 1
-            stale_epochs = 0
-            best_state = (
-                {
-                    name: value.detach().cpu().clone()
-                    for name, value in ema.shadow.items()
-                }
-                if ema is not None
-                else current_state
-            )
             _atomic_save(
-                {"model": best_state, "contract": model_config},
+                {"model": selected_state, "contract": model_config},
                 output / "best_loss.pt",
             )
+        value = float(epoch_metrics[monitor])
+        improved = (
+            value < best_monitor_value - min_delta
+            if minimize_monitor
+            else value > best_monitor_value + min_delta
+        )
+        if improved:
+            best_monitor_value = value
+            best_epoch = epoch + 1
+            stale_epochs = 0
+            best_state = selected_state
         else:
             stale_epochs += 1
         if float(validation["accuracy"]) > max(
@@ -1013,6 +965,7 @@ def main(argv: list[str] | None = None) -> int:
             {
                 "best_epoch": best_epoch,
                 "best_val_loss": best_validation_loss,
+                "best_monitor_value": best_monitor_value,
                 "optimizer_steps": optimizer_steps,
             }
         )
@@ -1043,6 +996,7 @@ def main(argv: list[str] | None = None) -> int:
                 "best_state": best_state,
                 "best_epoch": best_epoch,
                 "best_validation_loss": best_validation_loss,
+                "best_monitor_value": best_monitor_value,
                 "stale_epochs": stale_epochs,
                 "optimizer_steps": optimizer_steps,
                 "train_log": train_log,
@@ -1081,6 +1035,7 @@ def main(argv: list[str] | None = None) -> int:
             "status": "completed",
             "best_epoch": best_epoch,
             "best_val_loss": best_validation_loss,
+            "best_monitor_value": best_monitor_value,
             "optimizer_steps": optimizer_steps,
             "finished_at": datetime.now().isoformat(),
         }

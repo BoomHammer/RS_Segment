@@ -1,0 +1,31 @@
+# Full SegFormer + U-TAE plus main-branch pixel temporal attention bypass.
+model:
+  architecture: segformer_utae_pretrained
+  backbone: mit_b1
+  pretrained:
+    path: ../third_party/pretrained/mit-b1
+    revision: 13ddceec4e8bdf401e7cd7acf5aebc526222518c
+    freeze_stages: 2
+  temporal:
+    type: utae_ltae
+    frame_chunk_size: 2
+    projection_channels: 64
+    normalization: group
+    pixel_bypass: true
+  static:
+    projection_channels: 32
+  fusion:
+    output_channels: 96
+  regularization:
+    dropout: 0.
+    drop_path: 0.05
+  input:
+    invalid_fill_value: 0.0
+  supervision:
+    ground_truth_weight: 1.0
+    weak_label_weight: 0.5
+    focal_gamma: 2.0
+    ignore_index: -1
+  artifacts:
+    sample_index: auto
+    label_mapping: auto

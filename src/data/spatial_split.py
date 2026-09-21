@@ -265,7 +265,7 @@ def build_spatial_split(
         for window_id in window_ids:
             if window_id in splits[owner]:
                 window_classes[window_id][str(code)] += 1
-    total_counts = sum(counts_by_split.values(), Counter())
+    total_counts = counts_by_split["train"]
     class_weights = {code: 1.0 / (count**0.5) for code, count in total_counts.items()}
     if class_weights:
         mean_weight = sum(class_weights.values()) / len(class_weights)

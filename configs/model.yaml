@@ -24,7 +24,7 @@ model:
     output_channels: 96
   regularization:
     # 解码器 dropout 概率。
-    dropout: 0.
+    dropout: 0.2
     # 随机深度概率。
     drop_path: 0.05
   input:
