@@ -1,7 +1,23 @@
 # 阶段3模型架构配置。
 model:
   # 模型架构标识。
-  architecture: anysat
+  # Supported architectures:
+  # - lightweight_dual_branch: lightweight dynamic/static dual-branch model.
+  # - segformer_utae: legacy alias of lightweight_dual_branch.
+  # - segformer_utae_pretrained: pretrained MiT + U-TAE dual-branch model.
+  # - segformer_utae_dynamic_ablation: replace the dynamic branch with U-TAE.
+  # - segformer_utae_static_ablation: replace the static branch with pretrained MiT.
+  # - maestro_s: MAESTRO-S multimodal model.
+  # - anysat: AnySat-based multimodal model.
+  architecture: lightweight_dual_branch
+  backbone: mit_b1
+  temporal:
+    type: utae_ltae
+    projection_channels: 64
+  static:
+    projection_channels: 32
+  fusion:
+    output_channels: 96
   anysat:
     # 官方 tiny: 256维、4头、空间编码器/融合器各2层；base: 768/12/6。
     size: tiny

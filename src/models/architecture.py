@@ -272,6 +272,16 @@ class SegFormerUtae(nn.Module):
             from models.pretrained_utae import PretrainedSegFormerUTAE
 
             return PretrainedSegFormerUTAE(contract)
+        if contract.get("architecture") in {
+            "lightweight_dual_branch",
+            "segformer_utae",
+        }:
+            mapping = contract.get("fine_to_coarse")
+            if mapping is None:
+                mapping = dict(contract.get("derived", {})).get("fine_to_coarse")
+            if mapping is None:
+                raise ValueError("contract 缂哄皯 fine_to_coarse 灞傜骇鏄犲皠")
+            return cls(contract, mapping)
         mapping = contract.get("fine_to_coarse")
         if mapping is None:
             mapping = dict(contract.get("derived", {})).get("fine_to_coarse")
