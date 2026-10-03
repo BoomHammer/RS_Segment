@@ -2,7 +2,7 @@
 # Large and generated artifacts
 /data/
 /experiments/
-/SAM/
+/third_party/
 /.pytest_tmp/
 /.pytest_cache/
 /.uv-cache/
