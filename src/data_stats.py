@@ -20,6 +20,14 @@ from logging_config import configure_logging
 LOGGER = logging.getLogger(__name__)
 
 
+def _report_missing_value_ranges(categories: list[str]) -> None:
+    if categories:
+        LOGGER.warning(
+            "以下特征没有有效值范围，已按原始值计算（Scale=1）: %s",
+            ", ".join(categories),
+        )
+
+
 def _input_files(config: AppConfig) -> list[Path]:
     candidates = (config.data.dynamic, config.data.static)
     files: list[Path] = []
@@ -131,13 +139,14 @@ def compute_statistics(
     value_ranges = load_value_ranges(value_range_file)
     group_records: dict[str, list[dict[str, object]]] = {}
     group_statistics: dict[str, RasterStatistics] = {}
+    missing_value_ranges: set[str] = set()
     progress = tqdm(files, desc="计算栅格统计量", unit="file")
     for path in progress:
         progress.set_postfix_str(path.name)
         category, time = _file_category_and_time(config, path)
         value_range = value_range_for(category, value_ranges)
-        if value_ranges and value_range is None:
-            raise ValueError(f"输入特征缺少有效值范围: {category}")
+        if value_range is None:
+            missing_value_ranges.add(category)
         statistics = stream_raster_statistics(
             path,
             band=band,
@@ -173,6 +182,7 @@ def compute_statistics(
         }
         for category in sorted(group_statistics)
     ]
+    _report_missing_value_ranges(sorted(missing_value_ranges))
     return {
         "schema_version": 4,
         "cache_key": _cache_key(
@@ -185,6 +195,7 @@ def compute_statistics(
         "band": band,
         "window_size": list(window_size),
         "nodata": missing_value,
+        "missing_value_ranges": sorted(missing_value_ranges),
         "groups": groups,
     }
 
@@ -240,6 +251,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         cached_path = _find_cached_result(config.data.processed, key)
         if cached_path is not None:
+            cached_payload = json.loads(cached_path.read_text(encoding="utf-8"))
+            _report_missing_value_ranges(
+                sorted(
+                    group["category"]
+                    for group in cached_payload["groups"]
+                    if group.get("value_range") is None
+                )
+            )
             if args.output is not None:
                 output = args.output.resolve()
                 output.parent.mkdir(parents=True, exist_ok=True)

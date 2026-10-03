@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import rasterio
 from rasterio.transform import from_origin
 
@@ -95,9 +96,28 @@ def test_compute_stats_groups_dynamic_series_and_static_files(tmp_path: Path) ->
 
 def test_compute_stats_applies_configured_product_range_and_scale(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("data_stats.configure_logging", lambda: None)
     dynamic_directory = tmp_path / "dynamic"
     dynamic_directory.mkdir()
+    static_directory = tmp_path / "static"
+    static_directory.mkdir()
+    with rasterio.open(
+        static_directory / "COPERNICUS_DEM_100M.tif",
+        "w",
+        driver="GTiff",
+        width=5,
+        height=1,
+        count=1,
+        dtype="float32",
+        nodata=-9999,
+        transform=from_origin(0, 1, 1, 1),
+    ) as dataset:
+        dataset.write(
+            np.array([[100, 300, -9999, np.nan, np.inf]], dtype=np.float32), 1
+        )
     with rasterio.open(
         dynamic_directory / "LST230101.tif",
         "w",
@@ -115,6 +135,8 @@ def test_compute_stats_applies_configured_product_range_and_scale(
     config_path.write_text(
         "data:\n"
         f"  dynamic: {dynamic_directory.as_posix()}\n"
+        f"  static: {static_directory.as_posix()}\n"
+        f"  processed: {(tmp_path / 'processed').as_posix()}\n"
         "  stage2:\n"
         f"    value_range_file: {range_path.as_posix()}\n",
         encoding="utf-8",
@@ -124,7 +146,8 @@ def test_compute_stats_applies_configured_product_range_and_scale(
     assert main(["--config", str(config_path), "--output", str(output_path)]) == 0
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
-    group = payload["groups"][0]
+    groups = {group["category"]: group for group in payload["groups"]}
+    group = groups["LST"]
     assert payload["schema_version"] == 4
     assert group["statistics"]["count"] == 2
     assert group["statistics"]["mean"] == 175
@@ -133,3 +156,16 @@ def test_compute_stats_applies_configured_product_range_and_scale(
         "maximum": 65535.0,
         "scale": 0.02,
     }
+    dem = groups["COPERNICUS_DEM_100M"]
+    assert dem["value_range"] is None
+    assert dem["statistics"]["count"] == 2
+    assert dem["statistics"]["mean"] == 200
+    assert payload["missing_value_ranges"] == ["COPERNICUS_DEM_100M"]
+    assert "COPERNICUS_DEM_100M" in caplog.text
+
+    cached_path = tmp_path / "processed" / "raster_stats_cached.json"
+    cached_path.parent.mkdir()
+    cached_path.write_text(json.dumps(payload), encoding="utf-8")
+    caplog.clear()
+    assert main(["--config", str(config_path), "--output", str(output_path)]) == 0
+    assert "COPERNICUS_DEM_100M" in caplog.text
