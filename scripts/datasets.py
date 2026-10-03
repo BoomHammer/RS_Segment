@@ -39,9 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="切分并验证训练数据集")
     parser.add_argument("run", type=Path, help="weak_label.py 生成的结果目录")
     parser.add_argument("--config", type=Path, default=Path("configs/data.yaml"))
-    parser.add_argument(
-        "--train-config", type=Path, default=Path("configs/train.yaml")
-    )
+    parser.add_argument("--train-config", type=Path, default=Path("configs/train.yaml"))
     args = parser.parse_args(argv)
     run = args.run.resolve()
     if not run.is_dir():

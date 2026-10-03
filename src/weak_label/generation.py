@@ -8,6 +8,7 @@ from collections.abc import Iterable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
@@ -209,6 +210,8 @@ def generate_weak_labels(
     alliance_names: dict[int, str] | None = None,
     keyframe_index: int = 0,
     composite_names: Sequence[str] | None = None,
+    provenance_path: str | Path | None = None,
+    sample_outcomes_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Generate sparse, point-local labels from high-confidence SAM regions."""
 
@@ -257,6 +260,8 @@ def generate_weak_labels(
             )
             sample_outcomes.append(
                 {
+                    "seed_id": outcome_index + 1,
+                    "record_index": record.index,
                     "row": int(location["row"]),
                     "column": int(location["column"]),
                     "alliance_code": record.alliance_code,
@@ -281,6 +286,25 @@ def generate_weak_labels(
             for frame in video_frames
         ]
         destination = stack.enter_context(rasterio.open(output, "r+"))
+        workspace = Path(stack.enter_context(TemporaryDirectory(dir=output.parent)))
+
+        def mapped_array(name, dtype, fill):
+            array = np.memmap(
+                workspace / name,
+                mode="w+",
+                dtype=dtype,
+                shape=(grid.height, grid.width),
+            )
+            stack.callback(array._mmap.close)
+            for start in range(0, grid.height, 256):
+                array[start : start + 256] = fill
+            return array
+
+        provenance = (
+            mapped_array("seed_ids.bin", np.int32, config.output_nodata)
+            if provenance_path is not None
+            else None
+        )
         print("开始计算 SAM 视频帧的全局光谱拉伸统计量...")
         ranges = [
             [
@@ -295,10 +319,8 @@ def generate_weak_labels(
             for frame in datasets
         ]
         print("全局光谱拉伸统计量完成，开始加载视频帧并生成弱标签...")
-        score = np.full((grid.height, grid.width), -np.inf, dtype=np.float32)
-        labels = np.full(
-            (grid.height, grid.width), config.output_nodata, dtype=np.int32
-        )
+        score = mapped_array("scores.bin", np.float32, -np.inf)
+        labels = mapped_array("labels.bin", np.int32, config.output_nodata)
         global_seeds = []
         progress = tqdm(located_records, desc="生成弱标签", unit="sample")
         for record, row, column, outcome_index in progress:
@@ -478,6 +500,8 @@ def generate_weak_labels(
             else:
                 outcome["status"] = "medium_confidence_accepted"
             candidate_score = pixel_score * confidence
+            outcome["mask_confidence"] = confidence
+            outcome["candidate_pixels"] = int(selected.sum())
             global_rows = slice(row_start, row_start + int(window.height))
             global_columns = slice(column_start, column_start + int(window.width))
             current_score = score[global_rows, global_columns]
@@ -494,7 +518,27 @@ def generate_weak_labels(
             current_labels[better] = record.alliance_code
             current_labels[tied] = config.output_nodata
             current_score[tied] = -np.inf
-        destination.write(labels, 1)
+            if provenance is not None:
+                current_seeds = provenance[global_rows, global_columns]
+                current_seeds[better] = outcome_index + 1
+                current_seeds[tied] = config.output_nodata
+        provenance_destination = None
+        if provenance_path is not None:
+            provenance_destination = stack.enter_context(
+                rasterio.open(provenance_path, "w", **output_profile)
+            )
+        for _, window in destination.block_windows(1):
+            rows, columns = window.toslices()
+            destination.write(labels[rows, columns], 1, window=window)
+            if provenance_destination is not None:
+                provenance_destination.write(
+                    provenance[rows, columns], 1, window=window
+                )
+
+    if sample_outcomes_path is not None:
+        Path(sample_outcomes_path).write_text(
+            json.dumps(sample_outcomes, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     report = evaluate_label_quality_from_raster(
         output,

@@ -2,10 +2,11 @@
 # Large and generated artifacts
 /data/
 /experiments/
-/SAM/
+/third_party/
 /.pytest_tmp/
 /.pytest_tmp_*/
 /.pytest_cache/
+/.tmp/
 /.uv-cache/
 __pycache__/
 *.py[cod]

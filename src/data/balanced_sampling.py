@@ -57,9 +57,7 @@ class ClassBalancedPointSampler(Sampler[tuple[int, tuple[int, int]]]):
         self.epoch += 1
         queues = {}
         for code, points in self.points.items():
-            queues[code] = torch.randperm(
-                len(points), generator=generator
-            ).tolist()
+            queues[code] = torch.randperm(len(points), generator=generator).tolist()
         classes = sorted(queues)
         class_order = torch.randperm(len(classes), generator=generator).tolist()
         classes = [classes[position] for position in class_order]

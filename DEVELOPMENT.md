@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | 阶段 1 | 数据准备与弱监督标签生成 | 已完成 |
 | 阶段 2 | 数据加载与多分辨率融合 | 已完成 |
-| 阶段 3 | SegFormer-U-TAE 模型、训练与验证 | 已完成 |
+| 阶段 3 | MAESTRO-S 模型、训练与验证（保留旧架构读取） | 已完成 |
 | 阶段 4 | 层级化损失与长尾类别处理 | 已完成 |
 | 阶段 5 | 重叠滑窗无缝推理与全图预测 | 已完成 |
 
@@ -56,7 +56,7 @@ uv run python scripts/datasets.py data/processed/<YYYYMMDD_HHMMSS>
 
 训练和测试功能已实现，可以进行多次独立训练比较：
 
-- [x] SegFormer-U-TAE 风格多尺度模型、动态时序编码和静态特征融合。
+- [x] MAESTRO-S 分组时空编码、末三层跨组融合及层级分割；见 [适配说明](docs/maestro.md)。
 - [x] 层级 coarse/fine 输出、实测标签与弱标签掩码监督。
 - [x] 伪标签仅参与训练；验证和测试只使用地面实测标签。
 - [x] AdamW、Linear Warmup + Cosine Decay、BF16 AMP、梯度累积。
@@ -127,7 +127,7 @@ uv run python scripts/predict.py \
 
 ## 验证状态
 
-- [x] `pytest`：58 项通过；仅有 rasterio 的弃用提示。
+- [x] 调试代码清理后 `pytest`：69 项通过；仅有 rasterio 的弃用提示。
 - [x] `ruff check .`：通过。
 - [x] 训练入口已完成真实数据单 epoch 冒烟训练。
 - [x] 测试入口已完成 checkpoint 加载和测试指标输出验证。
@@ -142,9 +142,8 @@ uv run python scripts/predict.py \
 
 配置目录仅保留默认入口所需的 `data.yaml`、`model.yaml`、`train.yaml`、`predict.yaml`、`weak_label.yaml`。可选实验配置及预训练模型专项测试脚本已删除；模型实现和既有实验的 YAML 快照仍保留，用于加载历史模型和恢复训练。
 
-- `scripts/test.py` 是模型测试集评估入口；`scripts/test/` 保留自动回归测试和 SAM2 输入可视化工具。
-- `scripts/analyze_training.py`、`scripts/audit_supervision.py` 用于训练曲线分析和监督数据审计。
-- `scripts/pixel_dnn_ab.py` 保留为可复用的像素 DNN 对照实验入口。
+- `scripts/test.py` 是模型测试集评估入口；`scripts/test/` 保留主流程的自动回归测试。
+- 已删除训练曲线诊断、监督审计、固定批次拟合诊断、像素 DNN 对照实验及其专用测试，以及 SAM2 输入预览工具。
 - 已移除一次性的小区域预测、网格消融、旧归一化诊断和固定实验路径的筛选/报告脚本；既有实验结果仍保存在 `experiments/`。
 - 测试临时目录统一使用 `.pytest_tmp/`；额外的 `.pytest_tmp_*` 目录也由 Git 忽略。
 

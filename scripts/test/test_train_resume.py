@@ -80,7 +80,22 @@ class TinyLoader(list):
 
 
 @pytest.mark.parametrize("halo", [0, 1])
-def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, halo):
+@pytest.mark.parametrize("monitor", ["val_loss", "val_accuracy"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA FP16 required"
+            ),
+        ),
+    ],
+)
+def test_resume_matches_uninterrupted_training(
+    tmp_path, monkeypatch, halo, device, monitor
+):
     run = tmp_path / "data"
     run.mkdir()
     (run / "label_mapping.json").write_text("{}")
@@ -106,10 +121,21 @@ def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, halo):
             {
                 "training": {
                     "epochs": 3,
+                    "amp_dtype": "float16",
                     "gradient_accumulation_steps": 2,
-                    "early_stopping": {"enabled": False},
+                    "early_stopping": {
+                        "enabled": False,
+                        "monitor": monitor,
+                        "min_delta": 0.0,
+                    },
                 },
                 "supervision_policy": {"fixed_spatial_supervision": True},
+                "dataloader": {
+                    "num_workers": 6,
+                    "persistent_workers": True,
+                    "prefetch_factor": 2,
+                    "pin_memory": True,
+                },
             }
         )
     )
@@ -138,7 +164,13 @@ def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, halo):
             write=lambda path: None,
         ),
     )
-    monkeypatch.setattr(train, "build_dataloader", lambda *a, **kw: TinyLoader())
+    loader_options = []
+
+    def build_loader(*args, **kwargs):
+        loader_options.append(kwargs)
+        return TinyLoader()
+
+    monkeypatch.setattr(train, "build_dataloader", build_loader)
     monkeypatch.setattr(
         train,
         "load_model_contract",
@@ -157,11 +189,11 @@ def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, halo):
     monkeypatch.setattr(train, "combined_supervision_loss", loss)
     evaluate = train._evaluate
 
-    def interrupted(model, loader, device):
+    def interrupted(model, loader, device, **kwargs):
         modes.append(model.training)
         if len(modes) == 2:
             raise KeyboardInterrupt
-        return evaluate(model, loader, device)
+        return evaluate(model, loader, device, **kwargs)
 
     base = [
         str(run),
@@ -172,7 +204,7 @@ def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, halo):
         "--train-config",
         str(train_path),
         "--device",
-        "cpu",
+        device,
         "--window-size",
         "2",
         "2",
@@ -188,7 +220,7 @@ def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, halo):
     saved = torch.load(output / "last.pt", weights_only=True)
     assert saved["next_epoch"] == 1
     monkeypatch.setattr(train, "_evaluate", evaluate)
-    train.main([str(run), "--resume", str(output / "last.pt"), "--device", "cpu"])
+    train.main([str(run), "--resume", str(output / "last.pt"), "--device", device])
     full = tmp_path / "full"
     train.main([*base, "--output-dir", str(full)])
     recovered = torch.load(output / "last.pt", weights_only=True)
@@ -197,11 +229,18 @@ def test_resume_matches_uninterrupted_training(tmp_path, monkeypatch, halo):
         for name in expected[key]:
             torch.testing.assert_close(recovered[key][name], expected[key][name])
     assert recovered["scheduler"] == expected["scheduler"]
+    assert recovered["grad_scaler"] == expected["grad_scaler"]
     assert recovered["optimizer_steps"] == expected["optimizer_steps"] == 3
     assert recovered["train_log"]["epochs"] == expected["train_log"]["epochs"]
+    assert recovered["best_epoch"] == (1 if monitor == "val_accuracy" else 3)
     log = json.loads((output / "train_log.json").read_text())
     assert log["status"] == "completed"
     assert len(log["epochs"]) == 3
+    for options in loader_options[1::2]:
+        assert options["num_workers"] == 2
+        assert options["persistent_workers"] is False
+        assert options["pin_memory"] is False
+        assert options["prefetch_factor"] == 1
 
 
 def test_failed_save_preserves_previous_checkpoint(tmp_path, monkeypatch):
@@ -216,6 +255,37 @@ def test_failed_save_preserves_previous_checkpoint(tmp_path, monkeypatch):
     with pytest.raises(OSError):
         train._atomic_save({"epoch": 2}, path)
     assert torch.load(path, weights_only=True) == {"epoch": 1}
+
+
+def test_weight_initialization_rejects_reordered_class_mapping(tmp_path):
+    model = TinyModel()
+    contract = {"architecture": "tiny", "derived": {"fine_to_coarse": [0, 1]}}
+    path = tmp_path / "model.pt"
+    torch.save({"model": model.state_dict(), "contract": contract}, path)
+    with torch.no_grad():
+        model.logits.add_(1)
+    metadata = train._initialize_weights(model, contract, path)
+    assert torch.count_nonzero(model.logits) == 0
+    assert metadata["optimizer"] == "fresh"
+    with pytest.raises(ValueError, match="fine_to_coarse"):
+        train._initialize_weights(
+            model, {**contract, "derived": {"fine_to_coarse": [1, 0]}}, path
+        )
+
+
+def test_weight_initialization_rejects_changed_maestro_sampling(tmp_path):
+    model = TinyModel()
+    contract = {
+        "architecture": "maestro_s",
+        "maestro": {"temporal_bins": 4},
+        "derived": {"fine_to_coarse": [0, 1]},
+    }
+    path = tmp_path / "model.pt"
+    torch.save({"model": model.state_dict(), "contract": contract}, path)
+    with pytest.raises(ValueError, match="maestro"):
+        train._initialize_weights(
+            model, {**contract, "maestro": {"temporal_bins": 8}}, path
+        )
 
 
 def test_evaluate_reports_macro_f1():

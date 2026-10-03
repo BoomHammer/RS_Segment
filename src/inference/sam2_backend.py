@@ -252,4 +252,7 @@ def default_sam2_paths(project_root: str | Path) -> tuple[Path, str]:
     """Return the repository's SAM2.1 small checkpoint and config name."""
 
     root = Path(project_root).resolve()
-    return root / "SAM" / "sam2.1_hiera_small.pt", "configs/sam2.1/sam2.1_hiera_s.yaml"
+    return (
+        root / "third_party" / "SAM" / "sam2.1_hiera_small.pt",
+        "configs/sam2.1/sam2.1_hiera_s.yaml",
+    )

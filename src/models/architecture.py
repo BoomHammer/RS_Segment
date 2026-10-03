@@ -198,9 +198,9 @@ class HierarchicalHeads(nn.Module):
         coarse_logits = self.coarse(features)
         coarse_log_probability = coarse_logits.log_softmax(dim=1)
         expert_log_probability = torch.full(
-            (features.shape[0], len(self.fine_to_coarse), *features.shape[-2:]),
-            torch.finfo(features.dtype).min,
-            dtype=features.dtype,
+            (features.shape[0], len(self.fine_to_coarse), *coarse_logits.shape[-2:]),
+            torch.finfo(coarse_log_probability.dtype).min,
+            dtype=coarse_log_probability.dtype,
             device=features.device,
         )
         for coarse_index, expert in enumerate(self.experts):
@@ -253,10 +253,35 @@ class SegFormerUtae(nn.Module):
 
     @classmethod
     def from_contract(cls, contract: dict[str, Any]) -> SegFormerUtae:
+        if contract.get("architecture") == "anysat":
+            from models.anysat import AnySatSegmentation
+
+            return AnySatSegmentation(contract)
+        if contract.get("architecture") == "maestro_s":
+            from models.maestro import MaestroS
+
+            return MaestroS(contract)
+        if contract.get("architecture") in {
+            "segformer_utae_dynamic_ablation",
+            "segformer_utae_static_ablation",
+        }:
+            from models.branch_ablation import BranchAblation
+
+            return BranchAblation(contract)
         if contract.get("architecture") == "segformer_utae_pretrained":
             from models.pretrained_utae import PretrainedSegFormerUTAE
 
             return PretrainedSegFormerUTAE(contract)
+        if contract.get("architecture") in {
+            "lightweight_dual_branch",
+            "segformer_utae",
+        }:
+            mapping = contract.get("fine_to_coarse")
+            if mapping is None:
+                mapping = dict(contract.get("derived", {})).get("fine_to_coarse")
+            if mapping is None:
+                raise ValueError("contract 缂哄皯 fine_to_coarse 灞傜骇鏄犲皠")
+            return cls(contract, mapping)
         mapping = contract.get("fine_to_coarse")
         if mapping is None:
             mapping = dict(contract.get("derived", {})).get("fine_to_coarse")

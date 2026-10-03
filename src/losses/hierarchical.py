@@ -48,6 +48,7 @@ def hierarchical_supervision_loss(
     hierarchy_weight: float = 0.2,
     focal_gamma: float = 0.0,
     class_weights: Tensor | None = None,
+    weight_normalization: str = "weighted_mean",
     ignore_index: int = -1,
 ) -> dict[str, Tensor]:
     """Train joint coarse/fine heads while keeping weak labels lower confidence."""
@@ -72,6 +73,7 @@ def hierarchical_supervision_loss(
             fine_labels,
             gamma=focal_gamma,
             weight=class_weights,
+            weight_normalization=weight_normalization,
             ignore_index=ignore_index,
         )
         coarse_loss = focal_cross_entropy(

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +57,8 @@ def test_streaming_weak_labels_write_geo_tiff_and_quality(tmp_path: Path) -> Non
         output_path=output,
         config=WeakLabelGenerationConfig(window_size=(4, 4)),
         alliance_names={7: "Test alliance"},
+        provenance_path=tmp_path / "seed_ids.tif",
+        sample_outcomes_path=tmp_path / "outcomes.json",
     )
     with rasterio.open(output) as dataset:
         assert dataset.crs.to_string() == "EPSG:4326"
@@ -64,6 +67,12 @@ def test_streaming_weak_labels_write_geo_tiff_and_quality(tmp_path: Path) -> Non
     assert report["labeled_pixels"] == 1
     assert report["sample_quality"]["invalid_samples"] == 0
     assert report["class_distribution"]["7"]["alliance"] == "Test alliance"
+    with rasterio.open(tmp_path / "seed_ids.tif") as seeds:
+        assert seeds.read(1)[0, 0] == 1
+        assert (seeds.read(1) > 0).sum() == 1
+    outcomes = json.loads((tmp_path / "outcomes.json").read_text())
+    assert outcomes[0]["record_index"] == "1"
+    assert outcomes[0]["seed_id"] == 1
 
 
 def test_quality_report_detects_conflicting_labels(tmp_path: Path) -> None:

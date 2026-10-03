@@ -121,15 +121,11 @@ def _stratified_block_assignment(
     active_splits = int(np.sum(ratio_array > 0))
 
     def cost(counts: np.ndarray) -> float:
-        class_error = np.sum(
-            (counts - class_targets) ** 2 / (class_targets + 1.0)
-        )
+        class_error = np.sum((counts - class_targets) ** 2 / (class_targets + 1.0))
         point_error = 10.0 * np.sum(
             (counts.sum(axis=1) - point_targets) ** 2 / (point_targets + 1.0)
         )
-        train_missing = (
-            1_000_000.0 * np.sum(counts[0] == 0) if ratios[0] > 0 else 0.0
-        )
+        train_missing = 1_000_000.0 * np.sum(counts[0] == 0) if ratios[0] > 0 else 0.0
         feasible_everywhere = class_presence >= active_splits
         split_missing = 10_000.0 * sum(
             np.sum((counts[index] == 0) & feasible_everywhere)
@@ -164,9 +160,7 @@ def _stratified_block_assignment(
             candidate[right_split] += matrix[left] - matrix[right]
             candidate_cost = cost(candidate)
             difference = candidate_cost - current_cost
-            if difference < 0 or generator.random() < np.exp(
-                -difference / temperature
-            ):
+            if difference < 0 or generator.random() < np.exp(-difference / temperature):
                 assignment[left], assignment[right] = right_split, left_split
                 counts = candidate
                 current_cost = candidate_cost
@@ -178,8 +172,7 @@ def _stratified_block_assignment(
         raise RuntimeError("空间块优化没有产生有效划分")
     _, assignment, counts_array = best
     assigned = {
-        block: names[int(assignment[index])]
-        for index, block in enumerate(labelled)
+        block: names[int(assignment[index])] for index, block in enumerate(labelled)
     }
     random.Random(seed).shuffle(unlabelled)
     start = 0
@@ -190,9 +183,7 @@ def _stratified_block_assignment(
         start += remaining
     counts = {
         name: Counter(
-            {
-                code: int(counts_array[index, code_index[code]]) for code in codes
-            }
+            {code: int(counts_array[index, code_index[code]]) for code in codes}
         )
         for index, name in enumerate(names)
     }
@@ -274,7 +265,7 @@ def build_spatial_split(
         for window_id in window_ids:
             if window_id in splits[owner]:
                 window_classes[window_id][str(code)] += 1
-    total_counts = sum(counts_by_split.values(), Counter())
+    total_counts = counts_by_split["train"]
     class_weights = {code: 1.0 / (count**0.5) for code, count in total_counts.items()}
     if class_weights:
         mean_weight = sum(class_weights.values()) / len(class_weights)

@@ -2,8 +2,9 @@
 training:
   # 训练轮数。
   epochs: 30
-  # CUDA 自动混合精度类型：bfloat16、float16 或 none。
-  amp_dtype: bfloat16
+  # auto：4090 等支持原生 BF16 的显卡使用 BF16；2070 等使用 FP16 + 梯度缩放。
+  # 也可指定 bfloat16、float16 或 none；不支持原生 BF16 时自动回退到 FP16。
+  amp_dtype: auto
   # 梯度累积步数；用于在较小显存下模拟更大 batch。
   gradient_accumulation_steps: 2
   # 随机种子，保证数据采样和增强可复现。
@@ -22,7 +23,10 @@ dataloader:
   # 训练/验证每个 batch 包含的窗口数量。增大可提高 GPU 吞吐，但会增加显存占用。
   batch_size: 2
   # 验证没有反向传播；即使训练因 halo 降为单窗口，验证仍可按此批量前向。
-  validation_batch_size: 2
+  # 8GB 显卡上验证也会产生整套前向激活，必须使用单窗口批次。
+  validation_batch_size: 1
+  # 验证单独使用较小的 worker 池；验证结束即释放，不常驻、不使用页锁定预取。
+  validation_num_workers: 2
   # 数据加载子进程数量。大于 0 时可并行读取和预处理 GeoTIFF，减少 GPU 等待。
   # 建议从 2~4 开始测试；过大可能造成磁盘争用和内存占用增加。
   num_workers: 6
@@ -77,6 +81,13 @@ ema:
   enabled: true
   # EMA 衰减率，越接近 1 越平滑。
   decay: 0.99
+
+# 训练期间约束重叠区域的预测，配合 halo/高斯融合缓解 patch 接缝。
+overlap_consistency:
+  weight: 0.1
+  every_n_batches: 4
+  warmup_epochs: 0
+  crop_margin: 32
 
 checkpoint:
   # checkpoint 文件名模板；{timestamp} 由训练入口替换。

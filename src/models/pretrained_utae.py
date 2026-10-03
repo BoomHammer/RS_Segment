@@ -11,7 +11,7 @@ from transformers import SegformerConfig, SegformerModel
 from transformers.models.segformer.modeling_segformer import SegformerDecodeHead
 
 from models.architecture import GatedScaleFusion, HierarchicalHeads
-from models.input_adapter import sanitize_batch
+from models.input_adapter import TemporalAttentionEncoder, sanitize_batch
 from models.utae.utae import UTAE
 
 
@@ -23,8 +23,15 @@ class MaskedUTAE(UTAE):
     Whole padded dates are removed per sample before temporal normalization.
     """
 
-    def __init__(self, input_dim: int, chunk_size: int = 2):
-        super().__init__(input_dim=input_dim, encoder=True, pad_value=None)
+    def __init__(
+        self, input_dim: int, chunk_size: int = 2, normalization: str = "batch"
+    ):
+        super().__init__(
+            input_dim=input_dim,
+            encoder=True,
+            pad_value=None,
+            normalization=normalization,
+        )
         if chunk_size < 1:
             raise ValueError("frame_chunk_size 必须为正整数")
         self.chunk_size = chunk_size
@@ -47,7 +54,7 @@ class MaskedUTAE(UTAE):
         heads, batch, time = attention.shape[:3]
         height, width = features.shape[-2:]
         weights = F.interpolate(
-            attention.flatten(0, 1),
+            attention.flatten(0, 1).float(),
             size=(height, width),
             mode="bilinear",
             align_corners=False,
@@ -82,9 +89,12 @@ class MaskedUTAE(UTAE):
                     ]
                 )
                 continue
-            values = sequence[sample : sample + 1, active]
-            valid = present[sample : sample + 1, active]
-            dates = positions[sample : sample + 1, active]
+            # Boolean indexing copies the entire sequence. The common case
+            # without padded dates can keep a view of the checkpoint inputs.
+            selection = slice(None) if active.all() else active
+            values = sequence[sample : sample + 1, selection]
+            valid = present[sample : sample + 1, selection]
+            dates = positions[sample : sample + 1, selection]
             features = [self._encode(self.in_conv, values)]
             for block in self.down_blocks:
                 features.append(self._encode(block, features[-1]))
@@ -92,7 +102,7 @@ class MaskedUTAE(UTAE):
                 F.adaptive_max_pool2d(
                     valid.flatten(0, 1).float(), features[-1].shape[-2:]
                 )
-                .unflatten(0, (1, int(active.sum())))
+                .unflatten(0, (1, values.shape[1]))
                 .squeeze(2)
                 .bool()
             )
@@ -102,7 +112,17 @@ class MaskedUTAE(UTAE):
             output = output * coarse_valid.any(dim=1)[:, None]
             maps = [output]
             for i, block in enumerate(self.up_blocks):
-                skip = self._aggregate(features[-i - 2], attention, valid)
+                skip = (
+                    checkpoint(
+                        self._aggregate,
+                        features[-i - 2],
+                        attention,
+                        valid,
+                        use_reentrant=False,
+                    )
+                    if self.training and torch.is_grad_enabled()
+                    else self._aggregate(features[-i - 2], attention, valid)
+                )
                 output = block(output, skip)
                 maps.append(output)
             per_sample.append(list(reversed(maps)))
@@ -146,6 +166,9 @@ class PretrainedSegFormerUTAE(nn.Module):
         self.dynamic_encoder = MaskedUTAE(
             2 * derived["dynamic_features_count"],
             chunk_size=int(contract.get("temporal", {}).get("frame_chunk_size", 2)),
+            normalization=str(
+                contract.get("temporal", {}).get("normalization", "batch")
+            ),
         )
         widths = self.dynamic_encoder.decoder_widths
         self.static_projections = nn.ModuleList(
@@ -164,6 +187,30 @@ class PretrainedSegFormerUTAE(nn.Module):
             )
         )
         self.decoder.classifier = nn.Identity()
+        # Hugging Face's SegformerDecodeHead contains a hard-coded BN after
+        # feature fusion; encoder_norm does not affect this layer.
+        normalization = str(contract.get("temporal", {}).get("normalization", "batch"))
+        if normalization == "group":
+            self.decoder.batch_norm = nn.GroupNorm(
+                num_groups=min(8, decoder_width), num_channels=decoder_width
+            )
+        self.pixel_bypass_enabled = bool(
+            contract.get("temporal", {}).get("pixel_bypass", False)
+        )
+        if self.pixel_bypass_enabled:
+            pixel_channels = int(
+                contract.get("temporal", {}).get("projection_channels", 64)
+            )
+            self.pixel_temporal = TemporalAttentionEncoder(
+                derived["dynamic_features_count"], channels=pixel_channels
+            )
+            self.pixel_bypass = nn.Conv2d(
+                pixel_channels, decoder_width, kernel_size=1
+            )
+            self.pixel_fusion = nn.Sequential(
+                nn.Conv2d(decoder_width * 2, decoder_width, kernel_size=1),
+                nn.GELU(),
+            )
         self.heads = HierarchicalHeads(
             decoder_width, derived["num_coarse_classes"], derived["fine_to_coarse"]
         )
@@ -205,11 +252,34 @@ class PretrainedSegFormerUTAE(nn.Module):
 
     def forward(self, batch):
         clean = sanitize_batch(batch)
-        dynamic = torch.cat(
-            [clean["dynamic"], clean["dynamic_value_mask"].float()], dim=2
+        device_type = clean["dynamic"].device.type
+        input_dtype = (
+            torch.get_autocast_dtype(device_type)
+            if torch.is_autocast_enabled(device_type)
+            else clean["dynamic"].dtype
         )
+        # Checkpoint inputs live until backward. Store frame chunks in the same
+        # dtype their convolutions use instead of retaining a full FP32 copy.
+        dynamic = torch.cat(
+            [
+                clean["dynamic"].to(input_dtype),
+                clean["dynamic_value_mask"].to(input_dtype),
+            ],
+            dim=2,
+        )
+        if self.pixel_bypass_enabled:
+            pixel_temporal, _ = self.pixel_temporal(
+                clean["dynamic"],
+                clean["dynamic_mask"],
+                clean["dynamic_time_mask"],
+                clean["time_encoding"],
+                clean["dynamic_value_mask"],
+            )
+        else:
+            pixel_temporal = None
         present = clean["dynamic_value_mask"].any(dim=2, keepdim=True)
         present = present & clean["dynamic_time_mask"][:, :, None, None, None]
+        del clean["dynamic"], clean["dynamic_value_mask"]
         static = torch.cat([clean["static"], clean["static_value_mask"].float()], dim=1)
         height, width = static.shape[-2:]
         # U-TAE transposed convolutions require matching sizes at all four scales.
@@ -217,6 +287,8 @@ class PretrainedSegFormerUTAE(nn.Module):
         static = F.pad(static, (0, right, 0, bottom))
         dynamic = F.pad(dynamic, (0, right, 0, bottom))
         present = F.pad(present, (0, right, 0, bottom))
+        if pixel_temporal is not None:
+            pixel_temporal = F.pad(pixel_temporal, (0, right, 0, bottom))
         stem = self.static_stem(static)
 
         def spatial(value):
@@ -252,6 +324,12 @@ class PretrainedSegFormerUTAE(nn.Module):
         ]
         # Classify at final resolution so the conditional hierarchy stays normalized.
         features = self.decoder(fused)[..., :height, :width]
+        if pixel_temporal is not None:
+            bypass = self.pixel_bypass(pixel_temporal)
+            bypass = F.interpolate(
+                bypass, size=features.shape[-2:], mode="bilinear", align_corners=False
+            )
+            features = self.pixel_fusion(torch.cat((features, bypass), dim=1))
         with torch.autocast(device_type=features.device.type, enabled=False):
             output = self.heads(features.float())
         output["valid_mask"] = clean["valid_mask"][:, None]

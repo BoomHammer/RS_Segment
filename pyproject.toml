@@ -31,6 +31,8 @@ rs-check-data = "data_check:main"
 rs-compute-stats = "data_stats:main"
 rs-prepare-data = "prepare_data:main"
 rs-pipeline = "pipeline:main"
+rs-train-predict = "train_predict:train_main"
+rs-resume-predict = "train_predict:resume_main"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["src"]

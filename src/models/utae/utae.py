@@ -10,6 +10,16 @@ import torch.nn as nn
 from .ltae import LTAE2d
 
 
+def _normalization_2d(kind: str, channels: int) -> nn.Module:
+    if kind == "batch":
+        return nn.BatchNorm2d(channels)
+    if kind == "group":
+        return nn.GroupNorm(num_groups=min(4, channels), num_channels=channels)
+    if kind == "instance":
+        return nn.InstanceNorm2d(channels)
+    raise ValueError("normalization 必须是 batch、group 或 instance")
+
+
 class UTAE(nn.Module):
     def __init__(
         self,
@@ -29,6 +39,7 @@ class UTAE(nn.Module):
         return_maps=False,
         pad_value=0,
         padding_mode="reflect",
+        normalization="batch",
     ):
         """
         U-TAE architecture for spatio-temporal encoding of satellite image time series.
@@ -89,6 +100,7 @@ class UTAE(nn.Module):
         )
         self.pad_value = pad_value
         self.encoder = encoder
+        normalization = normalization or "batch"
         if encoder:
             self.return_maps = True
 
@@ -125,7 +137,7 @@ class UTAE(nn.Module):
                 k=str_conv_k,
                 s=str_conv_s,
                 p=str_conv_p,
-                norm="batch",
+                norm=normalization,
                 padding_mode=padding_mode,
             )
             for i in range(self.n_stages - 1, 0, -1)
@@ -137,6 +149,7 @@ class UTAE(nn.Module):
             mlp=[d_model, encoder_widths[-1]],
             return_att=True,
             d_k=d_k,
+            normalization="layer" if normalization == "group" else normalization,
         )
         self.temporal_aggregator = Temporal_Aggregator(mode=agg_mode)
         self.out_conv = ConvBlock(
@@ -340,14 +353,14 @@ class UpConvBlock(nn.Module):
         d = d_out if d_skip is None else d_skip
         self.skip_conv = nn.Sequential(
             nn.Conv2d(in_channels=d, out_channels=d, kernel_size=1),
-            nn.BatchNorm2d(d),
+            _normalization_2d(norm, d),
             nn.ReLU(),
         )
         self.up = nn.Sequential(
             nn.ConvTranspose2d(
                 in_channels=d_in, out_channels=d_out, kernel_size=k, stride=s, padding=p
             ),
-            nn.BatchNorm2d(d_out),
+            _normalization_2d(norm, d_out),
             nn.ReLU(),
         )
         self.conv1 = ConvLayer(
