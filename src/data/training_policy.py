@@ -39,7 +39,9 @@ def point_windows(
     if (manifest is None) != (split is None):
         raise ValueError("manifest 和 split 必须同时提供")
     result: dict[int, Counter] = {}
-    for pixel, code in dataset.ground_truth_pixels.items():
+    for pixel, code in getattr(
+        dataset, "supervision_pixels", dataset.ground_truth_pixels
+    ).items():
         if manifest is not None and point_owner(*pixel, manifest) != split:
             continue
         for index in dataset.query_windows_for_pixel(*pixel):
@@ -54,12 +56,12 @@ def assert_supervision_isolated(
 
     train = {
         pixel
-        for pixel in dataset.ground_truth_pixels
+        for pixel in getattr(dataset, "supervision_pixels", dataset.ground_truth_pixels)
         if point_owner(*pixel, manifest) == "train"
     }
     validation = {
         pixel
-        for pixel in dataset.ground_truth_pixels
+        for pixel in getattr(dataset, "supervision_pixels", dataset.ground_truth_pixels)
         if point_owner(*pixel, manifest) == "validation"
     }
     overlap = train & validation
@@ -103,7 +105,9 @@ def supervision_summary(dataset, manifest) -> dict:
     split_sets = {name: set(ids) for name, ids in manifest.splits.items()}
     counts = {name: Counter() for name in split_sets}
     point_window_counts = Counter()
-    for pixel, code in dataset.ground_truth_pixels.items():
+    for pixel, code in getattr(
+        dataset, "supervision_pixels", dataset.ground_truth_pixels
+    ).items():
         owner = point_owner(*pixel, manifest)
         if owner not in split_sets:
             continue

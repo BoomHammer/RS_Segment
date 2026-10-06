@@ -204,16 +204,12 @@ class PretrainedSegFormerUTAE(nn.Module):
             self.pixel_temporal = TemporalAttentionEncoder(
                 derived["dynamic_features_count"], channels=pixel_channels
             )
-            self.pixel_bypass = nn.Conv2d(
-                pixel_channels, decoder_width, kernel_size=1
-            )
+            self.pixel_bypass = nn.Conv2d(pixel_channels, decoder_width, kernel_size=1)
             self.pixel_fusion = nn.Sequential(
                 nn.Conv2d(decoder_width * 2, decoder_width, kernel_size=1),
                 nn.GELU(),
             )
-        self.heads = HierarchicalHeads(
-            decoder_width, derived["num_coarse_classes"], derived["fine_to_coarse"]
-        )
+        self.heads = HierarchicalHeads.from_derived(decoder_width, derived)
 
     def initialize_pretrained(self):
         folder = Path(self.contract["pretrained"]["path"])

@@ -97,3 +97,30 @@ def test_label_artifacts_are_json(tmp_path: Path) -> None:
     report_data = json.loads(report.read_text(encoding="utf-8"))
     assert report_data["invalid_rows"] == 0
     assert report_data["mapping_validation"]["valid"] is True
+
+
+def test_invalid_points_are_reported_and_skipped(tmp_path: Path) -> None:
+    path = tmp_path / "labels.csv"
+    _write_labels(path)
+    with path.open("a", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["4", "小类A", "大类A", "Minor A", "Major A", "", "22"])
+        writer.writerow(["5", "小类A", "大类A", "Minor A", "Major A", "bad", "23"])
+
+    mapping = build_label_mapping(path, label_columns=COLUMNS)
+    report = validate_labels(path, label_columns=COLUMNS, mapping=mapping)
+    encoded = [
+        record
+        for batch in iter_encoded_labels(
+            path,
+            label_columns=COLUMNS,
+            mapping=mapping,
+            batch_size=2,
+        )
+        for record in batch
+    ]
+
+    assert (report.total_rows, report.valid_rows, report.invalid_rows) == (5, 3, 2)
+    assert [item["csv_line"] for item in report.invalid_row_examples] == [5, 6]
+    assert [item["index"] for item in report.invalid_row_examples] == ["4", "5"]
+    assert [record.index for record in encoded] == ["1", "2", "3"]

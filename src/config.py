@@ -35,10 +35,22 @@ class DataConfig:
     metadata_schema: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def label_columns(self) -> dict[str, str]:
+    def label_columns(self) -> dict[str, Any]:
         """Return CSV columns from the unified label schema."""
 
-        return dict(self.label_schema.get("columns", {}))
+        columns = dict(self.label_schema.get("columns", {}))
+        if "levels" in self.label_schema:
+            from data.label_hierarchy import label_levels
+
+            columns["levels"] = self.label_schema["levels"]
+            label_levels(columns)
+        columns["encoding"] = self.label_schema.get("encoding", "utf-8-sig")
+        columns["missing_policy"] = self.label_schema.get("missing_policy", "error")
+        if columns["missing_policy"] not in {"error", "skip", "partial"}:
+            raise ValueError(
+                "label_schema.missing_policy 必须为 error、skip 或 partial"
+            )
+        return columns
 
 
 @dataclass(slots=True)

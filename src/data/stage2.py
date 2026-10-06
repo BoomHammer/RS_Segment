@@ -234,8 +234,9 @@ def validate_dataset_windows(
     import torch
 
     candidate_ids: list[int] = []
-    if require_ground_truth and dataset.ground_truth_pixels:
-        for row, column in dataset.ground_truth_pixels:
+    supervision = getattr(dataset, "supervision_pixels", dataset.ground_truth_pixels)
+    if require_ground_truth and supervision:
+        for row, column in supervision:
             candidate_ids.extend(dataset.query_windows_for_pixel(row, column))
         candidate_ids = list(dict.fromkeys(candidate_ids))
     if not candidate_ids:
@@ -251,7 +252,8 @@ def validate_dataset_windows(
         labels = sample["ground_truth"][sample["ground_truth_mask"]]
         if torch.any(labels < 1):
             raise AssertionError(f"窗口 {window_id} 存在非法地面真实值类别编码")
-        if require_ground_truth and not sample["ground_truth_mask"].any():
+        observed = sample.get("ground_truth_levels", sample["ground_truth"])
+        if require_ground_truth and not observed.gt(0).any():
             raise AssertionError(f"窗口 {window_id} 未包含地面真实值标签")
         checked.append(sample["sample_status"])
     if require_ground_truth and not checked:

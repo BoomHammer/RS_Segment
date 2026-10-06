@@ -38,6 +38,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input-range", type=float, nargs=2, default=None)
     parser.add_argument("--mask-confidence", type=float, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        metavar="RUN_DIR",
+        help="从运行目录中的弱标签断点继续",
+    )
     args = parser.parse_args(argv)
     config = load_config(args.data_config)
     with args.config.open(encoding="utf-8") as stream:
@@ -65,18 +71,24 @@ def main(argv: list[str] | None = None) -> int:
         target_crs=config.data.target_grid.get("crs", "EPSG:4326"),
         resolution=tuple(config.data.target_grid.get("resolution", [0.00225, 0.00225])),
     )
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = config.data.processed / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    if args.resume is None:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = config.data.processed / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        run_dir = args.resume.resolve()
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"弱标签运行目录不存在: {run_dir}")
     label_mapping = build_label_mapping(
         config.data.label_file,
         label_columns=config.data.label_columns,
         schema=config.data.label_schema,
     )
     mapping = run_dir / "label_mapping.json"
-    mapping.write_text(
-        json.dumps(label_mapping, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    if args.resume is None:
+        mapping.write_text(
+            json.dumps(label_mapping, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
     record_batches = iter_encoded_labels(
         config.data.label_file,
         label_columns=config.data.label_columns,
@@ -137,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         ),
         keyframe_index=keyframe_index,
         composite_names=composite_names,
+        resume=args.resume is not None,
     )
     print(f"弱标签: {output}")
     print(f"质量报告: {report}")

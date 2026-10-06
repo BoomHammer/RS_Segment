@@ -67,7 +67,14 @@ def _initialize_weights(model, contract, path):
     ):
         if previous.get(key) != contract.get(key):
             raise ValueError(f"Initialization architecture mismatch: {key}")
-    for key in ("dynamic_features", "static_features", "fine_to_coarse"):
+    for key in (
+        "dynamic_features",
+        "static_features",
+        "fine_to_coarse",
+        "level_counts",
+        "level_parents",
+        "class_paths",
+    ):
         if previous["derived"].get(key) != contract["derived"].get(key):
             raise ValueError(f"Initialization input/label mismatch: {key}")
     model.load_state_dict(payload["model"], strict=True)
@@ -363,7 +370,9 @@ def main(argv: list[str] | None = None) -> int:
         manifest.write(output / "spatial_split.json")
         if policy.get("require_validation_classes_in_train", False):
             counts = supervision_audit["unique_class_counts"]
-            missing = set(counts["validation"]) - set(counts["train"])
+            missing = {code for code in counts["validation"] if int(code) > 0} - set(
+                counts["train"]
+            )
             if missing:
                 raise ValueError(
                     f"隔离后训练集缺少验证类别 {sorted(missing)}；"
@@ -775,7 +784,15 @@ def main(argv: list[str] | None = None) -> int:
                     )
                 split_mask = tensor_batch.get("supervision_split_mask")
                 if split_mask is not None and (
-                    (tensor_batch["ground_truth_mask"] & ~split_mask).any()
+                    (
+                        tensor_batch.get(
+                            "ground_truth_levels",
+                            tensor_batch["ground_truth"].unsqueeze(1),
+                        )
+                        .gt(0)
+                        .any(dim=1)
+                        & ~split_mask
+                    ).any()
                     or (tensor_batch["weak_label_mask"] & ~split_mask).any()
                 ):
                     raise AssertionError("实际训练监督越过了训练空间归属边界")
@@ -788,6 +805,7 @@ def main(argv: list[str] | None = None) -> int:
                     weak_label_weight=float(supervision.get("weak_label_weight", 0.5)),
                     focal_gamma=float(supervision.get("focal_gamma", 0.0)),
                     fine_to_coarse=derived["fine_to_coarse"],
+                    level_parents=derived.get("level_parents"),
                     class_weights=class_weights,
                     weight_normalization=str(
                         supervision.get("weight_normalization", "weighted_mean")
@@ -806,6 +824,13 @@ def main(argv: list[str] | None = None) -> int:
                     (predicted[ground_truth_mask] == target[ground_truth_mask]).sum()
                 )
                 labeled_pixels += int(ground_truth_mask.sum())
+            observed_ground_truth = tensor_batch.get(
+                "ground_truth_levels", tensor_batch["ground_truth"]
+            )
+            observed_mask = observed_ground_truth.gt(0)
+            if observed_mask.ndim == 4:
+                observed_mask = observed_mask.any(dim=1)
+            if (observed_mask & tensor_batch["valid_mask"]).any():
                 source_loss = _source_supervision_loss(loss_components, "ground_truth")
                 if source_loss is not None:
                     ground_truth_loss_sum += float(source_loss.detach())

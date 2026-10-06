@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
@@ -44,6 +45,110 @@ class WeakLabelGenerationConfig:
     min_confidence: float = 0.0
     mask_fusion: str = "intersection"
     weighted_vote_threshold: float = 0.5
+
+
+_CHECKPOINT_VERSION = 1
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+def _checkpoint_contract(
+    *,
+    grid: TargetGrid,
+    config: WeakLabelGenerationConfig,
+    video_frames: Sequence[Sequence[Sequence[str | Path]]],
+    keyframe_index: int,
+    located_records: Sequence[tuple[LabelRecord, int, int, int]],
+    provenance_enabled: bool,
+) -> dict[str, Any]:
+    records = [
+        [
+            record.index,
+            record.x,
+            record.y,
+            record.formation_code,
+            record.alliance_code,
+            row,
+            column,
+            outcome_index,
+        ]
+        for record, row, column, outcome_index in located_records
+    ]
+    records_digest = hashlib.sha256(
+        json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "version": _CHECKPOINT_VERSION,
+        "grid": {
+            "width": grid.width,
+            "height": grid.height,
+            "crs": str(grid.crs),
+            "transform": list(grid.transform),
+        },
+        "config": json.loads(json.dumps(asdict(config))),
+        "image_paths": [
+            [[str(Path(path).resolve()) for path in group] for group in frame]
+            for frame in video_frames
+        ],
+        "keyframe_index": keyframe_index,
+        "record_count": len(located_records),
+        "records_digest": records_digest,
+        "provenance_enabled": provenance_enabled,
+    }
+
+
+def _load_completed_outcomes(
+    path: Path,
+    sample_outcomes: list[dict[str, Any]],
+    located_records: Sequence[tuple[LabelRecord, int, int, int]],
+) -> int:
+    if not path.exists():
+        return 0
+    completed = 0
+    valid_bytes = 0
+    with path.open("rb+") as stream:
+        for line in stream:
+            try:
+                payload = json.loads(line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                break
+            if payload.get("located_index") != completed:
+                raise RuntimeError("弱标签检查点的样点顺序不连续")
+            if completed >= len(located_records):
+                raise RuntimeError("弱标签检查点包含多余的样点结果")
+            outcome_index = located_records[completed][3]
+            outcome = payload.get("outcome")
+            if not isinstance(outcome, dict):
+                raise RuntimeError("弱标签检查点的样点结果无效")
+            sample_outcomes[outcome_index] = outcome
+            completed += 1
+            valid_bytes = stream.tell()
+        stream.truncate(valid_bytes)
+    return completed
+
+
+def _append_completed_outcome(
+    path: Path, located_index: int, outcome: dict[str, Any]
+) -> None:
+    payload = (
+        json.dumps(
+            {"located_index": located_index, "outcome": outcome},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    with path.open("ab") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def _window_for_point(
@@ -212,6 +317,8 @@ def generate_weak_labels(
     composite_names: Sequence[str] | None = None,
     provenance_path: str | Path | None = None,
     sample_outcomes_path: str | Path | None = None,
+    resume: bool = False,
+    checkpoint_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Generate sparse, point-local labels from high-confidence SAM regions."""
 
@@ -240,11 +347,19 @@ def generate_weak_labels(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output_profile = _profile(grid, config.output_nodata)
-    with rasterio.open(output, "w", **output_profile) as destination:
-        _write_initial_nodata(destination, grid, config.output_nodata)
     located_records = []
     sample_outcomes: list[dict[str, Any]] = []
     for record in records:
+        if record.alliance_code < 1:
+            sample_outcomes.append(
+                {
+                    "record_index": record.index,
+                    "alliance_code": -1,
+                    "status": "partial_label",
+                    "reason": "仅保留已知层级实测监督，不生成叶类弱标签",
+                }
+            )
+            continue
         location = locate_points(
             [(record.x, record.y)], point_crs="EPSG:4326", grid=grid
         )[0]
@@ -277,6 +392,33 @@ def generate_weak_labels(
                     "status": "outside_grid",
                 }
             )
+    checkpoint = Path(checkpoint_path or output.with_name(f"{output.name}.checkpoint"))
+    manifest_path = checkpoint / "manifest.json"
+    completed_outcomes_path = checkpoint / "completed.jsonl"
+    contract = _checkpoint_contract(
+        grid=grid,
+        config=config,
+        video_frames=video_frames,
+        keyframe_index=keyframe_index,
+        located_records=located_records,
+        provenance_enabled=provenance_path is not None,
+    )
+    if resume:
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"弱标签断点不存在: {manifest_path}")
+        saved_contract = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if saved_contract != contract:
+            raise ValueError("弱标签断点与当前网格、影像、标签或配置不匹配")
+    else:
+        if checkpoint.exists():
+            raise FileExistsError(
+                f"弱标签断点目录已存在: {checkpoint}；请使用 resume=True 继续"
+            )
+        checkpoint.mkdir(parents=True)
+        _write_json_atomic(manifest_path, contract)
+    completed = _load_completed_outcomes(
+        completed_outcomes_path, sample_outcomes, located_records
+    )
     with ExitStack() as stack:
         datasets = [
             [
@@ -285,19 +427,23 @@ def generate_weak_labels(
             ]
             for frame in video_frames
         ]
-        destination = stack.enter_context(rasterio.open(output, "r+"))
-        workspace = Path(stack.enter_context(TemporaryDirectory(dir=output.parent)))
 
         def mapped_array(name, dtype, fill):
+            path = checkpoint / name
+            mode = "r+" if resume else "w+"
+            if resume and not path.is_file():
+                raise FileNotFoundError(f"弱标签断点数组不存在: {path}")
             array = np.memmap(
-                workspace / name,
-                mode="w+",
+                path,
+                mode=mode,
                 dtype=dtype,
                 shape=(grid.height, grid.width),
             )
             stack.callback(array._mmap.close)
-            for start in range(0, grid.height, 256):
-                array[start : start + 256] = fill
+            if not resume:
+                for start in range(0, grid.height, 256):
+                    array[start : start + 256] = fill
+                array.flush()
             return array
 
         provenance = (
@@ -321,9 +467,28 @@ def generate_weak_labels(
         print("全局光谱拉伸统计量完成，开始加载视频帧并生成弱标签...")
         score = mapped_array("scores.bin", np.float32, -np.inf)
         labels = mapped_array("labels.bin", np.int32, config.output_nodata)
-        global_seeds = []
-        progress = tqdm(located_records, desc="生成弱标签", unit="sample")
-        for record, row, column, outcome_index in progress:
+
+        def save_completed_outcome(located_index: int, outcome: dict[str, Any]) -> None:
+            score.flush()
+            labels.flush()
+            if provenance is not None:
+                provenance.flush()
+            _append_completed_outcome(completed_outcomes_path, located_index, outcome)
+
+        global_seeds = [
+            record_to_seed(record, row, column)
+            for record, row, column, _ in located_records
+        ]
+        progress = tqdm(
+            located_records[completed:],
+            desc="生成弱标签",
+            unit="sample",
+            initial=completed,
+            total=len(located_records),
+        )
+        for located_index, (record, row, column, outcome_index) in enumerate(
+            progress, start=completed
+        ):
             outcome = sample_outcomes[outcome_index]
             window = _window_for_point(row, column, grid, config.window_size)
             row_start, column_start = int(window.row_off), int(window.col_off)
@@ -429,7 +594,6 @@ def generate_weak_labels(
                         axis=0,
                         weights=weights,
                     )
-            global_seeds.append(record_to_seed(record, row, column))
             selected = np.zeros(valid.shape, dtype=bool)
             pixel_score = np.zeros(valid.shape, dtype=np.float32)
             if confidence >= config.medium_confidence:
@@ -494,6 +658,7 @@ def generate_weak_labels(
                         outcome["status"] = "boundary_touch"
                     else:
                         outcome["status"] = "no_pixels_after_filters"
+                    save_completed_outcome(located_index, outcome)
                     continue
             elif confidence >= config.min_confidence:
                 outcome["status"] = "high_confidence_accepted"
@@ -512,20 +677,32 @@ def generate_weak_labels(
             tied = (
                 selected
                 & np.isfinite(current_score)
+                & (current_labels != record.alliance_code)
                 & (np.abs(candidate_score - current_score) <= config.conflict_margin)
             )
-            current_score[better] = candidate_score[better]
             current_labels[better] = record.alliance_code
+            current_score[better] = candidate_score[better]
             current_labels[tied] = config.output_nodata
             current_score[tied] = -np.inf
             if provenance is not None:
                 current_seeds = provenance[global_rows, global_columns]
                 current_seeds[better] = outcome_index + 1
                 current_seeds[tied] = config.output_nodata
+            save_completed_outcome(located_index, outcome)
+        partial_output = output.with_name(f".{output.name}.partial")
+        destination = stack.enter_context(
+            rasterio.open(partial_output, "w", **output_profile)
+        )
+        partial_provenance = None
         provenance_destination = None
         if provenance_path is not None:
+            provenance_output = Path(provenance_path)
+            provenance_output.parent.mkdir(parents=True, exist_ok=True)
+            partial_provenance = provenance_output.with_name(
+                f".{provenance_output.name}.partial"
+            )
             provenance_destination = stack.enter_context(
-                rasterio.open(provenance_path, "w", **output_profile)
+                rasterio.open(partial_provenance, "w", **output_profile)
             )
         for _, window in destination.block_windows(1):
             rows, columns = window.toslices()
@@ -534,6 +711,10 @@ def generate_weak_labels(
                 provenance_destination.write(
                     provenance[rows, columns], 1, window=window
                 )
+
+    partial_output.replace(output)
+    if partial_provenance is not None:
+        partial_provenance.replace(Path(provenance_path))
 
     if sample_outcomes_path is not None:
         Path(sample_outcomes_path).write_text(
@@ -576,6 +757,18 @@ def generate_weak_labels(
             quality_visualization_path,
             valid_mask=valid,
         )
+    for checkpoint_file in (
+        completed_outcomes_path,
+        checkpoint / "seed_ids.bin",
+        checkpoint / "scores.bin",
+        checkpoint / "labels.bin",
+        manifest_path,
+    ):
+        checkpoint_file.unlink(missing_ok=True)
+    try:
+        checkpoint.rmdir()
+    except OSError:
+        pass
     return report
 
 
@@ -677,21 +870,26 @@ def evaluate_label_quality_from_raster(
         reason_counts = Counter(
             outcome["status"]
             for outcome in outcomes
-            if outcome["status"] not in accepted_statuses
+            if outcome["status"] not in accepted_statuses | {"partial_label"}
         )
         status_counts = Counter(outcome["status"] for outcome in outcomes)
         invalid_count = sum(reason_counts.values())
         in_grid_outcomes = [
-            outcome for outcome in outcomes if outcome["status"] != "outside_grid"
+            outcome
+            for outcome in outcomes
+            if outcome["status"] not in {"outside_grid", "partial_label"}
         ]
         in_grid_invalid_count = sum(
             outcome["status"] not in accepted_statuses for outcome in in_grid_outcomes
         )
         sample_quality = {
             "total_samples": len(outcomes),
+            "partial_label_samples": sum(
+                item["status"] == "partial_label" for item in outcomes
+            ),
             "in_grid_samples": len(in_grid_outcomes),
             "inference_attempted": sum(
-                outcome["status"] not in {"outside_grid", "pending"}
+                outcome["status"] not in {"outside_grid", "pending", "partial_label"}
                 for outcome in outcomes
             ),
             "accepted_samples": sum(
@@ -742,7 +940,11 @@ def _warn_missing_classes(
     """Warn when an expected class produced no pixel in the output raster."""
 
     expected_codes = set(alliance_names or {})
-    expected_codes.update(int(item["alliance_code"]) for item in sample_outcomes)
+    expected_codes.update(
+        int(item["alliance_code"])
+        for item in sample_outcomes
+        if int(item["alliance_code"]) > 0
+    )
     generated_codes = {int(code) for code in report["class_distribution"]}
     missing_codes = sorted(expected_codes - generated_codes)
     report["missing_classes"] = [

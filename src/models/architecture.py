@@ -178,13 +178,43 @@ class SharedDecoder(nn.Module):
 class HierarchicalHeads(nn.Module):
     """Coarse head and conditional fine experts, combined without argmax routing."""
 
+    @classmethod
+    def from_derived(cls, channels, derived, head_factory=None):
+        from models.hierarchy import MultiLevelHeads
+
+        counts = derived.get("level_counts")
+        if counts is not None and (
+            not counts or counts[-1] != derived.get("num_classes", counts[-1])
+        ):
+            raise ValueError("最后一层类别数必须等于 num_classes")
+        if counts is not None and len(counts) == 2:
+            if derived.get("level_parents") != [derived["fine_to_coarse"]]:
+                raise ValueError("两层 level_parents 与 fine_to_coarse 不一致")
+            if counts[0] != max(derived["fine_to_coarse"]) + 1:
+                raise ValueError("第一层类别数与父类映射不一致")
+        if counts is not None and len(counts) != 2:
+            return MultiLevelHeads(
+                channels, counts, derived["level_parents"], head_factory
+            )
+        mapping = derived["fine_to_coarse"]
+        result = cls(channels, max(mapping) + 1, mapping)
+        if head_factory is not None:
+            result.coarse = head_factory(max(mapping) + 1)
+            result.experts = nn.ModuleList(
+                head_factory(mapping.count(parent))
+                for parent in range(max(mapping) + 1)
+            )
+        return result
+
     def __init__(
         self, channels: int, num_coarse: int, fine_to_coarse: Sequence[int]
     ) -> None:
         super().__init__()
         self.num_coarse = num_coarse
         self.fine_to_coarse = tuple(int(value) for value in fine_to_coarse)
-        if len(self.fine_to_coarse) < 1 or min(self.fine_to_coarse) < 0:
+        if not self.fine_to_coarse or set(self.fine_to_coarse) != set(
+            range(num_coarse)
+        ):
             raise ValueError("fine_to_coarse 必须是非空的 0-based 映射")
         self.coarse = nn.Conv2d(channels, num_coarse, 1)
         expert_sizes = [self.fine_to_coarse.count(index) for index in range(num_coarse)]
@@ -245,8 +275,8 @@ class SegFormerUtae(nn.Module):
         self.decoder = SharedDecoder(
             MiTB1Encoder.channels, decoder_channels, dropout=dropout
         )
-        self.heads = HierarchicalHeads(
-            decoder_channels, max(fine_to_coarse) + 1, fine_to_coarse
+        self.heads = HierarchicalHeads.from_derived(
+            decoder_channels, {**derived, "fine_to_coarse": list(fine_to_coarse)}
         )
         if len(fine_to_coarse) != int(derived["num_classes"]):
             raise ValueError("fine_to_coarse 长度必须等于 contract 的类别数")
@@ -299,14 +329,15 @@ class SegFormerUtae(nn.Module):
                 self.fusions, static_features, dynamic_features, strict=True
             )
         ]
-        output = self.heads(self.decoder(fused))
         target_size = batch["static"].shape[-2:]
-        for key in ("coarse_logits", "fine_logits"):
-            output[key] = F.interpolate(
-                output[key], size=target_size, mode="bilinear", align_corners=False
+        output = self.heads(
+            F.interpolate(
+                self.decoder(fused),
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
             )
-        output["coarse_probability"] = output["coarse_logits"].softmax(dim=1)
-        output["fine_probability"] = output["fine_logits"].exp()
+        )
         output["valid_mask"] = F.interpolate(
             adapted["valid_mask"].float(), size=target_size, mode="nearest"
         ).bool()

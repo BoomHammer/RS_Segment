@@ -43,6 +43,7 @@ def combined_supervision_loss(
     weak_label_weight: float = 0.5,
     ignore_index: int = -1,
     fine_to_coarse: list[int] | None = None,
+    level_parents: list[list[int]] | None = None,
     hierarchy_weight: float = 0.2,
     focal_gamma: float = 0.0,
     class_weights: Tensor | None = None,
@@ -51,12 +52,13 @@ def combined_supervision_loss(
     """Use ground truth and weak labels as two masked supervision sources."""
 
     if isinstance(logits, dict):
-        if fine_to_coarse is None:
+        if fine_to_coarse is None and "level_0_logits" not in logits:
             raise ValueError("层级输出需要 fine_to_coarse 映射")
         return hierarchical_supervision_loss(
             logits,
             batch,
             fine_to_coarse,
+            level_parents=level_parents,
             ground_truth_weight=ground_truth_weight,
             weak_label_weight=weak_label_weight,
             hierarchy_weight=hierarchy_weight,

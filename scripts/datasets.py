@@ -104,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         block_size=tuple(split.get("block_size", (2048, 2048))),
         ratios=tuple(split.get("ratios", (0.8, 0.1, 0.1))),
         seed=int(split.get("seed", 42)),
+        min_class_points_per_split=int(split.get("min_class_points_per_split", 2)),
         output=run / "spatial_split.json",
     )
     config_report = validate_stage2_config(stage2, index_path)

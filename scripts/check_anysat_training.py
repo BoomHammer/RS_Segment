@@ -82,7 +82,10 @@ def main():
     ):
         output = model(batch)
         losses = combined_supervision_loss(
-            output, batch, fine_to_coarse=contract["derived"]["fine_to_coarse"]
+            output,
+            batch,
+            fine_to_coarse=contract["derived"]["fine_to_coarse"],
+            level_parents=contract["derived"].get("level_parents"),
         )
     assert torch.isfinite(losses["loss"]) and losses["loss"] > 0
     scaler.scale(losses["loss"]).backward()

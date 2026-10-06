@@ -145,6 +145,12 @@ def _classification_metrics(
     valid_aucs = [auc for auc in per_class_aucs.values() if auc is not None]
     return {
         "support": int(support.sum()),
+        "class_support": support.int().tolist(),
+        "classes_without_ground_truth": (support == 0)
+        .nonzero()
+        .flatten()
+        .add(1)
+        .tolist(),
         "accuracy": {
             "micro": float(true_positive.sum() / total),
             "macro": float(per_class_recall[present].mean()) if present.any() else 0.0,
@@ -189,6 +195,8 @@ def _metrics(
     *,
     fine_to_coarse: list[int],
     loss_sum: float,
+    level_parents: list[list[int]] | None = None,
+    level_names: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build fine/coarse reports from all valid labeled pixels."""
 
@@ -214,6 +222,27 @@ def _metrics(
             "auc": "多分类 One-vs-Rest；没有正负样本的类别 AUC 为 null",
         },
     }
+    if level_parents is not None:
+        reports = [report["fine"]]
+        current_targets, current_probabilities = targets, probabilities
+        for edge in reversed(level_parents):
+            parent = torch.tensor(edge, dtype=torch.long)
+            aggregated = current_probabilities.new_zeros(
+                (targets.shape[0], int(parent.max()) + 1)
+            )
+            aggregated.index_add_(1, parent, current_probabilities)
+            current_targets = parent[current_targets]
+            current_probabilities = aggregated
+            reports.append(
+                _classification_metrics(
+                    current_targets, aggregated, aggregated.shape[1]
+                )
+            )
+        reports.reverse()
+        names = level_names or [f"level_{i}" for i in range(len(reports))]
+        report["levels"] = dict(zip(names, reports, strict=True))
+        if not level_parents:
+            report.pop("coarse")
     return report
 
 
@@ -312,6 +341,9 @@ def main(argv: list[str] | None = None) -> int:
     contract = payload.get("contract") if isinstance(payload, dict) else None
     if contract is None:
         raise ValueError("checkpoint 缺少训练时保存的模型 contract")
+    from models.config import validate_checkpoint_mapping
+
+    validate_checkpoint_mapping(contract["derived"], mapping)
     model = SegFormerUtae.from_contract(contract)
     model.load_state_dict(_select_checkpoint_state(payload, args.weights), strict=True)
     device = torch.device(
@@ -342,20 +374,37 @@ def main(argv: list[str] | None = None) -> int:
         )
         _reestimate_batch_norm(model, train_loader, device)
     fine_to_coarse = list(contract["derived"]["fine_to_coarse"])
+    level_predictions = {}
     targets, probabilities, positions, occurrences = collect_point_predictions(
         model,
         loader,
         device,
         amp_dtype=str(train_config.get("training", {}).get("amp_dtype", "auto")),
+        level_predictions=level_predictions,
     )
-    summary = point_metrics(targets, probabilities, occurrences)
-    report = _metrics(
-        targets,
-        probabilities,
-        fine_to_coarse=fine_to_coarse,
-        loss_sum=summary["loss"] * len(targets),
-    )
-    report.update(summary)
+    if targets.numel():
+        summary = point_metrics(targets, probabilities, occurrences)
+        report = _metrics(
+            targets,
+            probabilities,
+            fine_to_coarse=fine_to_coarse,
+            level_parents=contract["derived"].get("level_parents"),
+            level_names=contract["derived"].get("level_names"),
+            loss_sum=summary["loss"] * len(targets),
+        )
+        report.update(summary)
+    else:
+        report = {"labeled_pixels": 0, "loss": None, "fine": None}
+    if level_predictions:
+        names = contract["derived"].get("level_names", ["coarse", "fine"])
+        report["levels"] = {
+            names[level]: {
+                **_classification_metrics(values[0], values[1], values[1].shape[1]),
+                "labeled_pixels": len(values[0]),
+            }
+            for level, values in level_predictions.items()
+        }
+    report["class_coverage"] = manifest.class_coverage
     report["metric_protocol"] = "owned_unique_points_mean_probability_v1"
     report["partial_evaluation"] = args.max_windows is not None
     report["point_predictions"] = [

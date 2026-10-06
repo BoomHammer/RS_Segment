@@ -235,7 +235,6 @@ class MaestroS(nn.Module):
         mapping = self.derived["fine_to_coarse"]
         if len(mapping) != int(self.derived["num_classes"]):
             raise ValueError("fine_to_coarse 长度与类别数不一致")
-        self.heads = HierarchicalHeads(dim, max(mapping) + 1, mapping)
 
         # Dense patch unprojection, as in the paper's PixelifyHead. Compute
         # hierarchical probabilities AFTER unpatchifying coarse/fine logits.
@@ -245,10 +244,7 @@ class MaestroS(nn.Module):
                 nn.PixelShuffle(self.patch_size),
             )
 
-        self.heads.coarse = pixel_head(max(mapping) + 1)
-        self.heads.experts = nn.ModuleList(
-            pixel_head(mapping.count(parent)) for parent in range(max(mapping) + 1)
-        )
+        self.heads = HierarchicalHeads.from_derived(dim, self.derived, pixel_head)
 
     def spatial_encoding(self, height: int, width: int, device: torch.device) -> Tensor:
         # Existing rasters already share a target grid/GSD; there is no native

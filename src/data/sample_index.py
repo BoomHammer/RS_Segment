@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,6 +32,7 @@ from .value_ranges import (
 )
 
 INDEX_SCHEMA_VERSION = 2
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,7 +296,11 @@ def _validate_statistics_value_ranges(
         category = str(group["category"])
         expected = value_range_for(category, ranges)
         recorded = group.get("value_range")
-        if expected is None or recorded is None:
+        if expected is None:
+            if recorded is not None:
+                raise ValueError(f"栅格统计量有效值规则已变化: {category}")
+            continue
+        if recorded is None:
             raise ValueError(f"栅格统计量缺少有效值规则: {category}")
         actual = ValueRange(
             float(recorded["minimum"]),
@@ -391,6 +397,8 @@ class WindowedSampleDataset(GeoDataset):
         self.nodata = float(nodata)
         self._label_columns = label_columns or {}
         self._ground_truth: dict[tuple[int, int], int] = {}
+        self._ground_truth_levels: dict[tuple[int, int], tuple[int, ...]] = {}
+        self._label_depth = len((label_mapping or {}).get("levels", [])) or 2
         self._load_ground_truth(label_mapping)
         self._configure_stage2(stage2_config)
         rows = range(self.grid_offset[1], self.grid.height, self.stride[1])
@@ -502,7 +510,10 @@ class WindowedSampleDataset(GeoDataset):
                 }
             )
             if missing_ranges:
-                raise ValueError(f"输入特征缺少有效值范围: {missing_ranges}")
+                LOGGER.warning(
+                    "以下输入特征没有有效值范围，将按原始值计算（Scale=1）: %s",
+                    ", ".join(missing_ranges),
+                )
         if normalization.get("require_statistics", False):
             keys = [_feature_name(asset) for asset in dynamic_assets]
             keys.extend(asset.name for asset in static_assets)
@@ -518,6 +529,7 @@ class WindowedSampleDataset(GeoDataset):
             mapping = build_label_mapping(
                 source["path"], label_columns=self._label_columns
             )
+        self._label_depth = len(mapping.get("levels", [])) or 2
         records: list[LabelRecord] = [
             record
             for batch in iter_encoded_labels(
@@ -530,10 +542,26 @@ class WindowedSampleDataset(GeoDataset):
             point_crs=source.get("crs", "EPSG:4326"),
             grid=self.grid,
         )
+        for item, record in zip(locations, records, strict=True):
+            if not item["inside"]:
+                continue
+            pixel = (item["row"], item["column"])
+            codes = record.level_codes or (record.formation_code, record.alliance_code)
+            previous = self._ground_truth_levels.get(pixel)
+            if previous is not None:
+                # A less detailed observation must not erase an existing leaf.
+                if all(
+                    a == b or a < 1 or b < 1
+                    for a, b in zip(previous, codes, strict=True)
+                ):
+                    codes = tuple(
+                        max(a, b) for a, b in zip(previous, codes, strict=True)
+                    )
+            self._ground_truth_levels[pixel] = codes
         self._ground_truth = {
-            (item["row"], item["column"]): record.alliance_code
-            for item, record in zip(locations, records, strict=True)
-            if item["inside"]
+            pixel: codes[-1]
+            for pixel, codes in self._ground_truth_levels.items()
+            if codes[-1] > 0
         }
 
     def configure_supervision_split(
@@ -736,8 +764,14 @@ class WindowedSampleDataset(GeoDataset):
             if self._mask_weak_labels_by_split:
                 weak = np.where(supervision_split_mask, weak, -1)
         ground_truth = np.full(shape, -1, dtype=np.int64)
+        ground_truth_levels = np.full((self._label_depth, *shape), -1, dtype=np.int64)
         row_start, col_start = int(window.row_off), int(window.col_off)
-        for (row, column), code in self._ground_truth.items():
+        observations = {
+            pixel: (-1,) * (self._label_depth - 1) + (code,)
+            for pixel, code in self._ground_truth.items()
+        }
+        observations.update(self._ground_truth_levels)
+        for (row, column), codes in observations.items():
             if (
                 selected_ground_truth is not None
                 and (row, column) != selected_ground_truth
@@ -750,7 +784,8 @@ class WindowedSampleDataset(GeoDataset):
                 continue
             local_row, local_column = row - row_start, column - col_start
             if 0 <= local_row < shape[0] and 0 <= local_column < shape[1]:
-                ground_truth[local_row, local_column] = code
+                ground_truth[local_row, local_column] = codes[-1]
+                ground_truth_levels[:, local_row, local_column] = codes
         boundary_clipped = (
             int(window.width) != self.window_size[0]
             or int(window.height) != self.window_size[1]
@@ -773,6 +808,7 @@ class WindowedSampleDataset(GeoDataset):
             "supervision_split_mask": torch.from_numpy(supervision_split_mask),
             "ground_truth": torch.from_numpy(ground_truth),
             "ground_truth_mask": torch.from_numpy(ground_truth >= 0),
+            "ground_truth_levels": torch.from_numpy(ground_truth_levels),
             "weak_label": torch.from_numpy(weak),
             "weak_label_mask": torch.from_numpy(weak >= 0),
             "crs": self.grid.crs,
@@ -803,6 +839,17 @@ class WindowedSampleDataset(GeoDataset):
         """Return target-grid point labels used to build split statistics."""
 
         return dict(self._ground_truth)
+
+    @property
+    def supervision_pixels(self) -> dict[tuple[int, int], int]:
+        """Sampling identities; negative keys identify partial classes, not labels."""
+        result = dict(self._ground_truth)
+        for pixel, codes in self._ground_truth_levels.items():
+            if codes[-1] > 0:
+                continue
+            depth = sum(code > 0 for code in codes)
+            result[pixel] = -((depth << 32) + codes[depth - 1])
+        return result
 
     def query_windows_for_pixel(self, row: int, column: int) -> list[int]:
         """Return window positions covering one target-grid pixel."""
@@ -874,6 +921,15 @@ def sample_collate_fn(
         "ground_truth": torch.stack([sample["ground_truth"] for sample in samples]),
         "ground_truth_mask": torch.stack(
             [sample["ground_truth_mask"] for sample in samples]
+        ),
+        **(
+            {
+                "ground_truth_levels": torch.stack(
+                    [sample["ground_truth_levels"] for sample in samples]
+                )
+            }
+            if all("ground_truth_levels" in sample for sample in samples)
+            else {}
         ),
         "weak_label": torch.stack([sample["weak_label"] for sample in samples]),
         "weak_label_mask": torch.stack(

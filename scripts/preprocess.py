@@ -42,23 +42,36 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--skip-weak-labels", action="store_true")
     parser.add_argument(
+        "--resume",
+        type=Path,
+        metavar="RUN_DIR",
+        help="从运行目录中的弱标签断点继续",
+    )
+    parser.add_argument(
         "--skip-statistics",
         action="store_true",
         help="跳过与 SAM 推理无关的全量栅格统计扫描",
     )
     args = parser.parse_args(argv)
+    if args.resume is not None and args.skip_weak_labels:
+        parser.error("--resume 不能与 --skip-weak-labels 同时使用")
     config = load_config(args.config)
     with Path("configs/weak_label.yaml").open(encoding="utf-8") as stream:
         weak_config = dict((yaml.safe_load(stream) or {}).get("weak_label", {}))
-    if args.skip_statistics:
-        print("已跳过全量栅格统计量计算。")
-    run_dir = run_preprocessing(
-        config,
-        band=args.band,
-        window_size=tuple(args.window_size or [1024, 1024]),
-        nodata=args.nodata,
-        skip_statistics=args.skip_statistics,
-    )
+    if args.resume is None:
+        if args.skip_statistics:
+            print("已跳过全量栅格统计量计算。")
+        run_dir = run_preprocessing(
+            config,
+            band=args.band,
+            window_size=tuple(args.window_size or [1024, 1024]),
+            nodata=args.nodata,
+            skip_statistics=args.skip_statistics,
+        )
+    else:
+        run_dir = args.resume.resolve()
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"弱标签运行目录不存在: {run_dir}")
     if not args.skip_weak_labels:
         composite_names = (
             ["命令行影像"]
@@ -159,6 +172,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             keyframe_index=keyframe_index,
             composite_names=composite_names,
+            resume=args.resume is not None,
         )
     print(f"预处理产物: {run_dir}")
     return 0

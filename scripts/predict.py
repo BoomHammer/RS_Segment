@@ -106,6 +106,22 @@ def _gaussian_weights(height: int, width: int, sigma_scale: float) -> np.ndarray
 
 
 def _write_mapping(mapping: dict[str, Any], path: Path) -> None:
+    if "levels" in mapping:
+        names = [level["name"] for level in mapping["levels"]]
+        with path.open("w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(["数字", *names, *[f"{name}中文" for name in names]])
+            for item in sorted(
+                mapping["classes"], key=lambda item: item["alliance_code"]
+            ):
+                writer.writerow(
+                    [
+                        item["alliance_code"],
+                        *item["level_names"],
+                        *item["level_names_zh"],
+                    ]
+                )
+        return
     fields = ["数字", "大类", "小类", "大类中文", "小类中文"]
     classes = sorted(
         mapping.get("classes", []), key=lambda item: int(item["alliance_code"])
@@ -198,6 +214,9 @@ def predict(
     contract = payload.get("contract") if isinstance(payload, dict) else None
     if contract is None:
         raise ValueError("checkpoint 缺少训练时保存的模型 contract")
+    from models.config import validate_checkpoint_mapping
+
+    validate_checkpoint_mapping(contract["derived"], mapping)
     model = SegFormerUtae.from_contract(contract)
     model.load_state_dict(payload["model"])
     selected_device = torch.device(

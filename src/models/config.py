@@ -30,6 +30,30 @@ def _feature_name(asset: dict[str, Any]) -> str:
     return f"{name}_B{band}" if band is not None else name
 
 
+def validate_checkpoint_mapping(
+    derived: dict[str, Any], mapping: dict[str, Any]
+) -> None:
+    """Prevent a replaced hierarchy from silently changing checkpoint legends."""
+    if "levels" not in mapping and "level_counts" not in derived:
+        return  # Preserve legacy checkpoints and their original artifact contract.
+    from data.labels import validate_label_mapping
+
+    validate_label_mapping(mapping)
+    classes = sorted(mapping["classes"], key=lambda item: item["alliance_code"])
+    expected = {
+        "level_counts": mapping.get("level_counts"),
+        "level_parents": mapping.get("level_parents"),
+        "class_paths": [item.get("level_names") for item in classes],
+        "num_classes": len(classes),
+        "fine_to_coarse": [item["formation_code"] - 1 for item in classes],
+    }
+    for key, value in expected.items():
+        if derived.get(key) != value:
+            raise ValueError(
+                f"checkpoint 与标签映射的 {key} 不一致，请使用训练时的映射"
+            )
+
+
 def derive_model_contract(
     sample_index: str | Path, label_mapping: str | Path
 ) -> dict[str, Any]:
@@ -37,6 +61,19 @@ def derive_model_contract(
 
     index = _read_json(sample_index)
     mapping = _read_json(label_mapping)
+    hierarchy = {}
+    if "levels" in mapping:
+        from data.labels import validate_label_mapping
+
+        validate_label_mapping(mapping)
+        hierarchy = {key: mapping[key] for key in ("level_counts", "level_parents")}
+        hierarchy["level_names"] = [level["name"] for level in mapping["levels"]]
+        hierarchy["class_paths"] = [
+            item["level_names"]
+            for item in sorted(
+                mapping["classes"], key=lambda item: item["alliance_code"]
+            )
+        ]
     assets = index.get("assets", [])
     dynamic_features = sorted(
         {_feature_name(asset) for asset in assets if asset.get("role") == "dynamic"}
@@ -60,6 +97,7 @@ def derive_model_contract(
     if len(fine_to_coarse) != num_classes:
         raise ValueError("标签映射的小类数量与 minor_count 不一致")
     return {
+        **hierarchy,
         "dynamic_features": dynamic_features,
         "static_features": static_features,
         "dynamic_features_count": len(dynamic_features),

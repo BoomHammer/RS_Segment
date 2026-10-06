@@ -10,7 +10,7 @@ data:
   static: ../data/raw/static
   processed: ../data/processed
   # 原始样点 CSV，包含坐标和中英文分类字段。
-  label_file: ../data/labels/traindata20250626ori.csv
+  label_file: ../data/labels/YRBmerge20261003.csv
   # 输出 GeoTIFF 中表示未标注像元的值。
   output_nodata: -9999
   # 数据检查阶段必须存在的目录，相对 data.root 目录。
@@ -21,21 +21,38 @@ data:
     - raw/static
     - processed
 
-  # 标签字段、坐标及分类编码契约。内部统一使用英文类别；中文仅写入输出映射。
+  # 标签字段、坐标及分类编码契约。支持中文或英文类别名称。
   # 样点 CSV 中 X/Y 坐标使用的坐标参考系。
-  label_crs: EPSG:4326
+  label_crs: EPSG:4490
   label_schema:
     # 标签契约版本，便于后续变更字段时兼容旧数据。
-    version: 1
+    version: 2
+    # 当前 CSV 为 GBK 兼容编码；UTF-8 文件可设为 utf-8-sig。
+    encoding: UTF-8
+    # partial：只监督已知层级；只允许末尾为空，禁止跨级缺失，不推测未知子类。
+    # error：缺失即报错；skip：跳过。所有父类必须有至少一条已知完整类别路径。
+    missing_policy: partial
     # 内部字段名到 CSV 列名的映射。
     columns:
-      index: Index
+      index: 编号
       x: X
       y: Y
-      formation: Eng_Formation
-      alliance: Eng_Alliance
-      chn_formation: Formation
-      chn_alliance: Alliance
+    # 从粗到细列出 1～3 层；列表长度决定层数，最后一层为最终输出类别。
+    # 一层示例：只保留一级类；两层示例：保留一级类和二级类。
+    # 也可只用三级类做单层分类：仅保留下方三级类条目。
+    # name 为图例/评估中的层名，column 为 CSV 列名，zh_column 可选。
+    # 类别按完整父子路径编码，同名但不同父类的类别会分配不同 ID。
+    # 修改层级后必须重新生成标签映射、弱标签和数据集，并重新训练。
+    levels:
+      - name: 一级类
+        column: First_Cata
+        zh_column: 一级类
+      - name: 二级类
+        column: Second_Cata
+        zh_column: 二级类
+      - name: 三级类
+        column: Third_Cata
+        zh_column: 三级类
     # 自动编码类别时使用的起始整数编号。
     first_id: 1
 
@@ -122,6 +139,9 @@ data:
       # 修改后必须重新生成 spatial_split.json；已有划分文件不会随配置自动改变。
       block_size: [256, 256]
       ratios: [0.6, 0.2, 0.2]
+      # Rare classes stay in training if there are too few points or spatial blocks.
+      # Ratios are soft targets; see class_coverage in spatial_split.json.
+      min_class_points_per_split: 2
       seed: 42
     benchmark:
       enabled: true

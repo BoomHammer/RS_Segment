@@ -191,7 +191,7 @@ class AnySatSegmentation(nn.Module):
         mapping = self.derived["fine_to_coarse"]
         if len(mapping) != self.derived["num_classes"]:
             raise ValueError("AnySat fine_to_coarse differs from num_classes")
-        self.heads = HierarchicalHeads(channels, max(mapping) + 1, mapping)
+        self.heads = HierarchicalHeads.from_derived(channels, self.derived)
 
     def initialize_pretrained(self) -> dict[str, Any] | None:
         """Explicit initialization only; checkpoint restoration never downloads."""

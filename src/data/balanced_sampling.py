@@ -30,7 +30,9 @@ class ClassBalancedPointSampler(Sampler[tuple[int, tuple[int, int]]]):
         self.epoch = 0
         index_set = set(indices)
         self.points = {}
-        for pixel, code in dataset.ground_truth_pixels.items():
+        for pixel, code in getattr(
+            dataset, "supervision_pixels", dataset.ground_truth_pixels
+        ).items():
             if point_owner(*pixel, manifest) != "train":
                 continue
             candidates = sorted(

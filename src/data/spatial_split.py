@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import random
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +27,7 @@ class SpatialSplitManifest:
     class_counts: dict[str, dict[str, int]]
     class_weights: dict[str, float]
     sampling_weights: dict[str, float]
+    class_coverage: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -55,6 +56,7 @@ class SpatialSplitManifest:
             class_weights={
                 key: float(value) for key, value in payload["class_weights"].items()
             },
+            class_coverage=dict(payload.get("class_coverage", {})),
             sampling_weights={
                 key: float(value) for key, value in payload["sampling_weights"].items()
             },
@@ -86,6 +88,7 @@ def _stratified_block_assignment(
     block_classes: dict[tuple[int, int], Counter[str]],
     ratios: tuple[float, float, float],
     seed: int,
+    min_class_points_per_split: int = 2,
 ) -> dict[tuple[int, int], str]:
     """Optimize labelled-point ratios while keeping every block indivisible."""
 
@@ -94,8 +97,15 @@ def _stratified_block_assignment(
     labelled = [block for block in grouped if block_classes[block]]
     unlabelled = [block for block in grouped if not block_classes[block]]
     labelled_sizes = _split_sizes(len(labelled), ratios)
-    if any(labelled_sizes[index] > total_sizes[index] for index in range(3)):
-        raise ValueError("有标签空间块配额超过对应划分的总空间块容量")
+    labelled_sizes = [
+        min(size, capacity)
+        for size, capacity in zip(labelled_sizes, total_sizes, strict=True)
+    ]
+    for index in range(3):
+        remaining = len(labelled) - sum(labelled_sizes)
+        labelled_sizes[index] += min(
+            remaining, total_sizes[index] - labelled_sizes[index]
+        )
     if not labelled:
         shuffled = list(unlabelled)
         random.Random(seed).shuffle(shuffled)
@@ -181,32 +191,26 @@ def _stratified_block_assignment(
         for block in unlabelled[start : start + remaining]:
             assigned[block] = name
         start += remaining
-    counts = {
-        name: Counter(
-            {code: int(counts_array[index, code_index[code]]) for code in codes}
+    # Ratios are targets, not a reason to strand a class outside training.
+    # Reserve whole blocks: no point duplication across held-out splits.
+    if ratios[0] > 0:
+        rare = (class_presence < active_splits) | (
+            class_totals < active_splits * min_class_points_per_split
         )
-        for index, name in enumerate(names)
-    }
-
-    missing = {
-        name: {
-            code
-            for code in codes
-            if class_presence[code_index[code]] >= active_splits
-            and counts[name][code] == 0
-        }
-        for name in names
-        if ratios[names.index(name)] > 0
-    }
-    if any(missing.values()):
-        details = ", ".join(
-            f"{name}: {sorted(values)}" for name, values in missing.items() if values
+        for index, block in enumerate(labelled):
+            if np.any((matrix[index] > 0) & rare):
+                assigned[block] = "train"
+        covered = sum(
+            (block_classes[block] for block in grouped if assigned[block] == "train"),
+            Counter(),
         )
-        raise ValueError(
-            "按空间块进行类别分层后仍有类别缺失；请减小 block_size "
-            "或提供更多跨空间块的实测样点。"
-            f" 缺失={details}"
-        )
+        missing = set(codes) - set(covered)
+        while missing:
+            block = max(
+                labelled, key=lambda item: len(missing & set(block_classes[item]))
+            )
+            assigned[block] = "train"
+            missing -= set(block_classes[block])
     return assigned
 
 
@@ -217,6 +221,7 @@ def build_spatial_split(
     ratios: tuple[float, float, float] = (0.8, 0.1, 0.1),
     seed: int = 42,
     output: str | Path | None = None,
+    min_class_points_per_split: int = 2,
 ) -> SpatialSplitManifest:
     """Assign whole spatial blocks to train/validation/test splits.
 
@@ -230,6 +235,8 @@ def build_spatial_split(
         raise ValueError("block_size 必须是两个正整数")
     if len(ratios) != 3 or min(ratios) < 0 or sum(ratios) <= 0:
         raise ValueError("ratios 必须是三个非负数且总和大于 0")
+    if min_class_points_per_split < 1:
+        raise ValueError("min_class_points_per_split must be positive")
     normalized = tuple(value / sum(ratios) for value in ratios)
     grouped: dict[tuple[int, int], list[int]] = defaultdict(list)
     for window_id, row in enumerate(dataset.index.itertuples(index=False)):
@@ -240,11 +247,13 @@ def build_spatial_split(
     block_classes: dict[tuple[int, int], Counter[str]] = {
         block: Counter() for block in grouped
     }
-    for (row, column), code in dataset.ground_truth_pixels.items():
+    for (row, column), code in getattr(
+        dataset, "supervision_pixels", dataset.ground_truth_pixels
+    ).items():
         block = (int(row) // block_size[1], int(column) // block_size[0])
         block_classes[block][str(code)] += 1
     split_blocks = _stratified_block_assignment(
-        grouped, block_classes, normalized, seed
+        grouped, block_classes, normalized, seed, min_class_points_per_split
     )
     splits = {
         name: sorted(
@@ -258,7 +267,9 @@ def build_spatial_split(
 
     counts_by_split: dict[str, Counter[str]] = {name: Counter() for name in names}
     window_classes: dict[int, Counter[str]] = defaultdict(Counter)
-    for (row, column), code in dataset.ground_truth_pixels.items():
+    for (row, column), code in getattr(
+        dataset, "supervision_pixels", dataset.ground_truth_pixels
+    ).items():
         owner = split_blocks[(int(row) // block_size[1], int(column) // block_size[0])]
         counts_by_split[owner][str(code)] += 1
         window_ids = dataset.query_windows_for_pixel(row, column)
@@ -278,6 +289,26 @@ def build_spatial_split(
         sampling_weights[str(window_id)] = max(
             (class_weights[code] for code in labels), default=1.0
         )
+    all_codes = sorted({code for counts in block_classes.values() for code in counts})
+    coverage = {}
+    active = [name for name, ratio in zip(names, normalized, strict=True) if ratio > 0]
+    for code in all_codes:
+        per_split = {name: counts_by_split[name][code] for name in names}
+        support_blocks = sum(counts[code] > 0 for counts in block_classes.values())
+        coverage[code] = {
+            "points": sum(per_split.values()),
+            "spatial_blocks": support_blocks,
+            "split_counts": per_split,
+            "rare_train_only": normalized[0] > 0
+            and (
+                support_blocks < len(active)
+                or sum(per_split.values()) < len(active) * min_class_points_per_split
+            ),
+            "insufficient_splits": [
+                name for name in active if per_split[name] < min_class_points_per_split
+            ],
+            "min_points_per_split": min_class_points_per_split,
+        }
     manifest = SpatialSplitManifest(
         schema_version=1,
         seed=seed,
@@ -293,6 +324,7 @@ def build_spatial_split(
         },
         class_weights=dict(sorted(class_weights.items())),
         sampling_weights=sampling_weights,
+        class_coverage=coverage,
     )
     if output is not None:
         manifest.write(output)

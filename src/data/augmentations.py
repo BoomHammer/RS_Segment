@@ -16,6 +16,7 @@ SPATIAL_KEYS = (
     "static",
     "ground_truth",
     "ground_truth_mask",
+    "ground_truth_levels",
     "weak_label",
     "weak_label_mask",
     "dynamic_valid_mask",

@@ -12,12 +12,14 @@ from rasterio.transform import from_origin
 from data.raster_alignment import target_grid_from_raster
 from data.sample_index import (
     WindowedSampleDataset,
+    _validate_statistics_value_ranges,
     build_sample_index,
     load_sample_index,
     sample_collate_fn,
 )
 from data.sampling import SpatialWeightedSampler, build_dataloader
 from data.spatial_split import SpatialSplitManifest, build_spatial_split
+from data.value_ranges import ValueRange
 
 
 def _write_raster(path: Path, values: np.ndarray) -> None:
@@ -34,6 +36,50 @@ def _write_raster(path: Path, values: np.ndarray) -> None:
         nodata=-9999,
     ) as dataset:
         dataset.write(values, 1)
+
+
+def test_dataset_accepts_missing_product_range(tmp_path, caplog):
+    dynamic = tmp_path / "dynamic"
+    static = tmp_path / "static"
+    dynamic.mkdir()
+    static.mkdir()
+    path = dynamic / "NDVI230101.tif"
+    _write_raster(path, np.full((4, 4), 2, dtype=np.float32))
+    _write_raster(
+        static / "COPERNICUS_DEM_100M.tif", np.full((4, 4), 300, dtype=np.float32)
+    )
+    ranges = tmp_path / "ranges.csv"
+    ranges.write_text("Data,Min,Max,Scale\nNDVI,0,10,0.5\n", encoding="utf-8")
+    index = build_sample_index(
+        dynamic_dir=dynamic,
+        static_dir=static,
+        target_grid=target_grid_from_raster(path, target_crs="EPSG:4326", resolution=1),
+    )
+    payload = {
+        "schema_version": 4,
+        "groups": [
+            {
+                "category": "COPERNICUS_DEM_100M",
+                "value_range": None,
+                "statistics": {"mean": 100, "standard_deviation": 100},
+            }
+        ],
+    }
+    dataset = WindowedSampleDataset(
+        index,
+        window_size=(2, 2),
+        statistics=payload,
+        stage2={"value_range_file": str(ranges)},
+    )
+    torch.testing.assert_close(dataset[0]["static"], torch.full((1, 2, 2), 2.0))
+    assert "COPERNICUS_DEM_100M" in caplog.text
+    with pytest.raises(ValueError, match="缺少有效值规则"):
+        _validate_statistics_value_ranges(
+            payload, {"copernicus_dem_100m": ValueRange(0, 1000)}
+        )
+    payload["groups"][0]["value_range"] = {"minimum": 0, "maximum": 1000, "scale": 1}
+    with pytest.raises(ValueError, match="规则已变化"):
+        _validate_statistics_value_ranges(payload, {"ndvi": ValueRange(0, 10, 0.5)})
 
 
 def test_case_insensitive_statistics_and_legacy_snapshot_compatibility(tmp_path):

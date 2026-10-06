@@ -143,13 +143,13 @@ class BranchAblation(SegFormerUtae):
                 self.fusions, static_maps, dynamic_maps, strict=True
             )
         ]
-        # Identical head placement/interpolation to the lightweight control.
-        output = self.heads(self.decoder(fused))
-        for key in ("coarse_logits", "fine_logits"):
-            output[key] = F.interpolate(
-                output[key], size=(height, width), mode="bilinear", align_corners=False
+        output = self.heads(
+            F.interpolate(
+                self.decoder(fused),
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
             )
-        output["coarse_probability"] = output["coarse_logits"].softmax(dim=1)
-        output["fine_probability"] = output["fine_logits"].exp()
+        )
         output["valid_mask"] = clean["valid_mask"][:, None]
         return output

@@ -13,15 +13,15 @@ weak_label:
   # SAM 输入窗口大小，顺序为 [width, height]。
   input_window_size: [256, 256]
   # 高置信度标签向外扩张的半径（像元）。
-  label_radius: 8
+  label_radius: 2
   # 高置信度预测的最低置信度。
   mask_confidence: 0.90
   # 中等置信度预测的最低置信度。
   medium_confidence: 0.70
   # 中等置信度标签向外扩张的半径（像元）。
-  medium_label_radius: 4
+  medium_label_radius: 1
   # 无法使用置信度时的回退半径（像元）。
-  fallback_radius: 4
+  fallback_radius: 1
   # 光谱距离筛选阈值。
   spectral_distance_threshold: 0.12
   # mask logit 转为有效掩膜的阈值。

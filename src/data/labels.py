@@ -13,6 +13,16 @@ from typing import Any
 
 from pyproj import CRS, Transformer
 
+from data.label_hierarchy import (
+    build_hierarchy,
+    category_path,
+    known_prefix,
+    label_levels,
+    mapping_path,
+    prefix_codes,
+    validate_hierarchy,
+)
+
 
 @dataclass(slots=True, frozen=True)
 class LabelRecord:
@@ -27,6 +37,7 @@ class LabelRecord:
     minor_english: str
     formation_code: int
     alliance_code: int
+    level_codes: tuple[int, ...] = ()
 
 
 @dataclass(slots=True)
@@ -41,6 +52,9 @@ class ValidationReport:
     unknown_categories: int = 0
     errors: Counter[str] = field(default_factory=Counter)
     class_counts: Counter[str] = field(default_factory=Counter)
+    invalid_row_examples: list[dict[str, Any]] = field(default_factory=list)
+    missing_hierarchy_rows: list[int] = field(default_factory=list)
+    partial_rows: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +66,9 @@ class ValidationReport:
             "unknown_categories": self.unknown_categories,
             "errors": dict(self.errors),
             "class_counts": dict(self.class_counts),
+            "invalid_row_examples": self.invalid_row_examples,
+            "missing_hierarchy_rows": self.missing_hierarchy_rows,
+            "partial_rows": self.partial_rows,
         }
 
 
@@ -59,7 +76,7 @@ def _required(schema: Mapping[str, Any], key: str, default: str) -> str:
     return str(schema.get(key, default))
 
 
-def _field(columns: Mapping[str, str], key: str, default: str) -> str:
+def _field(columns: Mapping[str, Any], key: str, default: str) -> str:
     return str(columns.get(key, default))
 
 
@@ -73,7 +90,7 @@ def _read_float(value: str, name: str) -> float:
 def iter_label_rows(
     path: str | Path,
     *,
-    label_columns: Mapping[str, str],
+    label_columns: Mapping[str, Any],
     label_crs: str = "EPSG:4326",
     batch_size: int = 4096,
 ) -> Iterator[list[dict[str, str]]]:
@@ -85,12 +102,14 @@ def iter_label_rows(
     required = {
         _field(label_columns, "x", "X"),
         _field(label_columns, "y", "Y"),
-        _field(label_columns, "formation", "Eng_Formation"),
-        _field(label_columns, "alliance", "Eng_Alliance"),
-        _field(label_columns, "chn_formation", "Formation"),
-        _field(label_columns, "chn_alliance", "Alliance"),
     }
-    with Path(path).open(newline="", encoding="utf-8-sig") as stream:
+    for level in label_levels(label_columns):
+        required.add(level["column"])
+        if level.get("zh_column"):
+            required.add(level["zh_column"])
+    with Path(path).open(
+        newline="", encoding=label_columns.get("encoding", "utf-8-sig")
+    ) as stream:
         reader = csv.DictReader(stream)
         missing = required - set(reader.fieldnames or [])
         if missing:
@@ -108,12 +127,31 @@ def iter_label_rows(
 def build_label_mapping(
     path: str | Path,
     *,
-    label_columns: Mapping[str, str],
+    label_columns: Mapping[str, Any],
     schema: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a deterministic major/minor mapping from the CSV."""
+    """Build stable path-based IDs for the configured classification levels."""
 
     schema = schema or {}
+    if int(schema.get("first_id", 1)) != 1:
+        raise ValueError("训练标签 first_id 必须为 1")
+    if (
+        "levels" in schema
+        or "levels" in label_columns
+        or schema.get("missing_policy", label_columns.get("missing_policy"))
+        == "partial"
+    ):
+        label_columns = dict(label_columns)
+        if "levels" in schema:
+            label_columns["levels"] = schema["levels"]
+        if "encoding" in schema:
+            label_columns["encoding"] = schema["encoding"]
+        return build_hierarchy(
+            iter_label_rows(path, label_columns=label_columns),
+            label_levels(label_columns),
+            int(schema.get("version", 2)),
+            schema.get("missing_policy", label_columns.get("missing_policy", "error")),
+        )
     major_values: dict[str, tuple[str, str]] = {}
     pairs: dict[tuple[str, str], tuple[str, str]] = {}
     for batch in iter_label_rows(path, label_columns=label_columns):
@@ -161,8 +199,10 @@ def build_label_mapping(
 
 
 def validate_label_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate the persisted fine-to-coarse label mapping contract."""
+    """Validate the persisted hierarchy and its legacy root/leaf aliases."""
 
+    if "levels" in mapping:
+        return validate_hierarchy(mapping)
     classes = list(mapping.get("classes", []))
     required = {"formation_code", "alliance_code", "formation", "alliance"}
     errors: list[str] = []
@@ -216,7 +256,7 @@ def validate_label_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
 def validate_labels(
     path: str | Path,
     *,
-    label_columns: Mapping[str, str],
+    label_columns: Mapping[str, Any],
     label_crs: str = "EPSG:4326",
     mapping: Mapping[str, Any] | None = None,
     batch_size: int = 4096,
@@ -226,11 +266,16 @@ def validate_labels(
     report = ValidationReport()
     source_crs = CRS.from_user_input(label_crs)
     to_wgs84 = Transformer.from_crs(source_crs, CRS.from_epsg(4326), always_xy=True)
-    classes = {
-        (item["formation"], item["alliance"])
-        for item in (mapping or {}).get("classes", [])
-    }
-    seen: dict[tuple[float, float], tuple[str, str]] = {}
+    label_columns = dict(label_columns)
+    if mapping and "levels" in mapping:
+        label_columns["levels"] = mapping["levels"]
+    levels = label_levels(label_columns)
+    classes = {mapping_path(item) for item in (mapping or {}).get("classes", [])}
+    partial = (mapping or {}).get(
+        "missing_policy", label_columns.get("missing_policy")
+    ) == "partial"
+    prefixes = {path[:depth] for path in classes for depth in range(1, len(path) + 1)}
+    seen: dict[tuple[float, float], tuple[str, ...]] = {}
     for batch in iter_label_rows(
         path, label_columns=label_columns, batch_size=batch_size
     ):
@@ -242,65 +287,107 @@ def validate_labels(
                 lon, lat = to_wgs84.transform(x, y)
                 if not -180 <= lon <= 180 or not -90 <= lat <= 90:
                     raise ValueError("坐标超出 WGS84 范围")
-                major = row[_field(label_columns, "formation", "Eng_Formation")].strip()
-                minor = row[_field(label_columns, "alliance", "Eng_Alliance")].strip()
-                if not major or not minor:
-                    raise ValueError("类别为空")
-                if classes and (major, minor) not in classes:
+                names = category_path(row, levels)
+                if not all(names):
+                    if len(report.missing_hierarchy_rows) < 100:
+                        report.missing_hierarchy_rows.append(report.total_rows + 1)
+                    if not partial:
+                        raise ValueError("类别为空")
+                    names = known_prefix(names)
+                    report.partial_rows += 1
+                if classes and names not in prefixes:
                     report.unknown_categories += 1
                     raise ValueError("类别不在标签映射中")
                 key = (round(x, 9), round(y, 9))
                 previous = seen.get(key)
                 if previous is not None:
                     report.duplicate_points += 1
-                    if previous != (major, minor):
+                    if (
+                        previous[: min(len(previous), len(names))]
+                        != names[: min(len(previous), len(names))]
+                    ):
                         report.conflicting_duplicate_points += 1
                 else:
-                    seen[key] = (major, minor)
-                report.class_counts[f"{major}|{minor}"] += 1
+                    seen[key] = names
+                report.class_counts["|".join(names)] += 1
                 report.valid_rows += 1
             except (KeyError, TypeError, ValueError) as exc:
                 report.invalid_rows += 1
                 report.errors[str(exc)] += 1
+                if len(report.invalid_row_examples) < 100:
+                    report.invalid_row_examples.append(
+                        {
+                            "csv_line": report.total_rows + 1,
+                            "index": row.get(
+                                _field(label_columns, "index", "Index"), ""
+                            ),
+                            "x": row.get(_field(label_columns, "x", "X")),
+                            "y": row.get(_field(label_columns, "y", "Y")),
+                            "error": str(exc),
+                        }
+                    )
     return report
 
 
 def iter_encoded_labels(
     path: str | Path,
     *,
-    label_columns: Mapping[str, str],
+    label_columns: Mapping[str, Any],
     mapping: Mapping[str, Any],
     batch_size: int = 4096,
 ) -> Iterator[list[LabelRecord]]:
     """Yield bounded batches with categorical IDs suitable for training."""
 
-    lookup = {
-        (item["formation"], item["alliance"]): item
-        for item in mapping.get("classes", [])
-    }
+    label_columns = dict(label_columns)
+    if "levels" in mapping:
+        label_columns["levels"] = mapping["levels"]
+    levels = label_levels(label_columns)
+    lookup = {mapping_path(item): item for item in mapping.get("classes", [])}
+    prefixes = prefix_codes(mapping)
     for batch in iter_label_rows(
         path, label_columns=label_columns, batch_size=batch_size
     ):
         encoded: list[LabelRecord] = []
         for row in batch:
-            major = row[_field(label_columns, "formation", "Eng_Formation")].strip()
-            minor = row[_field(label_columns, "alliance", "Eng_Alliance")].strip()
-            item = lookup.get((major, minor))
-            if item is None:
-                raise ValueError(f"类别不在标签映射中: {major}|{minor}")
-            encoded.append(
-                LabelRecord(
-                    index=row.get(_field(label_columns, "index", "Index"), ""),
-                    x=_read_float(row[_field(label_columns, "x", "X")], "X"),
-                    y=_read_float(row[_field(label_columns, "y", "Y")], "Y"),
-                    major=major,
-                    minor=minor,
-                    major_english=major,
-                    minor_english=minor,
-                    formation_code=int(item["formation_code"]),
-                    alliance_code=int(item["alliance_code"]),
+            try:
+                names = category_path(row, levels)
+                if not all(names) and mapping.get("missing_policy", "error") == "skip":
+                    continue
+                major, minor = names[0], names[-1]
+                item = lookup.get(names)
+                if not all(names) and mapping.get("missing_policy") == "partial":
+                    prefix = known_prefix(names)
+                    if prefix not in prefixes:
+                        raise ValueError(f"部分标签不在类别体系中: {prefix}")
+                    codes = prefixes[prefix] + (-1,) * (len(levels) - len(prefix))
+                    item = {
+                        "formation_code": codes[0],
+                        "alliance_code": -1,
+                        "level_codes": codes,
+                    }
+                if item is None:
+                    raise ValueError(f"类别不在标签映射中: {major}|{minor}")
+                encoded.append(
+                    LabelRecord(
+                        index=row.get(_field(label_columns, "index", "Index"), ""),
+                        x=_read_float(row[_field(label_columns, "x", "X")], "X"),
+                        y=_read_float(row[_field(label_columns, "y", "Y")], "Y"),
+                        major=major,
+                        minor=minor,
+                        major_english=major,
+                        minor_english=minor,
+                        formation_code=int(item["formation_code"]),
+                        alliance_code=int(item["alliance_code"]),
+                        level_codes=tuple(
+                            item.get(
+                                "level_codes",
+                                (item["formation_code"], item["alliance_code"]),
+                            )
+                        ),
+                    )
                 )
-            )
+            except (KeyError, TypeError, ValueError):
+                continue
         yield encoded
 
 
@@ -308,7 +395,7 @@ def write_label_artifacts(
     path: str | Path,
     *,
     output_dir: str | Path,
-    label_columns: Mapping[str, str],
+    label_columns: Mapping[str, Any],
     label_crs: str = "EPSG:4326",
     schema: Mapping[str, Any] | None = None,
     output_nodata: int = -9999,
@@ -319,6 +406,10 @@ def write_label_artifacts(
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    label_columns = dict(label_columns)
+    for key in ("levels", "encoding", "missing_policy"):
+        if key in (schema or {}):
+            label_columns[key] = schema[key]
     mapping = build_label_mapping(path, label_columns=label_columns, schema=schema)
     mapping_validation = validate_label_mapping(mapping)
     report = validate_labels(
