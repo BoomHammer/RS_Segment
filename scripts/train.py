@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import hashlib
 import json
 import math
 import os
 import shutil
+import sys
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 
 import torch
+import torch.distributed as dist
 import yaml
+from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
 from config import load_config
@@ -32,7 +36,25 @@ from data.training_policy import (
     supervision_summary,
     training_class_weights,
 )
-from evaluation import evaluate_points as _evaluate
+from distributed_runtime import (
+    DistributedSamplerAdapter,
+    EpochRandomSampler,
+    auto_launch,
+    barrier,
+    broadcast_object,
+    finalize,
+    gather_objects,
+    initialize,
+    shard_sequence,
+)
+from evaluation import (
+    collect_point_predictions,
+    merge_point_prediction_shards,
+    point_metrics,
+)
+from evaluation import (
+    evaluate_points as _evaluate,
+)
 from losses.overlap import overlap_consistency_loss
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
@@ -87,6 +109,8 @@ def _initialize_weights(model, contract, path):
 
 def _atomic_save(payload: dict, path: Path) -> None:
     """Replace a checkpoint only after its complete contents reach disk."""
+    if int(os.environ.get("RANK", "0")) != 0:
+        return
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("wb") as stream:
         torch.save(payload, stream)
@@ -97,6 +121,9 @@ def _atomic_save(payload: dict, path: Path) -> None:
 
 def _append_metrics_csv(path: Path, row: dict[str, float | int]) -> None:
     """Append one validated epoch, without duplicating it after a resume."""
+
+    if int(os.environ.get("RANK", "0")) != 0:
+        return
 
     has_header = path.is_file() and path.stat().st_size > 0
     if has_header:
@@ -138,6 +165,37 @@ def _source_supervision_loss(
     if fine is None:
         return None
     return fine if coarse is None else fine + coarse
+
+
+def _distributed_evaluate(model, loader, device, amp_dtype, context):
+    """Evaluate disjoint window shards and restore global unique-point metrics."""
+
+    raw_predictions = {}
+    collect_point_predictions(
+        model,
+        loader,
+        device,
+        amp_dtype,
+        raw_predictions=raw_predictions,
+        show_progress=context.is_main,
+    )
+    gathered = gather_objects(raw_predictions, context)
+    report = None
+    if context.is_main:
+        (targets, probabilities, _, occurrences), levels = (
+            merge_point_prediction_shards(gathered)
+        )
+        selected_level = "leaf"
+        if not targets.numel():
+            selected_level = max(levels)
+            targets, probabilities, _, occurrences = levels[selected_level]
+        report = point_metrics(targets, probabilities, occurrences)
+        report["selection_level"] = selected_level
+        report["levels"] = {
+            str(level): point_metrics(values[0], values[1], values[3])
+            for level, values in levels.items()
+        }
+    return broadcast_object(report, context)
 
 
 def _restrict_manifest_to_region(
@@ -189,7 +247,7 @@ def _new_experiment_dir(root: Path) -> Path:
 class ModelEMA:
     """Exponential moving average of model parameters and buffers."""
 
-    def __init__(self, model: SegFormerUtae, decay: float) -> None:
+    def __init__(self, model: torch.nn.Module, decay: float) -> None:
         if not 0.0 < decay < 1.0:
             raise ValueError("ema.decay 必须位于 (0, 1)")
         self.decay = decay
@@ -197,7 +255,7 @@ class ModelEMA:
             name: value.detach().clone() for name, value in model.state_dict().items()
         }
 
-    def update(self, model: SegFormerUtae) -> None:
+    def update(self, model: torch.nn.Module) -> None:
         for name, value in model.state_dict().items():
             if value.is_floating_point():
                 self.shadow[name].mul_(self.decay).add_(
@@ -209,7 +267,7 @@ class ModelEMA:
     def state_dict(self) -> dict[str, torch.Tensor]:
         return {name: value.clone() for name, value in self.shadow.items()}
 
-    def copy_to(self, model: SegFormerUtae) -> None:
+    def copy_to(self, model: torch.nn.Module) -> None:
         model.load_state_dict(self.shadow)
 
 
@@ -230,6 +288,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--halo", type=int, nargs=2, default=None)
     parser.add_argument("--grid-offset", type=int, nargs=2, default=(0, 0))
     args = parser.parse_args(argv)
+    launch_result = auto_launch(
+        __file__, sys.argv[1:] if argv is None else argv, device=args.device
+    )
+    if launch_result is not None:
+        return launch_result
+    distributed = initialize(args.device)
+    atexit.register(finalize, distributed)
     if args.resume is not None and args.init_checkpoint is not None:
         parser.error("--resume and --init-checkpoint are mutually exclusive")
     run = args.run.resolve()
@@ -269,14 +334,17 @@ def main(argv: list[str] | None = None) -> int:
     if epochs < 1:
         raise ValueError("epochs 必须是正整数")
     experiment_started_at = datetime.now().isoformat()
-    output = (
-        args.output_dir.resolve()
-        if args.output_dir is not None
-        else _new_experiment_dir(Path("experiments"))
-    )
-    if resume is None and output.exists() and any(output.iterdir()):
-        raise FileExistsError(f"训练输出目录非空: {output}")
-    output.mkdir(parents=True, exist_ok=True)
+    output = None
+    if distributed.is_main:
+        output = (
+            args.output_dir.resolve()
+            if args.output_dir is not None
+            else _new_experiment_dir(Path("experiments"))
+        )
+        if resume is None and output.exists() and any(output.iterdir()):
+            raise FileExistsError(f"训练输出目录非空: {output}")
+        output.mkdir(parents=True, exist_ok=True)
+    output = Path(broadcast_object(str(output) if output else None, distributed))
     checkpoint_name = f"model_{output.name}.pt"
 
     data_config = load_config(args.data_config)
@@ -364,10 +432,11 @@ def main(argv: list[str] | None = None) -> int:
     supervision_audit = None
     if policy:
         supervision_audit = supervision_summary(dataset, manifest)
-        (output / "supervision_audit.json").write_text(
-            json.dumps(supervision_audit, indent=2), encoding="utf-8"
-        )
-        manifest.write(output / "spatial_split.json")
+        if distributed.is_main:
+            (output / "supervision_audit.json").write_text(
+                json.dumps(supervision_audit, indent=2), encoding="utf-8"
+            )
+            manifest.write(output / "spatial_split.json")
         if policy.get("require_validation_classes_in_train", False):
             counts = supervision_audit["unique_class_counts"]
             missing = {code for code in counts["validation"] if int(code) > 0} - set(
@@ -413,9 +482,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif resume is None and hasattr(model, "initialize_pretrained"):
         pretrained_initialization = model.initialize_pretrained()
-    device = torch.device(
-        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = distributed.device
     model.to(device)
     loader_config = dict(train_config.get("dataloader", {}))
     configured_batch_size = int(loader_config.get("batch_size", 1))
@@ -466,6 +533,13 @@ def main(argv: list[str] | None = None) -> int:
     else:
         train_sampler = None
         train_loader_indices = train_indices
+    if distributed.distributed:
+        if train_sampler is None:
+            train_sampler = EpochRandomSampler(
+                train_loader_indices, seed=int(training.get("seed", 42))
+            )
+            train_loader_indices = None
+        train_sampler = DistributedSamplerAdapter(train_sampler, distributed)
     loader = build_dataloader(
         dataset,
         indices=train_loader_indices,
@@ -480,7 +554,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     validation_loader = build_dataloader(
         validation_dataset,
-        indices=validation_indices,
+        indices=shard_sequence(validation_indices, distributed),
         batch_size=validation_batch_size,
         # Validation must not keep a second large worker/pinned-memory pool
         # alive throughout the following training epoch. Apply these defaults
@@ -500,7 +574,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("gradient_accumulation_steps 必须是正整数")
     if any(halo):
         accumulation_steps *= configured_batch_size
-        print(f"halo={halo}，单窗口训练，梯度累积={accumulation_steps}")
+        if distributed.is_main:
+            print(f"halo={halo}，单窗口训练，梯度累积={accumulation_steps}")
     parameters = model.parameters()
     if model_config.get("architecture") in {
         "segformer_utae_pretrained",
@@ -545,6 +620,13 @@ def main(argv: list[str] | None = None) -> int:
         weight_decay=float(optimizer_config.get("weight_decay", 0.0001)),
         betas=tuple(optimizer_config.get("betas", (0.9, 0.999))),
     )
+    raw_model = model
+    if distributed.distributed:
+        model = DistributedDataParallel(
+            raw_model,
+            device_ids=[distributed.local_rank],
+            output_device=distributed.local_rank,
+        )
     scheduler_config = dict(train_config.get("scheduler", {}))
     steps_per_epoch = math.ceil(len(loader) / accumulation_steps)
     total_steps = max(1, epochs * steps_per_epoch)
@@ -561,10 +643,11 @@ def main(argv: list[str] | None = None) -> int:
                 int(resume["optimizer_steps"]) + remaining_epochs * steps_per_epoch,
                 int(resume["optimizer_steps"]) + 1,
             )
-            print(
-                "每轮训练样本数已改变；学习率计划已按剩余全量训练步数续接，"
-                f"总优化步数调整为 {total_steps}"
-            )
+            if distributed.is_main:
+                print(
+                    "每轮训练样本数已改变；学习率计划已按剩余全量训练步数续接，"
+                    f"总优化步数调整为 {total_steps}"
+                )
 
     def learning_rate(step: int) -> float:
         if step < warmup_steps:
@@ -610,7 +693,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("gradient_clipping.max_norm 必须是正数")
     ema_config = dict(train_config.get("ema", {}))
     ema = (
-        ModelEMA(model, float(ema_config.get("decay", 0.99)))
+        ModelEMA(raw_model, float(ema_config.get("decay", 0.99)))
         if bool(ema_config.get("enabled", True))
         else None
     )
@@ -618,7 +701,8 @@ def main(argv: list[str] | None = None) -> int:
     amp_enabled = amp_dtype is not None
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
     amp_name = str(amp_dtype).removeprefix("torch.") if amp_enabled else "none"
-    print(f"计算精度: {amp_name}，梯度缩放: {scaler.is_enabled()}")
+    if distributed.is_main:
+        print(f"计算精度: {amp_name}，梯度缩放: {scaler.is_enabled()}")
     overlap = dict(train_config.get("overlap_consistency", {}))
     overlap_weight = float(overlap.get("weight", 0.0))
     overlap_interval = int(overlap.get("every_n_batches", 4))
@@ -646,7 +730,7 @@ def main(argv: list[str] | None = None) -> int:
         "metric_protocol": "owned_unique_points_mean_probability_v1",
         "checkpoint_monitor": monitor,
     }
-    if resume is None:
+    if resume is None and distributed.is_main:
         shutil.copy2(args.train_config, output / "train.yaml")
         shutil.copy2(args.config, output / "model.yaml")
         if model_config.get("architecture") == "anysat":
@@ -691,7 +775,7 @@ def main(argv: list[str] | None = None) -> int:
     if resume is not None:
         if resume["contract"] != model_config:
             raise ValueError("模型配置或标签映射与断点不一致")
-        model.load_state_dict(resume["model"])
+        raw_model.load_state_dict(resume["model"])
         optimizer.load_state_dict(resume["optimizer"])
         if scaler.is_enabled() and resume.get("grad_scaler"):
             scaler.load_state_dict(resume["grad_scaler"])
@@ -716,16 +800,18 @@ def main(argv: list[str] | None = None) -> int:
         train_transforms._generator.set_state(resume["augmentation_rng"])
         if train_sampler is not None:
             train_sampler.epoch = start_epoch
-        print(f"已恢复断点，完成 {start_epoch} 轮，目标共 {epochs} 轮")
+        if distributed.is_main:
+            print(f"已恢复断点，完成 {start_epoch} 轮，目标共 {epochs} 轮")
         del resume
     train_log["status"] = "running"
     train_log["precision"] = {
         "amp_dtype": amp_name,
         "gradient_scaling": scaler.is_enabled(),
     }
-    (output / "train_log.json").write_text(
-        json.dumps(train_log, indent=2), encoding="utf-8"
-    )
+    if distributed.is_main:
+        (output / "train_log.json").write_text(
+            json.dumps(train_log, indent=2), encoding="utf-8"
+        )
 
     def optimizer_step() -> None:
         nonlocal optimizer_steps
@@ -736,7 +822,7 @@ def main(argv: list[str] | None = None) -> int:
             scheduler.step()
             optimizer_steps += 1
             if ema is not None:
-                ema.update(model)
+                ema.update(raw_model)
         optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(start_epoch, epochs):
@@ -761,6 +847,7 @@ def main(argv: list[str] | None = None) -> int:
             desc=f"训练 Epoch {epoch + 1}/{epochs}",
             unit="batch",
             dynamic_ncols=True,
+            disable=not distributed.is_main,
         )
         batch_finished_at = perf_counter()
         for batch in progress:
@@ -909,28 +996,83 @@ def main(argv: list[str] | None = None) -> int:
             batch_finished_at = perf_counter()
         if batches % accumulation_steps:
             optimizer_step()
+        if distributed.distributed:
+            totals = torch.tensor(
+                [
+                    total,
+                    batches,
+                    correct_pixels,
+                    labeled_pixels,
+                    ground_truth_loss_sum,
+                    ground_truth_loss_batches,
+                    weak_label_loss_sum,
+                    weak_label_loss_batches,
+                    weak_label_correct_pixels,
+                    weak_label_pixels,
+                    overlap_loss_sum,
+                    overlap_batches,
+                ],
+                dtype=torch.float64,
+                device=device,
+            )
+            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+            (
+                total,
+                batches,
+                correct_pixels,
+                labeled_pixels,
+                ground_truth_loss_sum,
+                ground_truth_loss_batches,
+                weak_label_loss_sum,
+                weak_label_loss_batches,
+                weak_label_correct_pixels,
+                weak_label_pixels,
+                overlap_loss_sum,
+                overlap_batches,
+            ) = totals.tolist()
         epoch_loss = total / max(batches, 1)
         epoch_accuracy = correct_pixels / max(labeled_pixels, 1)
         ground_truth_loss = ground_truth_loss_sum / max(ground_truth_loss_batches, 1)
         weak_label_loss = weak_label_loss_sum / max(weak_label_loss_batches, 1)
         weak_label_accuracy = weak_label_correct_pixels / max(weak_label_pixels, 1)
-        current_state = {
-            name: value.detach().cpu().clone()
-            for name, value in model.state_dict().items()
-        }
+        current_state = (
+            {
+                name: value.detach().cpu().clone()
+                for name, value in raw_model.state_dict().items()
+            }
+            if distributed.is_main or (distributed.distributed and ema is not None)
+            else None
+        )
+        barrier(distributed)
         if ema is not None:
-            ema.copy_to(model)
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        validation = _evaluate(model, validation_loader, device, amp_dtype=amp_name)
+            ema.copy_to(raw_model)
+        if distributed.is_main:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        if distributed.distributed:
+            validation = _distributed_evaluate(
+                raw_model,
+                validation_loader,
+                device,
+                amp_name,
+                distributed,
+            )
+        else:
+            validation = _evaluate(
+                raw_model, validation_loader, device, amp_dtype=amp_name
+            )
         # Inference and training have different allocation patterns. Do not
         # carry unused validation allocations into the next training epoch.
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        (output / f"validation_epoch_{epoch + 1:03d}.json").write_text(
-            json.dumps(validation, indent=2), encoding="utf-8"
-        )
-        model.load_state_dict(current_state)
+        if distributed.is_main:
+            (output / f"validation_epoch_{epoch + 1:03d}.json").write_text(
+                json.dumps(validation, indent=2), encoding="utf-8"
+            )
+        if current_state is not None:
+            raw_model.load_state_dict(current_state)
+        if not distributed.is_main:
+            current_state = None
         epoch_metrics = {
             "epoch": epoch + 1,
             "loss": epoch_loss,
@@ -971,17 +1113,23 @@ def main(argv: list[str] | None = None) -> int:
                 "validation_ground_truth_macro_f1": float(validation["macro_f1"]),
             },
         )
-        selected_state = (
-            {name: value.detach().cpu().clone() for name, value in ema.shadow.items()}
-            if ema is not None
-            else current_state
-        )
+        selected_state = None
+        if distributed.is_main:
+            selected_state = (
+                {
+                    name: value.detach().cpu().clone()
+                    for name, value in ema.shadow.items()
+                }
+                if ema is not None
+                else current_state
+            )
         if float(validation["loss"]) < best_validation_loss:
             best_validation_loss = float(validation["loss"])
-            _atomic_save(
-                {"model": selected_state, "contract": model_config},
-                output / "best_loss.pt",
-            )
+            if distributed.is_main:
+                _atomic_save(
+                    {"model": selected_state, "contract": model_config},
+                    output / "best_loss.pt",
+                )
         value = float(epoch_metrics[monitor])
         improved = (
             value < best_monitor_value - min_delta
@@ -995,7 +1143,7 @@ def main(argv: list[str] | None = None) -> int:
             best_state = selected_state
         else:
             stale_epochs += 1
-        if float(validation["accuracy"]) > max(
+        if distributed.is_main and float(validation["accuracy"]) > max(
             (float(item["val_accuracy"]) for item in metrics[:-1]), default=-1.0
         ):
             accuracy_state = (
@@ -1008,13 +1156,18 @@ def main(argv: list[str] | None = None) -> int:
                 output / "best_accuracy.pt",
             )
         unique_accuracy = validation.get("unique_point_accuracy")
-        if unique_accuracy is not None and unique_accuracy > max(
-            (
-                item["val_unique_point_accuracy"]
-                for item in metrics[:-1]
-                if item.get("val_unique_point_accuracy") is not None
-            ),
-            default=-1.0,
+        if (
+            distributed.is_main
+            and unique_accuracy is not None
+            and unique_accuracy
+            > max(
+                (
+                    item["val_unique_point_accuracy"]
+                    for item in metrics[:-1]
+                    if item.get("val_unique_point_accuracy") is not None
+                ),
+                default=-1.0,
+            )
         ):
             unique_state = (
                 {name: value.detach().cpu() for name, value in ema.shadow.items()}
@@ -1033,65 +1186,71 @@ def main(argv: list[str] | None = None) -> int:
                 "optimizer_steps": optimizer_steps,
             }
         )
-        _atomic_save(
-            {
-                "resume_version": 1,
-                "source_run": str(run),
-                "window_options": {
-                    "window_size": window_size,
-                    "stride": window_stride,
-                    "grid_offset": tuple(args.grid_offset),
-                    "region_fraction": args.region_fraction,
+        if distributed.is_main:
+            _atomic_save(
+                {
+                    "resume_version": 1,
+                    "source_run": str(run),
+                    "window_options": {
+                        "window_size": window_size,
+                        "stride": window_stride,
+                        "grid_offset": tuple(args.grid_offset),
+                        "region_fraction": args.region_fraction,
+                    },
+                    "target_epochs": epochs,
+                    "next_epoch": epoch + 1,
+                    "model": current_state,
+                    "contract": model_config,
+                    "optimizer": optimizer.state_dict(),
+                    "grad_scaler": scaler.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "total_steps": total_steps,
+                    "warmup_steps": warmup_steps,
+                    "ema": {
+                        name: value.detach().cpu() for name, value in ema.shadow.items()
+                    }
+                    if ema is not None
+                    else None,
+                    "best_state": best_state,
+                    "best_epoch": best_epoch,
+                    "best_validation_loss": best_validation_loss,
+                    "best_monitor_value": best_monitor_value,
+                    "stale_epochs": stale_epochs,
+                    "optimizer_steps": optimizer_steps,
+                    "train_log": train_log,
+                    "rng": torch.get_rng_state(),
+                    "cuda_rng": torch.cuda.get_rng_state_all()
+                    if device.type == "cuda"
+                    else None,
+                    "loader_rng": loader.generator.get_state(),
+                    "validation_loader_rng": validation_loader.generator.get_state(),
+                    "augmentation_rng": train_transforms._generator.get_state(),
                 },
-                "target_epochs": epochs,
-                "next_epoch": epoch + 1,
-                "model": current_state,
-                "contract": model_config,
-                "optimizer": optimizer.state_dict(),
-                "grad_scaler": scaler.state_dict(),
-                "scheduler": scheduler.state_dict(),
-                "total_steps": total_steps,
-                "warmup_steps": warmup_steps,
-                "ema": {
-                    name: value.detach().cpu() for name, value in ema.shadow.items()
-                }
-                if ema is not None
-                else None,
-                "best_state": best_state,
-                "best_epoch": best_epoch,
-                "best_validation_loss": best_validation_loss,
-                "best_monitor_value": best_monitor_value,
-                "stale_epochs": stale_epochs,
-                "optimizer_steps": optimizer_steps,
-                "train_log": train_log,
-                "rng": torch.get_rng_state(),
-                "cuda_rng": torch.cuda.get_rng_state_all()
-                if device.type == "cuda"
-                else None,
-                "loader_rng": loader.generator.get_state(),
-                "validation_loader_rng": validation_loader.generator.get_state(),
-                "augmentation_rng": train_transforms._generator.get_state(),
-            },
-            output / "last.pt",
-        )
-        (output / "train_log.json").write_text(
-            json.dumps(train_log, indent=2), encoding="utf-8"
-        )
-        print(
-            f"epoch {epoch + 1}/{epochs}: loss={epoch_loss:.5f}, "
-            f"accuracy={epoch_accuracy:.4f}, "
-            f"val_loss={validation['loss']:.5f}, "
-            f"val_accuracy={validation['accuracy']:.4f} "
-            f"({correct_pixels}/{labeled_pixels})"
-        )
+                output / "last.pt",
+            )
+        if distributed.is_main:
+            (output / "train_log.json").write_text(
+                json.dumps(train_log, indent=2), encoding="utf-8"
+            )
+            print(
+                f"epoch {epoch + 1}/{epochs}: loss={epoch_loss:.5f}, "
+                f"accuracy={epoch_accuracy:.4f}, "
+                f"val_loss={validation['loss']:.5f}, "
+                f"val_accuracy={validation['accuracy']:.4f} "
+                f"({int(correct_pixels)}/{int(labeled_pixels)})"
+            )
         if early_stopping_enabled and stale_epochs >= patience:
-            print(f"early stopping: 连续 {patience} 轮验证集未改善")
+            if distributed.is_main:
+                print(f"early stopping: 连续 {patience} 轮验证集未改善")
             break
+    barrier(distributed)
+    if not distributed.is_main:
+        return 0
     if best_state is not None:
-        model.load_state_dict(best_state)
+        raw_model.load_state_dict(best_state)
     checkpoint = output / checkpoint_name
     cpu_state = {
-        name: value.detach().cpu() for name, value in model.state_dict().items()
+        name: value.detach().cpu() for name, value in raw_model.state_dict().items()
     }
     _atomic_save({"model": cpu_state, "contract": model_config}, checkpoint)
     train_log.update(

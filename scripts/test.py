@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,7 +19,18 @@ from data.sample_index import WindowedSampleDataset
 from data.sampling import build_dataloader
 from data.spatial_split import load_spatial_split
 from data.training_policy import point_windows
-from evaluation import collect_point_predictions, point_metrics
+from distributed_runtime import (
+    auto_launch,
+    finalize,
+    gather_objects,
+    initialize,
+    shard_sequence,
+)
+from evaluation import (
+    collect_point_predictions,
+    merge_point_prediction_shards,
+    point_metrics,
+)
 from models.architecture import SegFormerUtae
 
 
@@ -272,6 +285,13 @@ def main(argv: list[str] | None = None) -> int:
         help="指标 JSON 输出路径；默认写入 checkpoint 目录",
     )
     args = parser.parse_args(argv)
+    launch_result = auto_launch(
+        __file__, sys.argv[1:] if argv is None else argv, device=args.device
+    )
+    if launch_result is not None:
+        return launch_result
+    distributed = initialize(args.device)
+    atexit.register(finalize, distributed)
 
     checkpoint_path = args.checkpoint.resolve()
     experiment_dir = checkpoint_path.parent
@@ -346,15 +366,13 @@ def main(argv: list[str] | None = None) -> int:
     validate_checkpoint_mapping(contract["derived"], mapping)
     model = SegFormerUtae.from_contract(contract)
     model.load_state_dict(_select_checkpoint_state(payload, args.weights), strict=True)
-    device = torch.device(
-        args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    )
+    device = distributed.device
     model.to(device).eval()
     loader_config = dict(train_config.get("dataloader", {}))
     num_workers = int(loader_config.get("validation_num_workers", 2))
     loader = build_dataloader(
         dataset,
-        indices=indices,
+        indices=shard_sequence(indices, distributed),
         batch_size=int(loader_config.get("validation_batch_size", 1)),
         num_workers=num_workers,
         pin_memory=False,
@@ -375,13 +393,23 @@ def main(argv: list[str] | None = None) -> int:
         _reestimate_batch_norm(model, train_loader, device)
     fine_to_coarse = list(contract["derived"]["fine_to_coarse"])
     level_predictions = {}
+    raw_predictions = {}
     targets, probabilities, positions, occurrences = collect_point_predictions(
         model,
         loader,
         device,
         amp_dtype=str(train_config.get("training", {}).get("amp_dtype", "auto")),
         level_predictions=level_predictions,
+        raw_predictions=raw_predictions,
+        show_progress=distributed.is_main,
     )
+    gathered = gather_objects(raw_predictions, distributed)
+    if not distributed.is_main:
+        return 0
+    if distributed.distributed:
+        (targets, probabilities, positions, occurrences), level_predictions = (
+            merge_point_prediction_shards(gathered)
+        )
     if targets.numel():
         summary = point_metrics(targets, probabilities, occurrences)
         report = _metrics(

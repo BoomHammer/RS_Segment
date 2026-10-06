@@ -319,6 +319,7 @@ def generate_weak_labels(
     sample_outcomes_path: str | Path | None = None,
     resume: bool = False,
     checkpoint_path: str | Path | None = None,
+    score_output_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Generate sparse, point-local labels from high-confidence SAM regions."""
 
@@ -695,6 +696,8 @@ def generate_weak_labels(
         )
         partial_provenance = None
         provenance_destination = None
+        partial_score = None
+        score_destination = None
         if provenance_path is not None:
             provenance_output = Path(provenance_path)
             provenance_output.parent.mkdir(parents=True, exist_ok=True)
@@ -704,6 +707,19 @@ def generate_weak_labels(
             provenance_destination = stack.enter_context(
                 rasterio.open(partial_provenance, "w", **output_profile)
             )
+        if score_output_path is not None:
+            score_output = Path(score_output_path)
+            score_output.parent.mkdir(parents=True, exist_ok=True)
+            partial_score = score_output.with_name(f".{score_output.name}.partial")
+            score_profile = {
+                **output_profile,
+                "dtype": "float32",
+                "nodata": -1.0,
+                "predictor": 3,
+            }
+            score_destination = stack.enter_context(
+                rasterio.open(partial_score, "w", **score_profile)
+            )
         for _, window in destination.block_windows(1):
             rows, columns = window.toslices()
             destination.write(labels[rows, columns], 1, window=window)
@@ -711,10 +727,17 @@ def generate_weak_labels(
                 provenance_destination.write(
                     provenance[rows, columns], 1, window=window
                 )
+            if score_destination is not None:
+                score_values = np.where(
+                    np.isfinite(score[rows, columns]), score[rows, columns], -1.0
+                ).astype(np.float32)
+                score_destination.write(score_values, 1, window=window)
 
     partial_output.replace(output)
     if partial_provenance is not None:
         partial_provenance.replace(Path(provenance_path))
+    if partial_score is not None:
+        partial_score.replace(Path(score_output_path))
 
     if sample_outcomes_path is not None:
         Path(sample_outcomes_path).write_text(

@@ -12,6 +12,8 @@ def collect_point_predictions(
     device: torch.device,
     amp_dtype: str = "auto",
     level_predictions: dict | None = None,
+    raw_predictions: dict | None = None,
+    show_progress: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]], int]:
     """Aggregate probabilities by global position, then evaluate every point once."""
 
@@ -21,7 +23,13 @@ def collect_point_predictions(
     by_level = {}
     leaf_classes = 0
     with torch.inference_mode():
-        for batch in tqdm(loader, desc="验证", unit="batch", dynamic_ncols=True):
+        for batch in tqdm(
+            loader,
+            desc="验证",
+            unit="batch",
+            dynamic_ncols=True,
+            disable=not show_progress,
+        ):
             tensor_batch = {
                 key: value.to(device, non_blocking=True)
                 if isinstance(value, torch.Tensor)
@@ -73,6 +81,8 @@ def collect_point_predictions(
                 point_predictions, output["fine_logits"], target, mask, batch
             )
             del output, tensor_batch
+    if raw_predictions is not None:
+        raw_predictions.update({"leaf": point_predictions, "levels": by_level})
     if level_predictions is not None:
         level_predictions.update(
             {
@@ -82,7 +92,7 @@ def collect_point_predictions(
             }
         )
     if not point_predictions:
-        if level_predictions:
+        if level_predictions or raw_predictions is not None:
             return torch.empty(0, dtype=torch.long), torch.empty(0, leaf_classes), [], 0
         raise ValueError("No valid independent ground-truth points to evaluate")
     return _finish_points(point_predictions)
@@ -118,6 +128,35 @@ def _finish_points(points):
         list(points),
         sum(value[1] for value in points.values()),
     )
+
+
+def merge_point_prediction_shards(shards):
+    """Merge raw point accumulators produced by distributed evaluation ranks."""
+
+    leaf = {}
+    levels = {}
+    for shard in shards:
+        _merge_point_records(leaf, shard["leaf"])
+        for level, points in shard["levels"].items():
+            _merge_point_records(levels.setdefault(level, {}), points)
+    return _finish_points(leaf), {
+        level: _finish_points(points) for level, points in levels.items() if points
+    }
+
+
+def _merge_point_records(destination, source):
+    for key, (probability_sum, count, label) in source.items():
+        if key in destination:
+            previous, previous_count, previous_label = destination[key]
+            if label != previous_label:
+                raise ValueError("Conflicting labels at one evaluation pixel")
+            destination[key] = (
+                previous + probability_sum,
+                previous_count + count,
+                label,
+            )
+        else:
+            destination[key] = (probability_sum, count, label)
 
 
 def point_metrics(targets, probabilities, occurrences):

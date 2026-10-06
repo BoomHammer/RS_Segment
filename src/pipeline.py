@@ -130,8 +130,21 @@ def main(argv: list[str] | None = None) -> int:
             if processed.is_dir()
             else set()
         )
-        _run(root, "preprocess", ["--config", str(config)])
+        _run(
+            root,
+            "preprocess",
+            ["--config", str(config), "--skip-weak-labels"],
+        )
         run = _latest_run(processed, before)
+        weak_label_args = [
+            "--data-config",
+            str(config),
+            "--run-dir",
+            str(run),
+        ]
+        if args.device is not None:
+            weak_label_args.extend(["--device", args.device])
+        _run(root, "weak_label", weak_label_args)
         _run(
             root,
             "datasets",

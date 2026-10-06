@@ -82,8 +82,16 @@ vegetation_*.tif        # 全图预测结果
 需要单独控制各阶段时，按以下顺序执行：
 
 ```bash
-# 数据预处理、栅格统计和 PointSAM 弱标签
-uv run python scripts/preprocess.py --config configs/data.yaml
+# 数据预处理和栅格统计
+uv run python scripts/preprocess.py --config configs/data.yaml --skip-weak-labels
+
+# PointSAM 弱标签（已有多张 CUDA 卡时自动并行）
+uv run python scripts/weak_label.py --data-config configs/data.yaml \
+  --run-dir data/processed/<时间戳>
+
+# PointSAM 中断后，从同一预处理目录的断点继续
+uv run python scripts/weak_label.py --data-config configs/data.yaml \
+  --resume data/processed/<时间戳>
 
 # 使用上一步生成的目录建立样本索引和空间划分
 uv run python scripts/datasets.py data/processed/<时间戳>
@@ -107,6 +115,40 @@ uv run python scripts/predict.py \
 uv run python scripts/train.py data/processed/<时间戳> \
   --resume experiments/<训练实验时间戳>/last.pt
 ```
+
+PointSAM 会在输出目录中按样点保存临时进度；使用 `--resume` 后会跳过已经完成的样点，
+而不是重新生成全部伪标签。恢复时必须继续使用原来的预处理目录，并保持目标网格、输入
+影像、标签和弱标签配置不变，否则程序会拒绝加载不匹配的断点。多卡任务还应保持与中断
+前相同的可见 GPU 数量。生成成功后，临时断点会自动清理。
+
+如果中断的是包含弱标签生成的 `preprocess.py`，也可以直接恢复：
+
+```bash
+uv run python scripts/preprocess.py --config configs/data.yaml \
+  --resume data/processed/<时间戳>
+```
+
+#### 1.5 单卡与多卡
+
+`weak_label.py`、`train.py`、`test.py` 和 `predict.py` 会检查可见 CUDA
+设备。普通命令检测到多张卡时会自动以每卡一个进程启动；单卡和 CPU 环境保持原有
+行为。`rs-pipeline` 调用的也是这些入口，因此主流程同样自动适配多卡。
+
+```bash
+# 自动使用所有可见 GPU
+uv run python scripts/train.py data/processed/<时间戳>
+
+# 只开放两张指定 GPU
+CUDA_VISIBLE_DEVICES=0,1 uv run python scripts/train.py data/processed/<时间戳>
+
+# 强制单卡（显式设备会关闭自动多卡）
+uv run python scripts/train.py data/processed/<时间戳> --device cuda:0
+```
+
+也支持直接用 `torchrun` 启动。训练配置中的 `batch_size` 是每张卡的批量大小；
+全局有效批量为 `batch_size × GPU 数 × gradient_accumulation_steps`。测试按窗口
+分片并在全局像元坐标上去重；全图推理分别累加分数和高斯权重后流式归并，保持重叠
+融合和无缝输出；PointSAM 分片同时保存置信分数，再按冲突阈值合并。
 
 ### 2. 流程之外的重要命令
 

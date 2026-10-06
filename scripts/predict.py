@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import gc
 import json
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -15,11 +17,19 @@ import rasterio
 import torch
 import yaml
 from rasterio.windows import Window
-from torch.utils.data import DataLoader, SequentialSampler
+from torch.utils.data import DataLoader, SequentialSampler, Subset
 from tqdm import tqdm
 
 from config import load_config
 from data.sample_index import WindowedSampleDataset, sample_collate_fn
+from distributed_runtime import (
+    DistributedContext,
+    auto_launch,
+    barrier,
+    finalize,
+    gather_objects,
+    initialize,
+)
 from models.architecture import SegFormerUtae
 from precision import resolve_amp_dtype
 
@@ -166,6 +176,7 @@ def predict(
     output_predictor: int = 2,
     output_bigtiff: str = "IF_SAFER",
     write_row_block: int = 512,
+    distributed: DistributedContext | None = None,
 ) -> tuple[Path, Path]:
     """Predict the target grid while keeping raster/model tensors bounded."""
 
@@ -219,11 +230,8 @@ def predict(
     validate_checkpoint_mapping(contract["derived"], mapping)
     model = SegFormerUtae.from_contract(contract)
     model.load_state_dict(payload["model"])
-    selected_device = torch.device(
-        ("cuda" if torch.cuda.is_available() else "cpu")
-        if device in {None, "", "auto"}
-        else device
-    )
+    runtime = distributed or initialize(device)
+    selected_device = runtime.device
     model.to(selected_device).eval()
     resolved_dtype = resolve_amp_dtype(
         selected_device, amp_dtype if amp_enabled else "none"
@@ -286,10 +294,13 @@ def predict(
     # shapes after clipping. Keep them serial so the existing collator does
     # not pad spatial tensors and the 4090 memory budget stays predictable.
     effective_batch_size = 1 if any(halo) else batch_size
+    local_dataset = Subset(
+        dataset, range(runtime.rank, len(dataset), runtime.world_size)
+    )
     loader = DataLoader(
-        dataset,
+        local_dataset,
         batch_size=effective_batch_size,
-        sampler=SequentialSampler(dataset),
+        sampler=SequentialSampler(local_dataset),
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
@@ -300,7 +311,12 @@ def predict(
     denominator = result = valid = gaussian = probabilities = valid_masks = None
     try:
         with torch.inference_mode():
-            for batch in tqdm(loader, desc="全图预测", unit="batch"):
+            for batch in tqdm(
+                loader,
+                desc="全图预测",
+                unit="batch",
+                disable=not runtime.is_main,
+            ):
                 windows = batch["window"]
                 input_windows = batch["input_window"]
                 batch = {
@@ -345,6 +361,30 @@ def predict(
         weights.flush()
         if not np.isfinite(weights).all() or np.any(weights < 0):
             raise RuntimeError("滑窗融合权重出现非法值")
+        shards = gather_objects(
+            {"scores": str(temp_files[0]), "weights": str(temp_files[1])}, runtime
+        )
+        if not runtime.is_main:
+            barrier(runtime)
+            return output_path, mapping_path
+        score_shards = [
+            np.memmap(
+                shard["scores"],
+                mode="r",
+                dtype=np.float32,
+                shape=(classes, grid.height, grid.width),
+            )
+            for shard in shards
+        ]
+        weight_shards = [
+            np.memmap(
+                shard["weights"],
+                mode="r",
+                dtype=np.float32,
+                shape=(grid.height, grid.width),
+            )
+            for shard in shards
+        ]
         profile = {
             "driver": "GTiff",
             "width": grid.width,
@@ -361,7 +401,9 @@ def predict(
         with rasterio.open(output_path, "w", **profile) as destination:
             for row in range(0, grid.height, write_row_block):
                 end = min(row + write_row_block, grid.height)
-                denominator = weights[row:end]
+                denominator = np.zeros((end - row, grid.width), dtype=np.float32)
+                for shard_weights in weight_shards:
+                    denominator += shard_weights[row:end]
                 result = np.full(
                     (end - row, grid.width),
                     data_config.data.output_nodata,
@@ -369,9 +411,16 @@ def predict(
                 )
                 valid = denominator > 0
                 if valid.any():
-                    result[valid] = (
-                        scores[:, row:end].argmax(axis=0)[valid].astype(np.int32) + 1
-                    )
+                    best_class = np.zeros(result.shape, dtype=np.int32)
+                    best_score = np.full(result.shape, -np.inf, dtype=np.float32)
+                    for class_index in range(classes):
+                        class_score = np.zeros(result.shape, dtype=np.float32)
+                        for shard_scores in score_shards:
+                            class_score += shard_scores[class_index, row:end]
+                        better = class_score > best_score
+                        best_score[better] = class_score[better]
+                        best_class[better] = class_index + 1
+                    result[valid] = best_class[valid]
                 if override_ground_truth:
                     for pixel_row in range(row, end):
                         for column, code in ground_truth_by_row.get(
@@ -382,6 +431,9 @@ def predict(
                     result, 1, window=Window(0, row, grid.width, end - row)
                 )
         _write_mapping(mapping, mapping_path)
+        for shard in [*score_shards, *weight_shards]:
+            shard._mmap.close()
+        barrier(runtime)
     finally:
         # Windows keeps the backing file locked while any memmap view exists.
         # Clear the last row/output views before closing and deleting the files.
@@ -417,6 +469,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args(argv)
+    launch_result = auto_launch(
+        __file__, sys.argv[1:] if argv is None else argv, device=args.device
+    )
+    if launch_result is not None:
+        return launch_result
+    distributed = initialize(args.device)
+    atexit.register(finalize, distributed)
     with args.config.resolve().open(encoding="utf-8") as stream:
         predict_config = dict((yaml.safe_load(stream) or {}).get("predict", {}))
     loader_config = dict(predict_config.get("dataloader", {}))
@@ -467,9 +526,11 @@ def main(argv: list[str] | None = None) -> int:
         output_predictor=int(raster_config.get("predictor", 2)),
         output_bigtiff=str(raster_config.get("bigtiff", "IF_SAFER")),
         write_row_block=int(raster_config.get("write_row_block", 512)),
+        distributed=distributed,
     )
-    print(f"植被图: {output}")
-    print(f"类别对照表: {mapping}")
+    if distributed.is_main:
+        print(f"植被图: {output}")
+        print(f"类别对照表: {mapping}")
     return 0
 
 
