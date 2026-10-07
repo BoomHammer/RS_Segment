@@ -20,6 +20,8 @@ from shapely.geometry import Point, box
 from torchgeo.datasets import GeoDataset
 from torchgeo.datasets.utils import BoundingBox
 
+from performance import profile_collate, profile_sample, worker_stage
+
 from .filename_parser import RasterMetadata, scan_dynamic_directory
 from .labels import LabelRecord, build_label_mapping, iter_encoded_labels
 from .raster_alignment import TargetGrid, locate_points
@@ -33,6 +35,8 @@ from .value_ranges import (
 
 INDEX_SCHEMA_VERSION = 2
 LOGGER = logging.getLogger(__name__)
+_profiled_stack = worker_stage("stack_s")(np.stack)
+_profiled_full = worker_stage("missing_fill_s")(np.full)
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,6 +607,7 @@ class WindowedSampleDataset(GeoDataset):
                     ] = True
         return result
 
+    @profile_sample
     def __getitem__(
         self, index: int | tuple[int, tuple[int, int]] | BoundingBox
     ) -> dict[str, Any]:
@@ -633,8 +638,12 @@ class WindowedSampleDataset(GeoDataset):
         ] = True
         sample["core_mask"] = core_mask
         if self.transforms is not None:
-            sample = self.transforms(sample)
+            sample = self._transform_sample(sample)
         return sample
+
+    @worker_stage("transforms_s")
+    def _transform_sample(self, sample):
+        return self.transforms(sample)
 
     def _window_from_bounds(self, query: BoundingBox) -> Window:
         grid_left, grid_bottom, grid_right, grid_top = self.grid.bounds()
@@ -655,17 +664,20 @@ class WindowedSampleDataset(GeoDataset):
             min(height, self.grid.height - row),
         )
 
-    def _read_asset(self, asset: RasterAsset, window: Window) -> np.ndarray:
+    @worker_stage("raster_open_read_close_s")
+    def _read_raster(self, asset: RasterAsset, window: Window):
         with self._raster_pool.borrow(asset.path, asset.resampling) as dataset:
             # ``asset.band`` is the spectral identifier in filenames such as
             # SR230218B2.tif; each such file is itself a single-band GeoTIFF.
             band = asset.band if asset.count > 1 and asset.band else 1
             if band > dataset.count:
                 band = 1
-            values = dataset.read(band, window=window, masked=True)
-            result = np.asarray(
-                values.astype(np.float32).filled(np.nan), dtype=np.float32
-            )
+            return dataset.read(band, window=window, masked=True)
+
+    @worker_stage("read_asset_s")
+    def _read_asset(self, asset: RasterAsset, window: Window) -> np.ndarray:
+        values = self._read_raster(asset, window)
+        result = np.asarray(values.astype(np.float32).filled(np.nan), dtype=np.float32)
         invalid = ~np.isfinite(result)
         if asset.nodata is not None:
             invalid |= result == float(asset.nodata)
@@ -685,6 +697,7 @@ class WindowedSampleDataset(GeoDataset):
             return None
         return value_range_for(self._value_range_key(asset), self.value_ranges)
 
+    @worker_stage("normalize_s")
     def _normalized(self, values: np.ndarray, key: str) -> np.ndarray:
         statistics = self._statistics_for(key)
         if statistics is None:
@@ -697,6 +710,7 @@ class WindowedSampleDataset(GeoDataset):
             return self._casefold_statistics.get(key.casefold())
         return self.statistics.get(key)
 
+    @worker_stage("read_window_s")
     def _read_window(
         self, window: Window, selected_ground_truth: tuple[int, int] | None = None
     ) -> dict[str, Any]:
@@ -718,7 +732,7 @@ class WindowedSampleDataset(GeoDataset):
                 asset = asset_lookup.get((timestamp, feature))
                 if asset is None:
                     time_values.append(
-                        np.full(
+                        _profiled_full(
                             (int(window.height), int(window.width)),
                             np.nan,
                             dtype=np.float32,
@@ -732,9 +746,9 @@ class WindowedSampleDataset(GeoDataset):
                     )
                     dynamic_mask[time_index, feature_index] = True
             dynamic_values.append(time_values)
-        dynamic_array = np.stack(dynamic_values)
+        dynamic_array = _profiled_stack(dynamic_values)
         static = self._static_assets
-        static_array = np.stack(
+        static_array = _profiled_stack(
             [
                 self._normalized(self._read_asset(asset, window), asset.name)
                 for asset in static
@@ -865,6 +879,7 @@ class WindowedSampleDataset(GeoDataset):
         self._raster_pool.close()
 
 
+@profile_collate
 def sample_collate_fn(
     samples: list[dict[str, Any]], *, pad_value: float = float("nan")
 ) -> dict[str, Any]:

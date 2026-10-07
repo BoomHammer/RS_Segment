@@ -7,7 +7,7 @@ import atexit
 import json
 import sys
 from datetime import datetime
-from itertools import chain
+from itertools import chain, zip_longest
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +36,15 @@ from weak_label.generation import (  # noqa: E402
 )
 from weak_label.quality import write_label_quality_visualization  # noqa: E402
 from weak_label.sam_input import discover_sam_videos  # noqa: E402
+
+
+def _load_shard_outcomes(shards):
+    """Restore strided input order; CSV identifiers may be empty or nonnumeric."""
+    groups = [
+        json.loads(Path(shard["outcomes"]).read_text(encoding="utf-8"))
+        for shard in shards
+    ]
+    return [item for row in zip_longest(*groups) for item in row if item is not None]
 
 
 def _merge_weak_label_shards(
@@ -271,12 +280,7 @@ def main(argv: list[str] | None = None) -> int:
             nodata=config.data.output_nodata,
             conflict_margin=generation_config.conflict_margin,
         )
-        outcomes = []
-        for shard in shards:
-            outcomes.extend(
-                json.loads(Path(shard["outcomes"]).read_text(encoding="utf-8"))
-            )
-        outcomes.sort(key=lambda item: int(item.get("record_index", -1)))
+        outcomes = _load_shard_outcomes(shards)
         quality = evaluate_label_quality_from_raster(output, sample_outcomes=outcomes)
         report.parent.mkdir(parents=True, exist_ok=True)
         report.write_text(

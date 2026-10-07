@@ -16,6 +16,19 @@ from torch.utils.data import Sampler
 T = TypeVar("T")
 
 
+def wrap_training_model(model, context):
+    """Allow unused branches in supervised and overlap-only backward passes."""
+    if not context.distributed:
+        return model
+    cuda = context.device.type == "cuda"
+    return torch.nn.parallel.DistributedDataParallel(
+        model,
+        device_ids=[context.local_rank] if cuda else None,
+        output_device=context.local_rank if cuda else None,
+        find_unused_parameters=True,
+    )
+
+
 def _explicit_single_device(device: str | None) -> bool:
     if device is None or device in {"", "auto", "cuda"}:
         return False

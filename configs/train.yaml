@@ -1,5 +1,8 @@
 # 主训练配置。数据路径和数据集结构由 data.yaml 管理，模型结构由 model.yaml 管理。
 training:
+  # 性能诊断：前 N 个训练 batch 分 rank 输出 JSONL；0 关闭。
+  # 可用环境变量 RS_PROFILE_STEPS 覆盖；开启时 CUDA 同步计时会影响吞吐。
+  profile_steps: 0
   # 训练轮数。
   epochs: 30
   # auto：4090 等支持原生 BF16 的显卡使用 BF16；2070 等使用 FP16 + 梯度缩放。

@@ -152,6 +152,20 @@ uv run python scripts/train.py data/processed/<时间戳> --device cuda:0
 
 ### 2. 流程之外的重要命令
 
+若多卡 SAM 已完成、最终 `weak_labels.tif` 已写出，但质量报告汇总失败，且各卡的
+`.weak_labels.tif.rankN`、`.scores.tif` 和 `.outcomes.json` 仍在，可核验整幅栅格并
+恢复报告，无需再次运行 SAM：
+
+```bash
+uv run python -m scripts.recover_weak_labels data/processed/<时间戳> \
+  --ranks 2 --conflict-margin 0.05
+```
+
+参数必须与原生成任务一致。此命令保留原栅格与分片，仅在逐块核验通过后写入质量报告
+和预览图。随后运行 `scripts/datasets.py` 建立索引和空间划分，再使用
+`rs-pipeline --retrain data/processed/<时间戳>` 继续训练、测试和出图；不要重新启动
+无参数的 `rs-pipeline`，那会新建一次数据预处理与 SAM 任务。
+
 检查数据目录并计算统计量：
 
 ```bash

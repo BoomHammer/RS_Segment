@@ -19,7 +19,6 @@ from time import perf_counter
 import torch
 import torch.distributed as dist
 import yaml
-from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
 from config import load_config
@@ -46,6 +45,7 @@ from distributed_runtime import (
     gather_objects,
     initialize,
     shard_sequence,
+    wrap_training_model,
 )
 from evaluation import (
     collect_point_predictions,
@@ -59,6 +59,7 @@ from losses.overlap import overlap_consistency_loss
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
 from models.config import load_model_contract
+from performance import TrainingProfiler
 from precision import resolve_amp_dtype, scaled_optimizer_step
 from seed import seed_everything
 
@@ -326,6 +327,11 @@ def main(argv: list[str] | None = None) -> int:
     with args.train_config.open(encoding="utf-8") as stream:
         train_config = yaml.safe_load(stream) or {}
     training = dict(train_config.get("training", {}))
+    profile_steps = int(
+        os.environ.get("RS_PROFILE_STEPS", training.get("profile_steps", 0))
+    )
+    if profile_steps < 0:
+        raise ValueError("RS_PROFILE_STEPS/profile_steps must be nonnegative")
     seed_everything(int(training.get("seed", 42)))
     policy = dict(train_config.get("supervision_policy", {}))
     if resume is not None and not policy.get("fixed_spatial_supervision", False):
@@ -540,6 +546,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             train_loader_indices = None
         train_sampler = DistributedSamplerAdapter(train_sampler, distributed)
+    dataset.profile_steps = profile_steps * effective_batch_size
     loader = build_dataloader(
         dataset,
         indices=train_loader_indices,
@@ -621,12 +628,7 @@ def main(argv: list[str] | None = None) -> int:
         betas=tuple(optimizer_config.get("betas", (0.9, 0.999))),
     )
     raw_model = model
-    if distributed.distributed:
-        model = DistributedDataParallel(
-            raw_model,
-            device_ids=[distributed.local_rank],
-            output_device=distributed.local_rank,
-        )
+    model = wrap_training_model(raw_model, distributed)
     scheduler_config = dict(train_config.get("scheduler", {}))
     steps_per_epoch = math.ceil(len(loader) / accumulation_steps)
     total_steps = max(1, epochs * steps_per_epoch)
@@ -813,6 +815,14 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(train_log, indent=2), encoding="utf-8"
         )
 
+    profiler = TrainingProfiler(output, distributed.rank, device, profile_steps)
+    if profile_steps:
+        print(
+            f"[PERF rank={distributed.rank}] first {profile_steps} training batches; "
+            f"local CUDA sync enabled; output={profiler.path}",
+            flush=True,
+        )
+
     def optimizer_step() -> None:
         nonlocal optimizer_steps
         updated = scaled_optimizer_step(
@@ -853,18 +863,23 @@ def main(argv: list[str] | None = None) -> int:
         for batch in progress:
             step_started_at = perf_counter()
             data_seconds = step_started_at - batch_finished_at
+            profiler.begin(
+                epoch + 1, batches + 1, data_seconds, batch.pop("_performance", None)
+            )
             tensor_batch = {
                 key: value.to(device, non_blocking=True)
                 if isinstance(value, torch.Tensor)
                 else value
                 for key, value in batch.items()
             }
+            profiler.mark("transfer_s")
             with torch.autocast(
                 device_type=device.type,
                 dtype=amp_dtype or torch.float32,
                 enabled=amp_enabled,
             ):
                 prediction = model(tensor_batch)
+                profiler.mark("forward_s")
                 if "core_mask" in tensor_batch:
                     tensor_batch["valid_mask"] = (
                         tensor_batch["valid_mask"] & tensor_batch["core_mask"]
@@ -940,7 +955,9 @@ def main(argv: list[str] | None = None) -> int:
                 accumulation_steps,
                 len(loader) - (batches // accumulation_steps) * accumulation_steps,
             )
+            profiler.mark("loss_metrics_s")
             scaler.scale(loss / group_size).backward()
+            profiler.mark("backward_s")
             if (
                 overlap_weight > 0
                 and epoch >= int(overlap.get("warmup_epochs", 3))
@@ -966,8 +983,10 @@ def main(argv: list[str] | None = None) -> int:
                 overlap_loss_sum += float(consistency.detach())
                 overlap_batches += 1
                 del cropped_prediction, consistency, view
+            profiler.mark("overlap_s")
             if (batches + 1) % accumulation_steps == 0:
                 optimizer_step()
+            profiler.mark("optimizer_s")
             loss_value = float(loss.detach())
             total += loss_value
             batches += 1
@@ -993,6 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"{torch.cuda.memory_reserved(device) / 2**30:.2f}G"
                 )
             progress.set_postfix(status)
+            profiler.finish()
             batch_finished_at = perf_counter()
         if batches % accumulation_steps:
             optimizer_step()

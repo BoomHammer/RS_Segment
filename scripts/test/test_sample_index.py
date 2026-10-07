@@ -72,6 +72,19 @@ def test_dataset_accepts_missing_product_range(tmp_path, caplog):
         stage2={"value_range_file": str(ranges)},
     )
     torch.testing.assert_close(dataset[0]["static"], torch.full((1, 2, 2), 2.0))
+    baseline = dataset[0]
+    dataset.profile_steps = 1
+    profiled = dataset[0]
+    for key, value in baseline.items():
+        if isinstance(value, torch.Tensor):
+            torch.testing.assert_close(profiled[key], value, equal_nan=True)
+    batched = sample_collate_fn([profiled])
+    timings = batched["_performance"]["samples"][0]["seconds"]
+    assert timings["read_window_s"] >= timings["read_asset_s"]
+    assert timings["read_asset_s"] >= timings["raster_open_read_close_s"]
+    assert timings["normalize_s"] >= 0
+    assert timings["stack_s"] >= 0
+    assert "_performance" not in dataset[0]
     assert "COPERNICUS_DEM_100M" in caplog.text
     with pytest.raises(ValueError, match="缺少有效值规则"):
         _validate_statistics_value_ranges(

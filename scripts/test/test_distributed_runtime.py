@@ -1,12 +1,13 @@
 """CPU tests for deterministic sharding and distributed result merging."""
 
+import json
 from pathlib import Path
 
 import numpy as np
 import rasterio
 import torch
 from rasterio.transform import from_origin
-from scripts.weak_label import _merge_weak_label_shards
+from scripts.weak_label import _load_shard_outcomes, _merge_weak_label_shards
 
 from distributed_runtime import DistributedContext, DistributedSamplerAdapter
 from evaluation import merge_point_prediction_shards
@@ -34,6 +35,16 @@ def test_sampler_adapter_pads_equal_ddp_steps() -> None:
 
     assert first == [0, 2, 4]
     assert second == [1, 3, 0]
+
+
+def test_outcomes_restore_input_order_without_numeric_ids(tmp_path):
+    records = [{"record_index": value} for value in ("", "site-A", None, "2", "")]
+    shards = []
+    for rank in range(2):
+        path = tmp_path / f"rank{rank}.json"
+        path.write_text(json.dumps(records[rank::2]), encoding="utf-8")
+        shards.append({"outcomes": path})
+    assert _load_shard_outcomes(shards) == records
 
 
 def test_sampler_adapter_forwards_resume_epoch() -> None:
