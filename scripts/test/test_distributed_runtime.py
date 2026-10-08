@@ -1,14 +1,17 @@
 """CPU tests for deterministic sharding and distributed result merging."""
 
 import json
+import subprocess
 from pathlib import Path
 
 import numpy as np
+import pytest
 import rasterio
 import torch
 from rasterio.transform import from_origin
 from scripts.weak_label import _load_shard_outcomes, _merge_weak_label_shards
 
+import distributed_runtime
 from distributed_runtime import DistributedContext, DistributedSamplerAdapter
 from evaluation import merge_point_prediction_shards
 
@@ -27,6 +30,30 @@ class _Sampler(torch.utils.data.Sampler[int]):
 
 def _context(rank: int, world_size: int = 2) -> DistributedContext:
     return DistributedContext(rank, rank, world_size, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("configured, expected", [(None, "1"), ("6", "6")])
+def test_auto_launch_sets_quiet_omp_default(
+    tmp_path, monkeypatch, configured, expected
+) -> None:
+    if configured is None:
+        monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    else:
+        monkeypatch.setenv("OMP_NUM_THREADS", configured)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    captured = {}
+
+    def run(command, *, check, env):
+        captured.update(command=command, check=check, env=env)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(distributed_runtime.subprocess, "run", run)
+    result = distributed_runtime.auto_launch(tmp_path / "stage.py", ["--example"])
+
+    assert result == 0
+    assert captured["env"]["OMP_NUM_THREADS"] == expected
+    assert "torch.distributed.run" in captured["command"]
 
 
 def test_sampler_adapter_pads_equal_ddp_steps() -> None:

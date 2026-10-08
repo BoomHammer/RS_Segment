@@ -64,7 +64,11 @@ def auto_launch(
         str(Path(script).resolve()),
         *arguments,
     ]
-    return subprocess.run(command, check=False).returncode
+    environment = os.environ.copy()
+    # torchrun chooses the same default, but emits a large warning every time a
+    # pipeline stage starts. Set it explicitly while preserving user tuning.
+    environment.setdefault("OMP_NUM_THREADS", "1")
+    return subprocess.run(command, check=False, env=environment).returncode
 
 
 @dataclass(frozen=True, slots=True)

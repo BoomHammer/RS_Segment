@@ -38,7 +38,9 @@ def _write_raster(path: Path, values: np.ndarray) -> None:
         dataset.write(values, 1)
 
 
-def test_dataset_accepts_missing_product_range(tmp_path, caplog):
+def test_dataset_accepts_missing_product_range_without_repeated_warning(
+    tmp_path, caplog
+):
     dynamic = tmp_path / "dynamic"
     static = tmp_path / "static"
     dynamic.mkdir()
@@ -85,7 +87,7 @@ def test_dataset_accepts_missing_product_range(tmp_path, caplog):
     assert timings["normalize_s"] >= 0
     assert timings["stack_s"] >= 0
     assert "_performance" not in dataset[0]
-    assert "COPERNICUS_DEM_100M" in caplog.text
+    assert "COPERNICUS_DEM_100M" not in caplog.text
     with pytest.raises(ValueError, match="缺少有效值规则"):
         _validate_statistics_value_ranges(
             payload, {"copernicus_dem_100m": ValueRange(0, 1000)}

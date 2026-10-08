@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,7 +33,6 @@ from .value_ranges import (
 )
 
 INDEX_SCHEMA_VERSION = 2
-LOGGER = logging.getLogger(__name__)
 _profiled_stack = worker_stage("stack_s")(np.stack)
 _profiled_full = worker_stage("missing_fill_s")(np.full)
 
@@ -505,19 +503,6 @@ class WindowedSampleDataset(GeoDataset):
             {_feature_name(asset) for asset in dynamic_assets}
         )
         self._dynamic_times = times
-        if self.value_ranges:
-            missing_ranges = sorted(
-                {
-                    self._value_range_key(asset)
-                    for asset in (*dynamic_assets, *static_assets)
-                    if self._value_range_for_asset(asset) is None
-                }
-            )
-            if missing_ranges:
-                LOGGER.warning(
-                    "以下输入特征没有有效值范围，将按原始值计算（Scale=1）: %s",
-                    ", ".join(missing_ranges),
-                )
         if normalization.get("require_statistics", False):
             keys = [_feature_name(asset) for asset in dynamic_assets]
             keys.extend(asset.name for asset in static_assets)
