@@ -167,6 +167,8 @@ def test_schema_rejects_invalid_levels(levels):
         "anysat",
         "maestro_s",
         "lightweight_dual_branch",
+        "utae",
+        "segformer",
         "segformer_utae_pretrained",
         "segformer_utae_dynamic_ablation",
         "segformer_utae_static_ablation",

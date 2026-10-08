@@ -111,14 +111,26 @@ def derive_model_contract(
 
 
 def load_model_contract(
-    config_path: str | Path, run: str | Path, stage2: dict[str, Any] | None = None
+    config_path: str | Path,
+    run: str | Path,
+    stage2: dict[str, Any] | None = None,
+    *,
+    model_name: str | None = None,
 ) -> dict[str, Any]:
     """Load architecture settings and append dimensions derived from artifacts."""
 
     with Path(config_path).open(encoding="utf-8") as stream:
         raw = yaml.safe_load(stream) or {}
     model = dict(raw.get("model", {}))
+    if model_name is not None:
+        from experiment_options import MODEL_CHOICES
+
+        model["architecture"] = MODEL_CHOICES[model_name]
     pretrained = dict(model.get("pretrained", {}))
+    if model_name == "segformer-utae" and not pretrained.get("path"):
+        pretrained["freeze_stages"] = 0
+    if model_name in {"segformer-utae", "utae"}:
+        model.setdefault("temporal", {}).setdefault("normalization", "group")
     if pretrained.get("path") is not None:
         path = Path(pretrained["path"])
         pretrained["path"] = str(

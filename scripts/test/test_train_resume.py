@@ -79,6 +79,7 @@ class TinyLoader(list):
         self.generator = torch.Generator().manual_seed(42)
 
 
+@pytest.mark.parametrize("no_pseudo", [False, True])
 @pytest.mark.parametrize("halo", [0, 1])
 @pytest.mark.parametrize("monitor", ["val_loss", "val_accuracy"])
 @pytest.mark.parametrize(
@@ -94,7 +95,7 @@ class TinyLoader(list):
     ],
 )
 def test_resume_matches_uninterrupted_training(
-    tmp_path, monkeypatch, halo, device, monitor
+    tmp_path, monkeypatch, halo, device, monitor, no_pseudo
 ):
     run = tmp_path / "data"
     run.mkdir()
@@ -174,7 +175,7 @@ def test_resume_matches_uninterrupted_training(
     monkeypatch.setattr(
         train,
         "load_model_contract",
-        lambda *a: {"derived": {"num_classes": 2, "fine_to_coarse": [0, 0]}},
+        lambda *a, **kw: {"derived": {"num_classes": 2, "fine_to_coarse": [0, 0]}},
     )
     monkeypatch.setattr(
         train,
@@ -212,6 +213,8 @@ def test_resume_matches_uninterrupted_training(
         "1",
         "1",
     ]
+    if no_pseudo:
+        base.append("--no-pseudo-labels")
     output = tmp_path / "interrupted"
     monkeypatch.setattr(train, "_evaluate", interrupted)
     with pytest.raises(KeyboardInterrupt):
@@ -235,6 +238,7 @@ def test_resume_matches_uninterrupted_training(
     assert recovered["best_epoch"] == (1 if monitor == "val_accuracy" else 3)
     log = json.loads((output / "train_log.json").read_text())
     assert log["status"] == "completed"
+    assert log["supervision_policy"].get("disable_weak_labels", False) == no_pseudo
     assert len(log["epochs"]) == 3
     for options in loader_options[1::2]:
         assert options["num_workers"] == 2

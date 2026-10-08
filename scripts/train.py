@@ -9,7 +9,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
 import sys
 from dataclasses import replace
 from datetime import datetime
@@ -31,6 +30,7 @@ from data.spatial_split import build_spatial_split, load_spatial_split
 from data.training_policy import (
     assert_supervision_isolated,
     isolate_splits,
+    merge_test_into_train,
     point_windows,
     supervision_summary,
     training_class_weights,
@@ -55,6 +55,7 @@ from evaluation import (
 from evaluation import (
     evaluate_points as _evaluate,
 )
+from experiment_options import add_experiment_arguments, experiment_arguments
 from losses.overlap import overlap_consistency_loss
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
@@ -273,7 +274,7 @@ class ModelEMA:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="训练 MAESTRO-S 遥感分割模型")
+    parser = argparse.ArgumentParser(description="训练遥感分割模型")
     parser.add_argument("run", type=Path, help="datasets.py 生成的数据集目录")
     parser.add_argument("--data-config", type=Path, default=Path("configs/data.yaml"))
     parser.add_argument("--config", type=Path, default=Path("configs/model.yaml"))
@@ -288,7 +289,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stride", type=int, nargs=2, default=None)
     parser.add_argument("--halo", type=int, nargs=2, default=None)
     parser.add_argument("--grid-offset", type=int, nargs=2, default=(0, 0))
+    add_experiment_arguments(parser)
     args = parser.parse_args(argv)
+    if args.resume is not None and experiment_arguments(args):
+        parser.error("续训自动恢复实验设置，不能覆盖实验参数")
     launch_result = auto_launch(
         __file__, sys.argv[1:] if argv is None else argv, device=args.device
     )
@@ -326,6 +330,11 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("断点续训须保持原目标 epochs，以保留原学习率计划")
     with args.train_config.open(encoding="utf-8") as stream:
         train_config = yaml.safe_load(stream) or {}
+    policy = train_config.setdefault("supervision_policy", {})
+    if args.no_pseudo_labels:
+        policy["disable_weak_labels"] = True
+    if args.train_on_test:
+        policy["train_on_test"] = True
     training = dict(train_config.get("training", {}))
     profile_steps = int(
         os.environ.get("RS_PROFILE_STEPS", training.get("profile_steps", 0))
@@ -428,6 +437,8 @@ def main(argv: list[str] | None = None) -> int:
         if not split_path.is_file():
             raise FileNotFoundError(f"数据集目录缺少空间划分文件: {split_path}")
         manifest = load_spatial_split(split_path)
+    if policy.get("train_on_test", False):
+        manifest = merge_test_into_train(manifest)
     if args.region_fraction is not None:
         manifest = _restrict_manifest_to_region(dataset, manifest, args.region_fraction)
     if policy.get("isolate_spatial_splits", False):
@@ -478,7 +489,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError(f"空间划分中的 train 集为空: {split_path}{detail}")
     if not validation_indices:
         raise ValueError(f"空间划分中的 validation 集为空: {split_path}")
-    model_config = load_model_contract(args.config, run, stage2)
+    model_config = load_model_contract(args.config, run, stage2, model_name=args.model)
     model = SegFormerUtae.from_contract(model_config)
     pretrained_initialization = None
     weight_initialization = None
@@ -733,23 +744,23 @@ def main(argv: list[str] | None = None) -> int:
         "checkpoint_monitor": monitor,
     }
     if resume is None and distributed.is_main:
-        shutil.copy2(args.train_config, output / "train.yaml")
-        shutil.copy2(args.config, output / "model.yaml")
-        if model_config.get("architecture") == "anysat":
-            # Persist resolved initialization paths: the snapshot lives elsewhere.
-            (output / "model.yaml").write_text(
-                yaml.safe_dump(
-                    {
-                        "model": {
-                            key: value
-                            for key, value in model_config.items()
-                            if key != "derived"
-                        }
-                    },
-                    allow_unicode=True,
-                ),
-                encoding="utf-8",
-            )
+        (output / "train.yaml").write_text(
+            yaml.safe_dump(train_config, allow_unicode=True), encoding="utf-8"
+        )
+        # Persist resolved initialization paths: the snapshot lives elsewhere.
+        (output / "model.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "model": {
+                        key: value
+                        for key, value in model_config.items()
+                        if key != "derived"
+                    }
+                },
+                allow_unicode=True,
+            ),
+            encoding="utf-8",
+        )
         # Absolute paths keep the snapshot valid in the experiment directory.
         data_payload = yaml.safe_load(args.data_config.read_text(encoding="utf-8"))
         for name in (

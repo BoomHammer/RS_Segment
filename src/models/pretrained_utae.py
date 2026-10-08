@@ -212,6 +212,10 @@ class PretrainedSegFormerUTAE(nn.Module):
         self.heads = HierarchicalHeads.from_derived(decoder_width, derived)
 
     def initialize_pretrained(self):
+        if not self.contract.get("pretrained", {}).get("path"):
+            if self.freeze_stages:
+                raise ValueError("随机初始化不能冻结 MiT 阶段；设置 freeze_stages: 0")
+            return None
         folder = Path(self.contract["pretrained"]["path"])
         if not folder.is_dir():
             raise FileNotFoundError(

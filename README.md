@@ -1,215 +1,127 @@
 # RS-Segment
 
-基于弱监督学习的遥感植被语义分割项目。数据按窗口流式读取，使用 PointSAM 生成弱标签，使用 SegFormer-U-TAE 训练，并通过重叠滑窗生成无缝 GeoTIFF。
+面向大陆级遥感植被制图的弱监督语义分割项目。结合稀疏实测样点、多时相动态影像和静态环境特征，支持 PointSAM 伪标签、层级分类及多种分割模型，目标是生成 250 m 分辨率的植被类型分布图。
 
-## 环境准备
+数据按窗口流式读取；训练使用重叠区域一致性约束，预测使用带 halo 的重叠滑窗和高斯融合，以减少拼接边界伪影。默认模型为轻量双分支模型（`lightweight_dual_branch`），模型切换与对照实验参见 [EXPERIMENTS.md](EXPERIMENTS.md)。
+
+## 环境与安装
 
 - Python `>=3.11,<3.14`
-- CUDA `12.4`（GPU 训练/推理）
-- [uv](https://docs.astral.sh/uv/)
+- 包管理器：uv
+- GPU 环境：PyTorch CUDA 12.4；主要面向单张 RTX 4090（24 GB）
+- 代码格式化与检查：Ruff
 
-```bash
+在项目根目录安装依赖：
+
+```powershell
 uv sync --extra dev
 ```
 
-首次运行前，按本机数据位置修改：
+生成 PointSAM 伪标签还需要可导入的 `sam2` 包和本地 SAM2 权重；`uv sync` 不包含 SAM2 安装或权重下载。权重路径由 `configs/data.yaml` 中的 `data.sam2_checkpoint` 指定。复用已有数据集训练时不调用 SAM2。
 
-- [`configs/data.yaml`](configs/data.yaml)：数据、标签和预处理路径
-- [`configs/weak_label.yaml`](configs/weak_label.yaml)：PointSAM
-- [`configs/model.yaml`](configs/model.yaml)：模型
-- [`configs/train.yaml`](configs/train.yaml)：训练
-- [`configs/predict.yaml`](configs/predict.yaml)：全图预测
+## 数据与配置
 
-配置中的相对路径相对于配置文件所在目录解析。
+```text
+configs/               # 数据、模型、训练和预测配置
+data/
+  labels/              # 实测样点 CSV
+  raw/dynamic/         # 多时相影像
+  raw/static/          # DEM、气候等静态影像
+  processed/           # 预处理产物、样本索引及空间划分
+experiments/           # 训练断点、指标、配置快照和预测结果
+scripts/               # 各阶段入口；test/ 下为自动化测试
+src/                   # 数据、模型、损失、推理等实现
+```
 
-## 命令行用法
+首次运行前，根据本机数据修改以下配置：
 
-### 1. 主流程
+| 配置 | 主要内容 |
+| --- | --- |
+| [data.yaml](configs/data.yaml) | 数据路径、CSV 编码与坐标系、标签层级、目标网格、窗口与空间划分 |
+| [weak_label.yaml](configs/weak_label.yaml) | PointSAM 输入组合、置信度与融合策略 |
+| [model.yaml](configs/model.yaml) | 模型架构、监督权重与模型参数 |
+| [train.yaml](configs/train.yaml) | 训练轮数、采样、混合精度、梯度累积与早停 |
+| [predict.yaml](configs/predict.yaml) | 推理设备、融合方式、输出与实测标签覆盖策略 |
 
-#### 1.1 新训练：训练、测试并预测
+`data.yaml` 中的数据路径相对于该配置文件所在目录解析；命令行路径相对于当前工作目录。样点 CSV 的列名、编码、坐标系与分类层级必须与配置一致，标签契约详见 [docs/label_hierarchy.md](docs/label_hierarchy.md)。
 
-```bash
+## 运行流程
+
+以下命令均在项目根目录执行，尖括号内容需替换为实际目录名。
+
+### 从原始数据开始
+
+```powershell
 uv run rs-pipeline
 ```
 
-该命令依次执行：数据预处理和弱标签生成 → 数据集索引与空间划分 → 训练 → 测试 → 全图预测。
+依次执行：预处理与栅格统计 → PointSAM 伪标签生成 → 样本索引与空间划分 → 训练 → 测试 → 全图预测。
 
-常用覆盖参数：
+### 复用已有数据集
 
-```bash
-uv run rs-pipeline --epochs 30 --device cuda
-uv run rs-pipeline --data-config configs/data.yaml \
-  --model-config configs/model.yaml \
-  --train-config configs/train.yaml \
-  --predict-config configs/predict.yaml
-```
-
-#### 1.2 续训：从 `last.pt` 继续训练、测试并预测
-
-```bash
-uv run rs-pipeline --resume experiments/<训练实验时间戳>/last.pt
-```
-
-续训会自动读取断点所在实验目录的配置和数据集路径，完成后更新该实验的推理 checkpoint，并继续执行测试和全图预测。`--resume` 只接受完整断点 `last.pt`，不能使用 `model_*.pt` 或 `best_*.pt`。
-
-如需指定设备：
-
-```bash
-uv run rs-pipeline --resume experiments/<训练实验时间戳>/last.pt --device cuda
-```
-
-#### 1.3 重新训练：复用已有数据集，从头训练并预测
-
-```bash
+```powershell
 uv run rs-pipeline --retrain data/processed/<数据集时间戳>
 ```
 
-该命令跳过数据预处理和数据集重建，使用指定的已准备数据集新建实验，从头训练，随后自动测试和全图预测。可搭配 `--epochs`、`--device` 以及配置覆盖参数使用。
+使用已有样本索引、标签映射、统计量和空间划分，新建实验并从头训练，随后测试和全图预测。不会重新预处理、生成伪标签或划分数据集；索引引用的影像与标签文件仍需可访问。
 
-训练产物位于 `experiments/<时间戳>/`，主要包括：
+仅用真实标签、合并测试集训练，以及 SegFormer+U-TAE、U-TAE、SegFormer、MAESTRO-S、AnySat 模型切换，参见 [EXPERIMENTS.md](EXPERIMENTS.md)。
 
-```text
-model_<时间戳>.pt       # 训练完成后用于测试/预测
-last.pt                 # 可续训的完整状态
-best_*.pt               # 各验证指标对应的推理权重
-train_log.json          # 训练记录和来源数据集
-test_metrics.json       # 测试指标
-vegetation_*.tif        # 全图预测结果
+### 从断点续训
+
+```powershell
+uv run rs-pipeline --resume experiments/<实验时间戳>/last.pt
 ```
 
-#### 1.4 分步执行主流程
+恢复原实验的配置、数据集路径及完整训练状态，完成后测试和全图预测；原实验合并了测试集时自动跳过测试。续训只接受 `last.pt`，不能使用 `model_*.pt` 或 `best_*.pt`。`--resume` 与 `--retrain` 不能同时使用。
 
-需要单独控制各阶段时，按以下顺序执行：
+### 常用参数
 
-```bash
-# 数据预处理和栅格统计
+```powershell
+uv run rs-pipeline --retrain data/processed/<数据集时间戳> --epochs 30 --device cuda:0
+uv run rs-pipeline --data-config configs/data.yaml --model-config configs/model.yaml --train-config configs/train.yaml --predict-config configs/predict.yaml
+uv run rs-pipeline --help
+```
+
+`--epochs` 用于设置新训练的目标轮数，续训须保持原目标轮数。检测到多张可见 GPU 时，相关阶段支持自动多卡运行；显式指定 `--device cuda:0` 可选择单卡。训练耗时分析与性能诊断参见 [PERFORMANCE.md](PERFORMANCE.md)。
+
+### 分步执行
+
+需要单独运行某个阶段时：
+
+```powershell
 uv run python scripts/preprocess.py --config configs/data.yaml --skip-weak-labels
-
-# PointSAM 弱标签（已有多张 CUDA 卡时自动并行）
-uv run python scripts/weak_label.py --data-config configs/data.yaml \
-  --run-dir data/processed/<时间戳>
-
-# PointSAM 中断后，从同一预处理目录的断点继续
-uv run python scripts/weak_label.py --data-config configs/data.yaml \
-  --resume data/processed/<时间戳>
-
-# 使用上一步生成的目录建立样本索引和空间划分
-uv run python scripts/datasets.py data/processed/<时间戳>
-
-# 训练
-uv run python scripts/train.py data/processed/<时间戳>
-
-# 测试
-uv run python scripts/test.py \
-  experiments/<训练实验时间戳>/model_<训练实验时间戳>.pt
-
-# 全图预测
-uv run python scripts/predict.py \
-  experiments/<训练实验时间戳>/model_<训练实验时间戳>.pt \
-  --config configs/predict.yaml
+uv run python scripts/weak_label.py --data-config configs/data.yaml --run-dir data/processed/<数据集时间戳>
+uv run python scripts/datasets.py data/processed/<数据集时间戳>
+uv run python scripts/train.py data/processed/<数据集时间戳>
+uv run python scripts/test.py experiments/<实验时间戳>/model_<实验时间戳>.pt
+uv run python scripts/predict.py experiments/<实验时间戳>/model_<实验时间戳>.pt --config configs/predict.yaml
 ```
 
-`train.py` 单独续训时使用：
+PointSAM 中断后，可用 `uv run python scripts/weak_label.py --resume data/processed/<数据集时间戳>` 恢复；需保持原数据、配置和可见 GPU 数量。各脚本的其他选项通过 `--help` 查看。
 
-```bash
-uv run python scripts/train.py data/processed/<时间戳> \
-  --resume experiments/<训练实验时间戳>/last.pt
-```
+## 输出与预测
 
-PointSAM 会在输出目录中按样点保存临时进度；使用 `--resume` 后会跳过已经完成的样点，
-而不是重新生成全部伪标签。恢复时必须继续使用原来的预处理目录，并保持目标网格、输入
-影像、标签和弱标签配置不变，否则程序会拒绝加载不匹配的断点。多卡任务还应保持与中断
-前相同的可见 GPU 数量。生成成功后，临时断点会自动清理。
+中间数据保存在 `data/processed/<数据集时间戳>/`。实验目录通常包含：
 
-如果中断的是包含弱标签生成的 `preprocess.py`，也可以直接恢复：
+| 产物 | 用途 |
+| --- | --- |
+| `last.pt` | 可续训的完整状态 |
+| `model_<实验时间戳>.pt`、`best_*.pt` | 测试与预测权重 |
+| `train_log.json` | 训练记录、来源数据集与监督策略 |
+| `data.yaml`、`model.yaml`、`train.yaml` | 生效配置快照 |
+| `spatial_split.json`、`supervision_audit.json` | 本次实验的空间划分视图与监督审计 |
+| `test_metrics.json` | 测试指标；跳过测试时不生成 |
+| `vegetation_*.tif`、`vegetation_*.csv` | 植被分类 GeoTIFF 与类别映射表 |
 
-```bash
-uv run python scripts/preprocess.py --config configs/data.yaml \
-  --resume data/processed/<时间戳>
-```
+预测沿用训练记录中的窗口参数。当前 `configs/predict.yaml` 默认设置 `override_ground_truth: true`，会用实测标签覆盖输出图中的对应像元；如需保留纯模型预测，设为 `false`。该选项不改变训练或测试指标。默认禁止覆盖同名预测文件，重复出图需指定新输出路径或明确启用 `overwrite`。
 
-#### 1.5 单卡与多卡
+## 开发检查
 
-`weak_label.py`、`train.py`、`test.py` 和 `predict.py` 会检查可见 CUDA
-设备。普通命令检测到多张卡时会自动以每卡一个进程启动；单卡和 CPU 环境保持原有
-行为。`rs-pipeline` 调用的也是这些入口，因此主流程同样自动适配多卡。
-
-```bash
-# 自动使用所有可见 GPU
-uv run python scripts/train.py data/processed/<时间戳>
-
-# 只开放两张指定 GPU
-CUDA_VISIBLE_DEVICES=0,1 uv run python scripts/train.py data/processed/<时间戳>
-
-# 强制单卡（显式设备会关闭自动多卡）
-uv run python scripts/train.py data/processed/<时间戳> --device cuda:0
-```
-
-也支持直接用 `torchrun` 启动。训练配置中的 `batch_size` 是每张卡的批量大小；
-全局有效批量为 `batch_size × GPU 数 × gradient_accumulation_steps`。测试按窗口
-分片并在全局像元坐标上去重；全图推理分别累加分数和高斯权重后流式归并，保持重叠
-融合和无缝输出；PointSAM 分片同时保存置信分数，再按冲突阈值合并。
-
-### 2. 流程之外的重要命令
-
-若多卡 SAM 已完成、最终 `weak_labels.tif` 已写出，但质量报告汇总失败，且各卡的
-`.weak_labels.tif.rankN`、`.scores.tif` 和 `.outcomes.json` 仍在，可核验整幅栅格并
-恢复报告，无需再次运行 SAM：
-
-```bash
-uv run python -m scripts.recover_weak_labels data/processed/<时间戳> \
-  --ranks 2 --conflict-margin 0.05
-```
-
-参数必须与原生成任务一致。此命令保留原栅格与分片，仅在逐块核验通过后写入质量报告
-和预览图。随后运行 `scripts/datasets.py` 建立索引和空间划分，再使用
-`rs-pipeline --retrain data/processed/<时间戳>` 继续训练、测试和出图；不要重新启动
-无参数的 `rs-pipeline`，那会新建一次数据预处理与 SAM 任务。
-
-检查数据目录并计算统计量：
-
-```bash
-uv run rs-prepare-data
-```
-
-检查样点标签：
-
-```bash
-uv run python scripts/validate_labels.py --config configs/data.yaml
-```
-
-解析动态影像文件名：
-
-```bash
-uv run python -m data.filename_parser data/raw/dynamic \
-  --output experiments/dynamic_metadata.json
-```
-
-快速限制测试窗口数量：
-
-```bash
-uv run python scripts/test.py \
-  experiments/<训练实验时间戳>/model_<训练实验时间戳>.pt \
-  --split validation --max-windows 10 --device cuda
-```
-
-## 预测设置
-
-预测默认使用训练 checkpoint 记录的窗口参数，并通过重叠滑窗和高斯融合输出 GeoTIFF。若需把实测标签覆盖回输出图，在 [`configs/predict.yaml`](configs/predict.yaml) 中设置：
-
-```yaml
-predict:
-  override_ground_truth: true
-```
-
-该设置只影响输出，不改变训练或模型推理。
-
-## 检查代码
-
-```bash
+```powershell
 uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 ```
 
-完整流程的中间数据保存在 `data/processed/`，实验结果保存在 `experiments/`。所有大栅格按窗口流式读取，避免一次性加载到内存。
+MAESTRO-S 与 AnySat 的实现和权重说明分别参见 [docs/maestro.md](docs/maestro.md) 和 [docs/anysat.md](docs/anysat.md)。

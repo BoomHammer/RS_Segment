@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 
 from config import load_config
+from experiment_options import add_experiment_arguments, experiment_arguments
 
 
 def _run(root: Path, module: str, arguments: list[str]) -> None:
@@ -84,7 +85,10 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="使用已有 data/processed run 从头训练，并在完成后测试和预测",
     )
+    add_experiment_arguments(parser)
     args = parser.parse_args(argv)
+    if experiment_arguments(args) and args.retrain is None:
+        parser.error("实验参数仅用于 --retrain；续训自动恢复实验设置")
     if args.resume is not None and args.retrain is not None:
         parser.error("--resume 和 --retrain 不能同时使用")
     root = Path.cwd().resolve()
@@ -169,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         train_args.extend(["--epochs", str(args.epochs)])
     if args.device is not None:
         train_args.extend(["--device", args.device])
+    train_args.extend(experiment_arguments(args))
     _run(root, "train", train_args)
     if resume is None:
         experiment_candidates = sorted(
@@ -188,7 +193,10 @@ def main(argv: list[str] | None = None) -> int:
         test_args.extend(["--device", args.device])
     if args.max_windows is not None:
         test_args.extend(["--max-windows", str(args.max_windows)])
-    _run(root, "test", test_args)
+    metadata = json.loads((experiment / "train_log.json").read_text(encoding="utf-8"))
+    merged_test = metadata.get("supervision_policy", {}).get("train_on_test", False)
+    if not (args.train_on_test or merged_test):
+        _run(root, "test", test_args)
     predict_args = [str(checkpoint), "--config", str(args.predict_config.resolve())]
     if args.device is not None:
         predict_args.extend(["--device", args.device])

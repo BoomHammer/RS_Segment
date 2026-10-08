@@ -7,6 +7,35 @@ from data.sample_index import WindowedSampleDataset
 from data.spatial_split import SpatialSplitManifest
 
 
+def merge_test_into_train(manifest: SpatialSplitManifest) -> SpatialSplitManifest:
+    """Create an experiment view; never change the prepared split on disk."""
+    counts = Counter(manifest.class_counts.get("train", {}))
+    counts.update(manifest.class_counts.get("test", {}))
+    weights = {code: count**-0.5 for code, count in counts.items() if count > 0}
+    if weights:
+        mean = sum(weights.values()) / len(weights)
+        weights = {code: value / mean for code, value in weights.items()}
+    return replace(
+        manifest,
+        splits={
+            **manifest.splits,
+            "train": sorted(
+                set(manifest.splits.get("train", []))
+                | set(manifest.splits.get("test", []))
+            ),
+            "test": [],
+        },
+        blocks={
+            key: "train" if value == "test" else value
+            for key, value in manifest.blocks.items()
+        },
+        class_counts={**manifest.class_counts, "train": dict(counts), "test": {}},
+        class_weights=weights,
+        sampling_weights={},
+        class_coverage={},
+    )
+
+
 def training_class_weights(counts: dict[str, int], num_classes: int) -> list[float]:
     """Inverse-square-root weights with mean one over real training points.
 

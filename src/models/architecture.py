@@ -283,6 +283,10 @@ class SegFormerUtae(nn.Module):
 
     @classmethod
     def from_contract(cls, contract: dict[str, Any]) -> SegFormerUtae:
+        if contract.get("architecture") in {"utae", "segformer"}:
+            from models.single_encoder import SingleEncoder
+
+            return SingleEncoder(contract)
         if contract.get("architecture") == "anysat":
             from models.anysat import AnySatSegmentation
 

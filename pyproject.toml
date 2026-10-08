@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "rs-segment"
 version = "0.1.0"
 description = "Weakly supervised continental-scale remote-sensing vegetation segmentation"
-readme = "DEVELOPMENT.md"
+readme = "README.md"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "numpy>=2.1",
