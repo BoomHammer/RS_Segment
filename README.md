@@ -8,7 +8,7 @@
 
 - Python `>=3.11,<3.14`
 - 包管理器：uv
-- GPU 环境：PyTorch CUDA 12.4；主要面向单张 RTX 4090（24 GB）
+- GPU 环境：PyTorch CUDA 12.4；主要面向单张 RTX 3090，自动切换多卡运行
 - 代码格式化与检查：Ruff
 
 在项目根目录安装依赖：
@@ -57,6 +57,16 @@ uv run rs-pipeline
 
 依次执行：预处理与栅格统计 → PointSAM 伪标签生成 → 样本索引与空间划分 → 训练 → 测试 → 全图预测。
 
+### 伪标签生成断点续跑
+
+PointSAM 生成中断后，使用原预处理目录恢复，跳过已完成的样点：
+
+```powershell
+uv run python scripts/weak_label.py --data-config configs/data.yaml --config configs/weak_label.yaml --resume data/processed/<数据集时间戳>
+```
+
+恢复时需保持目标网格、输入影像、标签和弱标签配置不变；如果原任务使用自定义配置路径，继续使用原路径。多卡任务还需保持与中断前相同的可见 GPU 数量。此命令只恢复伪标签生成，完成后可继续执行上述数据集构建、训练、测试和预测步骤。
+
 ### 复用已有数据集
 
 ```powershell
@@ -98,7 +108,7 @@ uv run python scripts/test.py experiments/<实验时间戳>/model_<实验时间�
 uv run python scripts/predict.py experiments/<实验时间戳>/model_<实验时间戳>.pt --config configs/predict.yaml
 ```
 
-PointSAM 中断后，可用 `uv run python scripts/weak_label.py --resume data/processed/<数据集时间戳>` 恢复；需保持原数据、配置和可见 GPU 数量。各脚本的其他选项通过 `--help` 查看。
+各脚本的其他选项通过 `--help` 查看。
 
 ## 输出与预测
 
