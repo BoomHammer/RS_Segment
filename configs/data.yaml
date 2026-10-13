@@ -32,9 +32,9 @@ data:
     # partial：只监督已知层级；只允许末尾为空，禁止跨级缺失，不推测未知子类。
     # error：缺失即报错；skip：跳过。所有父类必须有至少一条已知完整类别路径。
     missing_policy: partial
-    # 完整三级类的唯一坐标样本少于该值时，不建立独立细类；样本合并为二级类。
-    # Desert/Desert/Bare_Soil 会编码为 Desert/Desert/Desert，保留上级类别。
-    min_samples_per_fine_class: 10
+    # 完整三级类的唯一坐标样本少于该值时，不建立独立细类；样本合并为二级类。# 完整三级类的唯一坐标样本少于该值时，不建立独立细类；样本合并为二级类。
+    # Desert/Desert/Bare_Soil 会编码为 Desert/Desert/Desert，保留上级类别。
+    min_samples_per_fine_class: 10
     # 内部字段名到 CSV 列名的映射。
     columns:
       index: 编号
@@ -141,7 +141,7 @@ data:
       # 调小：可分配块更多，比例和类别平衡更灵活，但不同划分可能距离更近，空间相关泄漏风险更高。
       # 修改后必须重新生成 spatial_split.json；已有划分文件不会随配置自动改变。
       block_size: [256, 256]
-      ratios: [0.6, 0.2, 0.2]
+      ratios: [0.7, 0.15, 0.15]
       # Rare classes stay in training if there are too few points or spatial blocks.
       # Ratios are soft targets; see class_coverage in spatial_split.json.
       min_class_points_per_split: 2

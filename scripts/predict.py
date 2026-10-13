@@ -178,14 +178,18 @@ def predict(
     write_row_block: int = 512,
     distributed: DistributedContext | None = None,
 ) -> tuple[Path, Path]:
-    """Predict the target grid while keeping raster/model tensors bounded."""
+    """Write classes, default confidence sidecar and mapping with bounded memory."""
 
     checkpoint_path = Path(checkpoint).resolve()
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"模型权重不存在: {checkpoint_path}")
     output_path = Path(output).resolve()
+    confidence_path = output_path.with_name(f"{output_path.stem}_confidence.tif")
     mapping_path = Path(mapping_output).resolve()
-    if (output_path.exists() or mapping_path.exists()) and not overwrite:
+    output_paths = (output_path, confidence_path, mapping_path)
+    if len(set(output_paths)) != len(output_paths):
+        raise ValueError("分类图、Confidence 图和类别表的输出路径必须不同")
+    if any(path.exists() for path in output_paths) and not overwrite:
         raise FileExistsError("输出已存在；如需覆盖请指定 --overwrite")
     if (
         window_size[0] < 2
@@ -398,7 +402,17 @@ def predict(
             "predictor": output_predictor,
             "BIGTIFF": output_bigtiff,
         }
-        with rasterio.open(output_path, "w", **profile) as destination:
+        confidence_profile = {**profile, "dtype": "float32", "nodata": -9999.0}
+        with (
+            rasterio.open(output_path, "w", **profile) as destination,
+            rasterio.open(confidence_path, "w", **confidence_profile) as confidence_dst,
+        ):
+            confidence_dst.set_band_description(1, "Confidence")
+            confidence_dst.update_tags(
+                definition="Gaussian-blended model probability of the output class",
+                valid_range="0,1",
+                ground_truth_override="Model probability of the overridden class",
+            )
             for row in range(0, grid.height, write_row_block):
                 end = min(row + write_row_block, grid.height)
                 denominator = np.zeros((end - row, grid.width), dtype=np.float32)
@@ -410,6 +424,7 @@ def predict(
                     dtype=np.int32,
                 )
                 valid = denominator > 0
+                confidence = np.full(result.shape, -9999.0, dtype=np.float32)
                 if valid.any():
                     best_class = np.zeros(result.shape, dtype=np.int32)
                     best_score = np.full(result.shape, -np.inf, dtype=np.float32)
@@ -421,14 +436,30 @@ def predict(
                         best_score[better] = class_score[better]
                         best_class[better] = class_index + 1
                     result[valid] = best_class[valid]
+                    confidence[valid] = best_score[valid] / denominator[valid]
                 if override_ground_truth:
                     for pixel_row in range(row, end):
                         for column, code in ground_truth_by_row.get(
                             pixel_row, {}
                         ).items():
                             result[pixel_row - row, column] = code
+                            local_row = pixel_row - row
+                            if valid[local_row, column] and 1 <= code <= classes:
+                                confidence[local_row, column] = (
+                                    sum(
+                                        float(shard[code - 1, pixel_row, column])
+                                        for shard in score_shards
+                                    )
+                                    / denominator[local_row, column]
+                                )
+                            else:
+                                confidence[local_row, column] = -9999.0
+                np.clip(confidence, 0, 1, out=confidence, where=confidence != -9999.0)
                 destination.write(
                     result, 1, window=Window(0, row, grid.width, end - row)
+                )
+                confidence_dst.write(
+                    confidence, 1, window=Window(0, row, grid.width, end - row)
                 )
         _write_mapping(mapping, mapping_path)
         for shard in [*score_shards, *weight_shards]:
@@ -529,6 +560,7 @@ def main(argv: list[str] | None = None) -> int:
         distributed=distributed,
     )
     if distributed.is_main:
+        print(f"Confidence 图: {output.with_name(f'{output.stem}_confidence.tif')}")
         print(f"植被图: {output}")
         print(f"类别对照表: {mapping}")
     return 0

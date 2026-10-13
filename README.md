@@ -124,6 +124,8 @@ uv run python scripts/predict.py experiments/<实验时间戳>/model_<实验时�
 | `test_metrics.json` | 测试指标；跳过测试时不生成 |
 | `vegetation_*.tif`、`vegetation_*.csv` | 植被分类 GeoTIFF 与类别映射表 |
 
+每次预测还会默认输出同目录下的 `<分类图文件名去掉扩展名>_confidence.tif`，无需增加参数。该图为 Float32，数值范围 0–1，表示重叠窗口高斯加权融合后，模型对最终输出类别的概率；越高表示模型越有把握，并不等同于实际分类准确率。空间范围、分辨率和坐标系与分类图一致，无有效预测的位置为 NoData（-9999）。实测标签覆盖的位置使用模型对覆盖后类别的概率，不人为设为 1。Confidence 图也遵循现有的 `overwrite` 设置。
+
 预测沿用训练记录中的窗口参数。当前 `configs/predict.yaml` 默认设置 `override_ground_truth: true`，会用实测标签覆盖输出图中的对应像元；如需保留纯模型预测，设为 `false`。该选项不改变训练或测试指标。默认禁止覆盖同名预测文件，重复出图需指定新输出路径或明确启用 `overwrite`。
 
 ## 开发检查
