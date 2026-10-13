@@ -10,7 +10,7 @@ data:
   static: ../data/raw/static
   processed: ../data/processed
   # 原始样点 CSV，包含坐标和中英文分类字段。
-  label_file: ../data/labels/YRBmerge20261003.csv
+  label_file: ../data/labels/YRBmerge20261012.csv
   # 输出 GeoTIFF 中表示未标注像元的值。
   output_nodata: -9999
   # 数据检查阶段必须存在的目录，相对 data.root 目录。
@@ -32,6 +32,9 @@ data:
     # partial：只监督已知层级；只允许末尾为空，禁止跨级缺失，不推测未知子类。
     # error：缺失即报错；skip：跳过。所有父类必须有至少一条已知完整类别路径。
     missing_policy: partial
+    # 完整三级类的唯一坐标样本少于该值时，不建立独立细类；样本合并为二级类。
+    # Desert/Desert/Bare_Soil 会编码为 Desert/Desert/Desert，保留上级类别。
+    min_samples_per_fine_class: 10
     # 内部字段名到 CSV 列名的映射。
     columns:
       index: 编号

@@ -58,6 +58,7 @@ model:
     focal_gamma: 2.0
     # 无效标签的忽略值。
     ignore_index: -1
+    weight_normalization: sample_mean
   artifacts:
     # 由阶段2 run 目录自动发现，不在此手工填写通道数或类别数。
     # 样本索引文件来源。

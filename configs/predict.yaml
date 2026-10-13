@@ -26,11 +26,11 @@ predict:
   # 批量推理参数。
   # 当前 predict.py 是单窗口串行推理，batch_size 目前仅作为目标配置记录。
   # 512 窗口和较长时间序列下，4090 建议先从 2 开始；显存充足时再增大。
-  batch_size: 2
+  batch_size: 8
 
   # 数据读取和预取参数。
   dataloader:
-    num_workers: 6
+    num_workers: 8
     pin_memory: true
     persistent_workers: true
     prefetch_factor: 2

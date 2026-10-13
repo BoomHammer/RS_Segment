@@ -178,6 +178,8 @@ def main(argv: list[str] | None = None) -> int:
         config.data.label_file,
         label_columns=config.data.label_columns,
         schema=config.data.label_schema,
+        label_crs=config.data.label_crs,
+        sample_grid=grid,
     )
     mapping = run_dir / "label_mapping.json"
     if args.resume is None and distributed.is_main:

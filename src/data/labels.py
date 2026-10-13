@@ -18,10 +18,12 @@ from data.label_hierarchy import (
     category_path,
     known_prefix,
     label_levels,
+    leaf_aliases,
     mapping_path,
     prefix_codes,
     validate_hierarchy,
 )
+from data.raster_alignment import TargetGrid, locate_points
 
 
 @dataclass(slots=True, frozen=True)
@@ -87,6 +89,42 @@ def _read_float(value: str, name: str) -> float:
     return result
 
 
+def _grid_fine_class_counts(
+    path: str | Path,
+    *,
+    label_columns: Mapping[str, Any],
+    label_crs: str,
+    grid: TargetGrid,
+    batch_size: int = 4096,
+) -> Counter[tuple[str, ...]]:
+    """Count unique in-grid ground-truth pixels for each complete leaf path."""
+    levels = label_levels(label_columns)
+    pixel_paths: dict[tuple[int, int], tuple[str, ...]] = {}
+    for batch in iter_label_rows(
+        path, label_columns=label_columns, batch_size=batch_size
+    ):
+        paths = []
+        points = []
+        for row in batch:
+            names = category_path(row, levels)
+            if not all(names):
+                continue
+            try:
+                point = (
+                    _read_float(row[_field(label_columns, "x", "X")], "X"),
+                    _read_float(row[_field(label_columns, "y", "Y")], "Y"),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            paths.append(names)
+            points.append(point)
+        locations = locate_points(points, point_crs=label_crs, grid=grid)
+        for names, location in zip(paths, locations, strict=True):
+            if location["inside"]:
+                pixel_paths[(location["row"], location["column"])] = names
+    return Counter(pixel_paths.values())
+
+
 def iter_label_rows(
     path: str | Path,
     *,
@@ -129,6 +167,8 @@ def build_label_mapping(
     *,
     label_columns: Mapping[str, Any],
     schema: Mapping[str, Any] | None = None,
+    label_crs: str = "EPSG:4326",
+    sample_grid: TargetGrid | None = None,
 ) -> dict[str, Any]:
     """Build stable path-based IDs for the configured classification levels."""
 
@@ -146,11 +186,27 @@ def build_label_mapping(
             label_columns["levels"] = schema["levels"]
         if "encoding" in schema:
             label_columns["encoding"] = schema["encoding"]
+        fine_class_counts = (
+            _grid_fine_class_counts(
+                path,
+                label_columns=label_columns,
+                label_crs=label_crs,
+                grid=sample_grid,
+            )
+            if sample_grid is not None
+            else None
+        )
         return build_hierarchy(
             iter_label_rows(path, label_columns=label_columns),
             label_levels(label_columns),
             int(schema.get("version", 2)),
             schema.get("missing_policy", label_columns.get("missing_policy", "error")),
+            int(schema.get("min_samples_per_fine_class", 1)),
+            (
+                _field(label_columns, "x", "X"),
+                _field(label_columns, "y", "Y"),
+            ),
+            fine_class_counts,
         )
     major_values: dict[str, tuple[str, str]] = {}
     pairs: dict[tuple[str, str], tuple[str, str]] = {}
@@ -271,6 +327,7 @@ def validate_labels(
         label_columns["levels"] = mapping["levels"]
     levels = label_levels(label_columns)
     classes = {mapping_path(item) for item in (mapping or {}).get("classes", [])}
+    aliases = leaf_aliases(mapping or {})
     partial = (mapping or {}).get(
         "missing_policy", label_columns.get("missing_policy")
     ) == "partial"
@@ -295,7 +352,7 @@ def validate_labels(
                         raise ValueError("类别为空")
                     names = known_prefix(names)
                     report.partial_rows += 1
-                if classes and names not in prefixes:
+                if classes and names not in prefixes and names not in aliases:
                     report.unknown_categories += 1
                     raise ValueError("类别不在标签映射中")
                 key = (round(x, 9), round(y, 9))
@@ -343,6 +400,7 @@ def iter_encoded_labels(
         label_columns["levels"] = mapping["levels"]
     levels = label_levels(label_columns)
     lookup = {mapping_path(item): item for item in mapping.get("classes", [])}
+    aliases = leaf_aliases(mapping)
     prefixes = prefix_codes(mapping)
     for batch in iter_label_rows(
         path, label_columns=label_columns, batch_size=batch_size
@@ -354,7 +412,7 @@ def iter_encoded_labels(
                 if not all(names) and mapping.get("missing_policy", "error") == "skip":
                     continue
                 major, minor = names[0], names[-1]
-                item = lookup.get(names)
+                item = lookup.get(aliases.get(names, names))
                 if not all(names) and mapping.get("missing_policy") == "partial":
                     prefix = known_prefix(names)
                     if prefix not in prefixes:
@@ -401,6 +459,7 @@ def write_label_artifacts(
     output_nodata: int = -9999,
     mapping_file: str | Path | None = None,
     validation_report: str | Path | None = None,
+    sample_grid: TargetGrid | None = None,
 ) -> tuple[Path, Path]:
     """Create the stable mapping and validation JSON artifacts."""
 
@@ -410,7 +469,13 @@ def write_label_artifacts(
     for key in ("levels", "encoding", "missing_policy"):
         if key in (schema or {}):
             label_columns[key] = schema[key]
-    mapping = build_label_mapping(path, label_columns=label_columns, schema=schema)
+    mapping = build_label_mapping(
+        path,
+        label_columns=label_columns,
+        schema=schema,
+        label_crs=label_crs,
+        sample_grid=sample_grid,
+    )
     mapping_validation = validate_label_mapping(mapping)
     report = validate_labels(
         path,

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 import torch
+from pyproj import CRS
+from rasterio.transform import from_origin
 
 from config import DataConfig
 from data.labels import (
@@ -17,6 +19,7 @@ from data.labels import (
     validate_labels,
     write_label_artifacts,
 )
+from data.raster_alignment import TargetGrid
 from losses.supervision import combined_supervision_loss
 from models.architecture import HierarchicalHeads, SegFormerUtae
 from models.config import derive_model_contract, validate_checkpoint_mapping
@@ -139,6 +142,96 @@ def test_missing_levels_require_explicit_skip_and_are_reported(tmp_path):
         )
         == 3
     )
+
+
+def test_rare_fine_classes_are_promoted_to_parent_category(tmp_path):
+    levels = [{"name": f"L{i}", "column": f"L{i}"} for i in range(3)]
+    columns = {"x": "lon", "y": "lat", "levels": levels}
+    path = tmp_path / "labels.csv"
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["lon", "lat", "L0", "L1", "L2"])
+        writer.writerows(
+            [
+                (10, 20, "A", "a", "rare_x"),
+                (10, 20, "A", "a", "rare_x"),
+                (11, 20, "A", "a", "rare_y"),
+                (12, 20, "A", "a", "common"),
+                (13, 20, "A", "a", "common"),
+                (14, 20, "A", "a", "common"),
+                (15, 20, "B", "b", "only_rare"),
+            ]
+        )
+    mapping = build_label_mapping(
+        path,
+        label_columns=columns,
+        schema={
+            "levels": levels,
+            "min_samples_per_fine_class": 3,
+        },
+    )
+    assert mapping["level_counts"] == [2, 2, 3]
+    assert [item["level_names"] for item in mapping["classes"]] == [
+        ["A", "a", "a"],
+        ["A", "a", "common"],
+        ["B", "b", "b"],
+    ]
+    assert len(mapping["promoted_fine_classes"]) == 3
+    assert mapping["promoted_fine_classes"][0]["ground_truth_samples"] == 1
+    assert validate_label_mapping(mapping)["promoted_fine_class_count"] == 3
+    records = [
+        record
+        for batch in iter_encoded_labels(path, label_columns=columns, mapping=mapping)
+        for record in batch
+    ]
+    assert records[0].level_codes == records[1].level_codes == (1, 1, 1)
+    assert records[2].level_codes == (1, 1, 1)
+    assert records[3].level_codes == records[4].level_codes == (1, 1, 2)
+    assert records[-1].level_codes == (2, 2, 3)
+    assert (
+        validate_labels(path, label_columns=columns, mapping=mapping).invalid_rows == 0
+    )
+
+
+def test_single_level_taxonomy_rejects_fine_class_promotion(tmp_path):
+    path, columns = _csv(tmp_path, 1)
+    with pytest.raises(ValueError, match="单层分类无法"):
+        build_label_mapping(
+            path,
+            label_columns=columns,
+            schema={
+                "levels": columns["levels"],
+                "min_samples_per_fine_class": 10,
+            },
+        )
+
+
+def test_fine_class_threshold_counts_unique_target_grid_pixels(tmp_path):
+    levels = [{"name": f"L{i}", "column": f"L{i}"} for i in range(3)]
+    columns = {"x": "lon", "y": "lat", "levels": levels}
+    path = tmp_path / "labels.csv"
+    path.write_text(
+        "lon,lat,L0,L1,L2\n"
+        "0.1,3.9,A,a,rare\n"
+        "0.2,3.8,A,a,rare\n"
+        "1.1,3.9,A,a,common\n"
+        "2.1,3.9,A,a,common\n",
+        encoding="utf-8",
+    )
+    mapping = build_label_mapping(
+        path,
+        label_columns=columns,
+        schema={
+            "levels": levels,
+            "min_samples_per_fine_class": 2,
+        },
+        sample_grid=TargetGrid(CRS.from_epsg(4326), from_origin(0, 4, 1, 1), 4, 4),
+    )
+    assert [item["level_names"] for item in mapping["classes"]] == [
+        ["A", "a", "a"],
+        ["A", "a", "common"],
+    ]
+    assert mapping["promoted_fine_classes"][0]["ground_truth_samples"] == 1
 
 
 def test_non_utf8_schema_propagates_to_artifact_validation(tmp_path):

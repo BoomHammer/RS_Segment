@@ -8,6 +8,8 @@ from pathlib import Path
 
 from config import load_config
 from data.labels import write_label_artifacts
+from data.raster_alignment import grid_from_config
+from preprocessing import _first_raster
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -16,6 +18,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = load_config(args.config)
     data = config.data
+    target_config = data.target_grid
+    reference = target_config.get("reference_raster") or _first_raster(
+        data.dynamic, data.static
+    )
+    sample_grid = grid_from_config(target_config, reference)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = data.processed / timestamp
     mapping, report = write_label_artifacts(
@@ -27,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         output_nodata=data.output_nodata,
         mapping_file=run_dir / f"label_mapping_{timestamp}.json",
         validation_report=run_dir / f"label_validation_{timestamp}.json",
+        sample_grid=sample_grid,
     )
     print(f"映射: {mapping}")
     print(f"报告: {report}")

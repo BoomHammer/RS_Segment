@@ -1,8 +1,5 @@
 # 主训练配置。数据路径和数据集结构由 data.yaml 管理，模型结构由 model.yaml 管理。
 training:
-  # 性能诊断：前 N 个训练 batch 分 rank 输出 JSONL；0 关闭。
-  # 可用环境变量 RS_PROFILE_STEPS 覆盖；开启时 CUDA 同步计时会影响吞吐。
-  profile_steps: 0
   # 训练轮数。
   epochs: 30
   # auto：4090 等支持原生 BF16 的显卡使用 BF16；2070 等使用 FP16 + 梯度缩放。
@@ -16,15 +13,15 @@ training:
     # 是否在验证损失长期不下降时提前结束训练。
     enabled: true
     # 早停监控指标名称。
-    monitor: val_loss
+    monitor: val_macro_f1
     # 连续多少轮没有改善后停止。
     patience: 5
     # 认为有效改善所需的最小损失下降量。
-    min_delta: 0.0001
+    min_delta: 0.001
 
 dataloader:
   # 训练/验证每个 batch 包含的窗口数量。增大可提高 GPU 吞吐，但会增加显存占用。
-  batch_size: 2
+  batch_size: 8
   # 验证没有反向传播；即使训练因 halo 降为单窗口，验证仍可按此批量前向。
   # 8GB 显卡上验证也会产生整套前向激活，必须使用单窗口批次。
   validation_batch_size: 1
@@ -32,7 +29,7 @@ dataloader:
   validation_num_workers: 2
   # 数据加载子进程数量。大于 0 时可并行读取和预处理 GeoTIFF，减少 GPU 等待。
   # 建议从 2~4 开始测试；过大可能造成磁盘争用和内存占用增加。
-  num_workers: 6
+  num_workers: 8
   # 将 batch 复制到页锁定内存，配合 non_blocking=True 加快 CPU 到 GPU 的传输。
   pin_memory: true
   # 保留 worker 进程，避免每个 epoch 重复创建进程；仅在 num_workers > 0 时有效。
@@ -56,6 +53,7 @@ supervision_policy:
   # 每轮让训练划分中的全部独立真实点各作为锚点一次，并按类别交错排序；
   # 每个锚点随机选择一个覆盖窗口，训练伪标签也只保留训练块内像元。
   class_balanced_point_sampling: true
+  class_weighting: train_inverse_sqrt
 
 optimizer:
   # 优化器名称；当前训练入口使用 AdamW。

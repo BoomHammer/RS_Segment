@@ -1,5 +1,6 @@
 """CSV hierarchy definitions and stable path-based categorical identifiers."""
 
+from collections import Counter
 from collections.abc import Mapping
 from typing import Any
 
@@ -64,10 +65,32 @@ def prefix_codes(mapping):
     return result
 
 
-def build_hierarchy(rows, levels, version=2, missing_policy="error"):
+def leaf_aliases(mapping):
+    """Return original rare leaf paths mapped to their promoted parent leaves."""
+    return {
+        tuple(item["source_level_names"]): tuple(item["target_level_names"])
+        for item in mapping.get("promoted_fine_classes", [])
+    }
+
+
+def build_hierarchy(
+    rows,
+    levels,
+    version=2,
+    missing_policy="error",
+    min_samples_per_fine_class=1,
+    sample_columns=None,
+    fine_class_counts=None,
+):
     if missing_policy not in {"error", "skip", "partial"}:
         raise ValueError("missing_policy 必须为 error、skip 或 partial")
+    if type(min_samples_per_fine_class) is not int or min_samples_per_fine_class < 1:
+        raise ValueError("min_samples_per_fine_class 必须是正整数")
+    if min_samples_per_fine_class > 1 and len(levels) < 2:
+        raise ValueError("单层分类无法将低频细类并入更高一级")
     paths = {}
+    path_counts = Counter()
+    path_samples = {}
     partial_paths = set()
     row_number = 1
     for batch in rows:
@@ -85,17 +108,41 @@ def build_hierarchy(rows, levels, version=2, missing_policy="error"):
                 (row.get(level.get("zh_column", "")) or "").strip() for level in levels
             )
             paths.setdefault(path, localized)
+            if sample_columns is None:
+                path_counts[path] += 1
+            else:
+                sample = tuple(
+                    str(row.get(column, "")).strip() for column in sample_columns
+                )
+                if all(sample):
+                    path_samples.setdefault(path, set()).add(sample)
     if not paths:
         raise ValueError("标签 CSV 没有完整类别路径，无法确定最终类别体系")
+    if sample_columns is not None:
+        path_counts.update({path: len(path_samples.get(path, set())) for path in paths})
+    if fine_class_counts is not None:
+        for path in paths:
+            path_counts[path] = int(fine_class_counts.get(path, 0))
     for prefix in partial_paths:
         if not any(path[: len(prefix)] == prefix for path in paths):
             raise ValueError(
                 f"部分标签 {prefix} 没有已知完整类别路径；请先补充类别体系样本"
             )
+    promoted = {}
+    effective_paths = {}
+    for path, localized in paths.items():
+        target = path
+        target_localized = localized
+        if path_counts[path] < min_samples_per_fine_class:
+            target = (*path[:-1], path[-2])
+            parent_localized = localized[-2] or path[-2]
+            target_localized = (*localized[:-1], parent_localized)
+            promoted[path] = target
+        effective_paths.setdefault(target, target_localized)
     identifiers = [
         {
             path: index + 1
-            for index, path in enumerate(sorted({p[:depth] for p in paths}))
+            for index, path in enumerate(sorted({p[:depth] for p in effective_paths}))
         }
         for depth in range(1, len(levels) + 1)
     ]
@@ -104,7 +151,7 @@ def build_hierarchy(rows, levels, version=2, missing_policy="error"):
         for depth in range(1, len(levels))
     ]
     classes = []
-    for path in sorted(paths):
+    for path in sorted(effective_paths):
         codes = [ids[path[:depth]] for depth, ids in enumerate(identifiers, 1)]
         classes.append(
             {
@@ -112,16 +159,25 @@ def build_hierarchy(rows, levels, version=2, missing_policy="error"):
                 "alliance_code": codes[-1],
                 "formation": path[0],
                 "alliance": path[-1],
-                "formation_zh": paths[path][0],
-                "alliance_zh": paths[path][-1],
+                "formation_zh": effective_paths[path][0],
+                "alliance_zh": effective_paths[path][-1],
                 "level_codes": codes,
                 "level_names": list(path),
-                "level_names_zh": list(paths[path]),
+                "level_names_zh": list(effective_paths[path]),
             }
         )
     return {
         "version": version,
         "missing_policy": missing_policy,
+        "min_samples_per_fine_class": min_samples_per_fine_class,
+        "promoted_fine_classes": [
+            {
+                "source_level_names": list(source),
+                "target_level_names": list(target),
+                "ground_truth_samples": path_counts[source],
+            }
+            for source, target in sorted(promoted.items())
+        ],
         "levels": levels,
         "level_counts": [len(ids) for ids in identifiers],
         "level_parents": parents,
@@ -161,10 +217,22 @@ def validate_hierarchy(mapping):
         ):
             if item.get(key) != canonical[key]:
                 raise ValueError(f"标签映射 {key} 与层级路径不一致")
+    canonical_paths = {mapping_path(item) for item in classes}
+    for source, target in leaf_aliases(mapping).items():
+        if (
+            len(source) != len(levels)
+            or len(target) != len(levels)
+            or target not in canonical_paths
+            or target[:-1] != source[:-1]
+            or target[-1] != source[-2]
+        ):
+            raise ValueError("promoted_fine_classes 包含无效的细类上移映射")
     return {
         "valid": True,
         "major_count": mapping["major_count"],
         "minor_count": mapping["minor_count"],
+        "min_samples_per_fine_class": int(mapping.get("min_samples_per_fine_class", 1)),
+        "promoted_fine_class_count": len(mapping.get("promoted_fine_classes", [])),
         "alliance_to_formation": {
             str(c["alliance_code"]): c["formation_code"] for c in classes
         },
