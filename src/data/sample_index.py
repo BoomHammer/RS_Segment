@@ -400,6 +400,7 @@ class WindowedSampleDataset(GeoDataset):
         self._label_columns = label_columns or {}
         self._ground_truth: dict[tuple[int, int], int] = {}
         self._ground_truth_levels: dict[tuple[int, int], tuple[int, ...]] = {}
+        self._mixed_observations: dict[tuple[int, int], list[tuple[int, ...]]] = {}
         self._label_depth = len((label_mapping or {}).get("levels", [])) or 2
         self._load_ground_truth(label_mapping)
         self._configure_stage2(stage2_config)
@@ -531,22 +532,26 @@ class WindowedSampleDataset(GeoDataset):
             point_crs=source.get("crs", "EPSG:4326"),
             grid=self.grid,
         )
+        observations = {}
         for item, record in zip(locations, records, strict=True):
             if not item["inside"]:
                 continue
             pixel = (item["row"], item["column"])
             codes = record.level_codes or (record.formation_code, record.alliance_code)
-            previous = self._ground_truth_levels.get(pixel)
-            if previous is not None:
-                # A less detailed observation must not erase an existing leaf.
-                if all(
-                    a == b or a < 1 or b < 1
-                    for a, b in zip(previous, codes, strict=True)
-                ):
-                    codes = tuple(
-                        max(a, b) for a, b in zip(previous, codes, strict=True)
-                    )
-            self._ground_truth_levels[pixel] = codes
+            # Exact repeats do not increase evidence. Distinct coordinates in
+            # one target pixel, and different classes at one coordinate, survive.
+            observations.setdefault(pixel, {})[(record.x, record.y, codes)] = codes
+        for pixel, records_at_pixel in observations.items():
+            observed = sorted(records_at_pixel.values())
+            choices = [
+                {codes[depth] for codes in observed if codes[depth] > 0}
+                for depth in range(self._label_depth)
+            ]
+            self._ground_truth_levels[pixel] = tuple(
+                next(iter(values)) if len(values) == 1 else -1 for values in choices
+            )
+            if any(len(values) > 1 for values in choices):
+                self._mixed_observations[pixel] = observed
         self._ground_truth = {
             pixel: codes[-1]
             for pixel, codes in self._ground_truth_levels.items()
@@ -770,6 +775,7 @@ class WindowedSampleDataset(GeoDataset):
             for pixel, code in self._ground_truth.items()
         }
         observations.update(self._ground_truth_levels)
+        mixed_observations = []
         for (row, column), codes in observations.items():
             if (
                 selected_ground_truth is not None
@@ -785,6 +791,11 @@ class WindowedSampleDataset(GeoDataset):
             if 0 <= local_row < shape[0] and 0 <= local_column < shape[1]:
                 ground_truth[local_row, local_column] = codes[-1]
                 ground_truth_levels[:, local_row, local_column] = codes
+                for observation in self._mixed_observations.get((row, column), []):
+                    mixed_observations.append((local_row, local_column, *observation))
+                if (row, column) in self._mixed_observations:
+                    # A single hard pseudo-label cannot replace measured mixtures.
+                    weak[local_row, local_column] = -1
         boundary_clipped = (
             int(window.width) != self.window_size[0]
             or int(window.height) != self.window_size[1]
@@ -808,6 +819,9 @@ class WindowedSampleDataset(GeoDataset):
             "ground_truth": torch.from_numpy(ground_truth),
             "ground_truth_mask": torch.from_numpy(ground_truth >= 0),
             "ground_truth_levels": torch.from_numpy(ground_truth_levels),
+            "ground_truth_observations": torch.tensor(
+                mixed_observations, dtype=torch.long
+            ).reshape(-1, self._label_depth + 2),
             "weak_label": torch.from_numpy(weak),
             "weak_label_mask": torch.from_numpy(weak >= 0),
             "crs": self.grid.crs,
@@ -837,7 +851,11 @@ class WindowedSampleDataset(GeoDataset):
     def ground_truth_pixels(self) -> dict[tuple[int, int], int]:
         """Return target-grid point labels used to build split statistics."""
 
-        return dict(self._ground_truth)
+        return {
+            pixel: code
+            for pixel, code in self._ground_truth.items()
+            if pixel not in self._mixed_observations
+        }
 
     @property
     def supervision_pixels(self) -> dict[tuple[int, int], int]:
@@ -847,7 +865,7 @@ class WindowedSampleDataset(GeoDataset):
             if codes[-1] > 0:
                 continue
             depth = sum(code > 0 for code in codes)
-            result[pixel] = -((depth << 32) + codes[depth - 1])
+            result[pixel] = -((depth << 32) + codes[depth - 1]) if depth else -(1 << 60)
         return result
 
     def query_windows_for_pixel(self, row: int, column: int) -> list[int]:
@@ -855,6 +873,22 @@ class WindowedSampleDataset(GeoDataset):
 
         point = self.grid.transform * (column + 0.5, row + 0.5)
         return np.flatnonzero(self.index.intersects(Point(point))).tolist()
+
+    @property
+    def supervision_memberships(self):
+        """Keep mixed-pixel class memberships for split and weighting audits."""
+        result = {pixel: (code,) for pixel, code in self.supervision_pixels.items()}
+        for pixel, observations in self._mixed_observations.items():
+            codes = set()
+            for observation in observations:
+                depth = sum(code > 0 for code in observation)
+                codes.add(
+                    observation[-1]
+                    if observation[-1] > 0
+                    else -((depth << 32) + observation[depth - 1])
+                )
+            result[pixel] = tuple(sorted(codes))
+        return result
 
     def __len__(self) -> int:
         return len(self.index)
@@ -921,6 +955,28 @@ def sample_collate_fn(
         "ground_truth": torch.stack([sample["ground_truth"] for sample in samples]),
         "ground_truth_mask": torch.stack(
             [sample["ground_truth_mask"] for sample in samples]
+        ),
+        **(
+            {
+                "ground_truth_observations": torch.cat(
+                    [
+                        torch.cat(
+                            (
+                                torch.full(
+                                    (len(sample["ground_truth_observations"]), 1),
+                                    i,
+                                    dtype=torch.long,
+                                ),
+                                sample["ground_truth_observations"],
+                            ),
+                            dim=1,
+                        )
+                        for i, sample in enumerate(samples)
+                    ]
+                )
+            }
+            if all("ground_truth_observations" in sample for sample in samples)
+            else {}
         ),
         **(
             {

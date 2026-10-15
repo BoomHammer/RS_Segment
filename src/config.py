@@ -46,6 +46,12 @@ class DataConfig:
             label_levels(columns)
         columns["encoding"] = self.label_schema.get("encoding", "utf-8-sig")
         columns["missing_policy"] = self.label_schema.get("missing_policy", "error")
+        columns["optional_leaf_level"] = self.label_schema.get(
+            "optional_leaf_level", False
+        )
+        columns["min_samples_per_fine_class"] = self.label_schema.get(
+            "min_samples_per_fine_class", 1
+        )
         if columns["missing_policy"] not in {"error", "skip", "partial"}:
             raise ValueError(
                 "label_schema.missing_policy 必须为 error、skip 或 partial"

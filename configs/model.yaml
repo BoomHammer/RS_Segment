@@ -50,6 +50,8 @@ model:
     # 仅作为计算哨兵值；有效性由数据批次中的 mask 决定。
     invalid_fill_value: 0.0
   supervision:
+    # 从一级到四级的监督权重；三级叶类不重复参加四级监督。
+    level_weights: [1.0, 0.5, 0.25, 0.1]
     # 地面实测标签损失权重。
     ground_truth_weight: 1.0
     # 伪标签损失权重；仅用于训练。
@@ -58,7 +60,7 @@ model:
     focal_gamma: 2.0
     # 无效标签的忽略值。
     ignore_index: -1
-    weight_normalization: sample_mean
+    weight_normalization: weighted_mean
   artifacts:
     # 由阶段2 run 目录自动发现，不在此手工填写通道数或类别数。
     # 样本索引文件来源。

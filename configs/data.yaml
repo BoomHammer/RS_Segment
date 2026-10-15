@@ -10,7 +10,7 @@ data:
   static: ../data/raw/static
   processed: ../data/processed
   # 原始样点 CSV，包含坐标和中英文分类字段。
-  label_file: ../data/labels/YRBmerge20261012.csv
+  label_file: ../data/labels/YRBmerge20261016.csv
   # 输出 GeoTIFF 中表示未标注像元的值。
   output_nodata: -9999
   # 数据检查阶段必须存在的目录，相对 data.root 目录。
@@ -26,21 +26,22 @@ data:
   label_crs: EPSG:4490
   label_schema:
     # 标签契约版本，便于后续变更字段时兼容旧数据。
-    version: 2
-    # 当前 CSV 为 GBK 兼容编码；UTF-8 文件可设为 utf-8-sig。
-    encoding: UTF-8
+    version: 3
+    # 兼容带 BOM 的 UTF-8 CSV。
+    encoding: utf-8-sig
     # partial：只监督已知层级；只允许末尾为空，禁止跨级缺失，不推测未知子类。
-    # error：缺失即报错；skip：跳过。所有父类必须有至少一条已知完整类别路径。
+    # error：缺失即报错；skip：跳过。可选四级模式允许整条分支终止在上级。
     missing_policy: partial
-    # 完整三级类的唯一坐标样本少于该值时，不建立独立细类；样本合并为二级类。# 完整三级类的唯一坐标样本少于该值时，不建立独立细类；样本合并为二级类。
-    # Desert/Desert/Bare_Soil 会编码为 Desert/Desert/Desert，保留上级类别。
+    # 没有四级细分的类停在三级；已细分分支的空四级归为“其它+三级类名”。
+    optional_leaf_level: true
+    # 按类别的独立坐标计数：四级不足阈值归“其它”；三级/二级不足则逐级并入上级。
     min_samples_per_fine_class: 10
     # 内部字段名到 CSV 列名的映射。
     columns:
       index: 编号
       x: X
       y: Y
-    # 从粗到细列出 1～3 层；列表长度决定层数，最后一层为最终输出类别。
+    # 从粗到细列出 1～4 层；可选四级模式输出三级/四级混合叶类。
     # 一层示例：只保留一级类；两层示例：保留一级类和二级类。
     # 也可只用三级类做单层分类：仅保留下方三级类条目。
     # name 为图例/评估中的层名，column 为 CSV 列名，zh_column 可选。
@@ -56,6 +57,9 @@ data:
       - name: 三级类
         column: Third_Cata
         zh_column: 三级类
+      - name: 四级类
+        column: Fourth_Cata
+        zh_column: 四级类
     # 自动编码类别时使用的起始整数编号。
     first_id: 1
 

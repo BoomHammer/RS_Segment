@@ -50,7 +50,7 @@ from distributed_runtime import (
 from evaluation import (
     collect_point_predictions,
     merge_point_prediction_shards,
-    point_metrics,
+    summarize_point_predictions,
 )
 from evaluation import (
     evaluate_points as _evaluate,
@@ -169,7 +169,9 @@ def _source_supervision_loss(
     return fine if coarse is None else fine + coarse
 
 
-def _distributed_evaluate(model, loader, device, amp_dtype, context):
+def _distributed_evaluate(
+    model, loader, device, amp_dtype, context, *, selection_level=None, leaf_depths=None
+):
     """Evaluate disjoint window shards and restore global unique-point metrics."""
 
     raw_predictions = {}
@@ -180,23 +182,16 @@ def _distributed_evaluate(model, loader, device, amp_dtype, context):
         amp_dtype,
         raw_predictions=raw_predictions,
         show_progress=context.is_main,
+        leaf_depths=leaf_depths,
     )
     gathered = gather_objects(raw_predictions, context)
     report = None
     if context.is_main:
-        (targets, probabilities, _, occurrences), levels = (
-            merge_point_prediction_shards(gathered)
+        mixed = {}
+        leaf, levels = merge_point_prediction_shards(gathered, mixed_predictions=mixed)
+        report = summarize_point_predictions(
+            leaf, levels, selection_level=selection_level, mixed_predictions=mixed
         )
-        selected_level = "leaf"
-        if not targets.numel():
-            selected_level = max(levels)
-            targets, probabilities, _, occurrences = levels[selected_level]
-        report = point_metrics(targets, probabilities, occurrences)
-        report["selection_level"] = selected_level
-        report["levels"] = {
-            str(level): point_metrics(values[0], values[1], values[3])
-            for level, values in levels.items()
-        }
     return broadcast_object(report, context)
 
 
@@ -896,6 +891,15 @@ def main(argv: list[str] | None = None) -> int:
                         tensor_batch["valid_mask"] & tensor_batch["core_mask"]
                     )
                 split_mask = tensor_batch.get("supervision_split_mask")
+                observations = tensor_batch.get("ground_truth_observations")
+                if (
+                    split_mask is not None
+                    and observations is not None
+                    and len(observations)
+                ):
+                    b, y, x = observations[:, :3].unbind(1)
+                    if (~split_mask[b, y, x]).any():
+                        raise AssertionError("混合像元监督越过了训练空间归属边界")
                 if split_mask is not None and (
                     (
                         tensor_batch.get(
@@ -919,6 +923,8 @@ def main(argv: list[str] | None = None) -> int:
                     focal_gamma=float(supervision.get("focal_gamma", 0.0)),
                     fine_to_coarse=derived["fine_to_coarse"],
                     level_parents=derived.get("level_parents"),
+                    level_weights=supervision.get("level_weights"),
+                    leaf_depths=derived.get("leaf_depths"),
                     class_weights=class_weights,
                     weight_normalization=str(
                         supervision.get("weight_normalization", "weighted_mean")
@@ -943,7 +949,11 @@ def main(argv: list[str] | None = None) -> int:
             observed_mask = observed_ground_truth.gt(0)
             if observed_mask.ndim == 4:
                 observed_mask = observed_mask.any(dim=1)
-            if (observed_mask & tensor_batch["valid_mask"]).any():
+            has_mixed = False
+            if observations is not None and len(observations):
+                b, y, x = observations[:, :3].unbind(1)
+                has_mixed = bool(tensor_batch["valid_mask"][b, y, x].any())
+            if (observed_mask & tensor_batch["valid_mask"]).any() or has_mixed:
                 source_loss = _source_supervision_loss(loss_components, "ground_truth")
                 if source_loss is not None:
                     ground_truth_loss_sum += float(source_loss.detach())
@@ -1087,10 +1097,17 @@ def main(argv: list[str] | None = None) -> int:
                 device,
                 amp_name,
                 distributed,
+                selection_level=training.get("selection_level"),
+                leaf_depths=derived.get("leaf_depths"),
             )
         else:
             validation = _evaluate(
-                raw_model, validation_loader, device, amp_dtype=amp_name
+                raw_model,
+                validation_loader,
+                device,
+                amp_dtype=amp_name,
+                selection_level=training.get("selection_level"),
+                leaf_depths=derived.get("leaf_depths"),
             )
         # Inference and training have different allocation patterns. Do not
         # carry unused validation allocations into the next training epoch.

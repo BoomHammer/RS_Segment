@@ -11,6 +11,7 @@ import numpy as np
 import rasterio
 from scripts.weak_label import _load_shard_outcomes
 
+from weak_label.conflicts import merge_candidate_window, open_candidate_sources
 from weak_label.generation import evaluate_label_quality_from_raster
 from weak_label.quality import write_label_quality_visualization
 
@@ -20,11 +21,18 @@ def recover(run: Path, ranks: int, conflict_margin: float) -> dict:
     shards = [
         {
             "labels": run / f".weak_labels.tif.rank{rank}",
-            "scores": run / f".weak_labels.tif.rank{rank}.scores.tif",
+            "candidate_labels": run / f".weak_labels.tif.rank{rank}.candidates.tif",
+            "candidate_scores": run / f".weak_labels.tif.rank{rank}.candidate_scores.tif",
             "outcomes": run / f".weak_labels.tif.rank{rank}.outcomes.json",
         }
         for rank in range(ranks)
     ]
+    if any(
+        not shard[key].is_file()
+        for shard in shards
+        for key in ("candidate_labels", "candidate_scores")
+    ):
+        raise ValueError("候选分片缺失；旧版单类别分片无法恢复冲突证据，请重新生成弱标签")
     outcomes = _load_shard_outcomes(shards)
     if not outcomes or any(item.get("status") == "pending" for item in outcomes):
         raise ValueError("Missing or unfinished sample outcomes")
@@ -33,45 +41,14 @@ def recover(run: Path, ranks: int, conflict_margin: float) -> dict:
     mismatch = 0
     with ExitStack() as stack:
         final = stack.enter_context(rasterio.open(run / "weak_labels.tif"))
-        sources = [
-            (
-                stack.enter_context(rasterio.open(shard["labels"])),
-                stack.enter_context(rasterio.open(shard["scores"])),
-            )
-            for shard in shards
-        ]
-        for pair in sources:
-            for source in pair:
-                if (source.shape, source.transform, source.crs, source.count) != (
-                    final.shape,
-                    final.transform,
-                    final.crs,
-                    1,
-                ):
-                    raise ValueError("Rank raster grid mismatch")
+        sources = open_candidate_sources(stack, shards, final)
         for _, window in final.block_windows(1):
             actual = final.read(1, window=window)
             if not set(np.unique(actual)) <= codes | {final.nodata}:
                 raise ValueError("Final raster has unknown class codes")
-            labels = np.full(actual.shape, final.nodata, dtype=np.int32)
-            scores = np.full(actual.shape, -np.inf, dtype=np.float32)
-            for label_source, score_source in sources:
-                candidate = label_source.read(1, window=window)
-                confidence = score_source.read(1, window=window)
-                selected = candidate > 0
-                if not np.isfinite(confidence).all():
-                    raise ValueError("Nonfinite rank scores")
-                better = selected & (confidence > scores + conflict_margin)
-                tied = (
-                    selected
-                    & np.isfinite(scores)
-                    & (labels != candidate)
-                    & (np.abs(confidence - scores) <= conflict_margin)
-                )
-                labels[better] = candidate[better]
-                scores[better] = confidence[better]
-                labels[tied] = final.nodata
-                scores[tied] = -np.inf
+            labels = merge_candidate_window(
+                sources, window, nodata=final.nodata, conflict_margin=conflict_margin
+            )
             mismatch += int(np.count_nonzero(actual != labels))
         if mismatch:
             raise ValueError(f"Final raster differs from rank merge: {mismatch} pixels")

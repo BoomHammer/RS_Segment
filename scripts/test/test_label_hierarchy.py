@@ -41,7 +41,7 @@ def _csv(tmp_path, depth):
     levels = [{"name": f"L{i}", "column": f"L{i}"} for i in range(depth)]
     columns = {"x": "lon", "y": "lat", "levels": levels}
     path = tmp_path / "labels.csv"
-    rows = [("A", "a", "same"), ("A", "b", "same"), ("B", "a", "other")]
+    rows = [("A", "a", "same", "x"), ("A", "b", "same", "y"), ("B", "a", "other", "z")]
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.writer(stream)
         writer.writerow(["lon", "lat", *[level["column"] for level in levels]])
@@ -50,7 +50,7 @@ def _csv(tmp_path, depth):
     return path, columns
 
 
-@pytest.mark.parametrize("depth", [1, 2, 3])
+@pytest.mark.parametrize("depth", [1, 2, 3, 4])
 def test_csv_contract_legend_and_metrics(tmp_path, depth):
     path, columns = _csv(tmp_path, depth)
     mapping_path, _ = write_label_artifacts(
@@ -58,7 +58,7 @@ def test_csv_contract_legend_and_metrics(tmp_path, depth):
     )
     mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
     assert validate_label_mapping(mapping)["valid"]
-    assert mapping["level_counts"] == [2, 3, 3][:depth]
+    assert mapping["level_counts"] == [2, 3, 3, 3][:depth]
     records = [
         r
         for batch in iter_encoded_labels(path, label_columns=columns, mapping=mapping)
@@ -253,7 +253,7 @@ def test_schema_rejects_invalid_levels(levels):
         _ = DataConfig(label_schema={"levels": levels}).label_columns
 
 
-@pytest.mark.parametrize("depth", [1, 3])
+@pytest.mark.parametrize("depth", [1, 3, 4])
 @pytest.mark.parametrize(
     "architecture",
     [
@@ -275,8 +275,10 @@ def test_all_architectures_train_restore_and_normalize(tmp_path, depth, architec
     derived = contract["derived"]
     derived.update(
         {
-            "level_counts": [3] if depth == 1 else [2, 3, 3],
-            "level_parents": [] if depth == 1 else [[0, 0, 1], [0, 1, 2]],
+            "level_counts": [3] if depth == 1 else [2, 3, 3, 3][:depth],
+            "level_parents": []
+            if depth == 1
+            else [[0, 0, 1], [0, 1, 2], [0, 1, 2]][: depth - 1],
             "fine_to_coarse": [0, 1, 2] if depth == 1 else [0, 0, 1],
             "num_coarse_classes": 3 if depth == 1 else 2,
             "dynamic_features_count": 4,

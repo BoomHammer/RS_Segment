@@ -3,6 +3,7 @@
 from collections import Counter
 from dataclasses import replace
 
+from data.label_observations import supervision_items
 from data.sample_index import WindowedSampleDataset
 from data.spatial_split import SpatialSplitManifest
 
@@ -68,9 +69,7 @@ def point_windows(
     if (manifest is None) != (split is None):
         raise ValueError("manifest 和 split 必须同时提供")
     result: dict[int, Counter] = {}
-    for pixel, code in getattr(
-        dataset, "supervision_pixels", dataset.ground_truth_pixels
-    ).items():
+    for pixel, code in supervision_items(dataset):
         if manifest is not None and point_owner(*pixel, manifest) != split:
             continue
         for index in dataset.query_windows_for_pixel(*pixel):
@@ -134,23 +133,25 @@ def supervision_summary(dataset, manifest) -> dict:
     split_sets = {name: set(ids) for name, ids in manifest.splits.items()}
     counts = {name: Counter() for name in split_sets}
     point_window_counts = Counter()
-    for pixel, code in getattr(
-        dataset, "supervision_pixels", dataset.ground_truth_pixels
-    ).items():
+    counted_pixels = set()
+    unique_pixels = {name: set() for name in split_sets}
+    for pixel, code in supervision_items(dataset):
         owner = point_owner(*pixel, manifest)
         if owner not in split_sets:
             continue
         counts[owner][str(code)] += 1
+        unique_pixels[owner].add(pixel)
         covering = set(dataset.query_windows_for_pixel(*pixel))
-        if covering & split_sets[owner]:
+        if covering & split_sets[owner] and pixel not in counted_pixels:
             point_window_counts[owner] += 1
+            counted_pixels.add(pixel)
     return {
         "windows": {name: len(ids) for name, ids in split_sets.items()},
         "point_windows": {
             name: len(ids & point_windows(dataset, manifest, name).keys())
             for name, ids in split_sets.items()
         },
-        "unique_points": {name: sum(c.values()) for name, c in counts.items()},
+        "unique_points": {name: len(pixels) for name, pixels in unique_pixels.items()},
         "unique_class_counts": {name: dict(c) for name, c in counts.items()},
         "points_covered_by_owned_windows": dict(point_window_counts),
         "shared_points": {},

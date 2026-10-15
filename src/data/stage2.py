@@ -253,7 +253,11 @@ def validate_dataset_windows(
         if torch.any(labels < 1):
             raise AssertionError(f"窗口 {window_id} 存在非法地面真实值类别编码")
         observed = sample.get("ground_truth_levels", sample["ground_truth"])
-        if require_ground_truth and not observed.gt(0).any():
+        if (
+            require_ground_truth
+            and not observed.gt(0).any()
+            and not len(sample.get("ground_truth_observations", []))
+        ):
             raise AssertionError(f"窗口 {window_id} 未包含地面真实值标签")
         checked.append(sample["sample_status"])
     if require_ground_truth and not checked:

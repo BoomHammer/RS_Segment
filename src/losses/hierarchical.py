@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from math import isfinite
 
 import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from data.label_hierarchy import active_level_classes
+from data.label_observations import mixed_level_observations
 from losses.focal import focal_cross_entropy
+
+
+def supervision_level_weights(weights, depth):
+    """Validate explicit coarse-to-fine priorities; preserve legacy defaults."""
+    if weights is None:
+        return [1.0] * depth
+    if len(weights) != depth:
+        raise ValueError("level_weights 必须与分类层数一致")
+    values = [float(value) for value in weights]
+    if any(not isfinite(value) or value < 0 for value in values) or not any(values):
+        raise ValueError("level_weights 必须非负、有限且至少一个大于零")
+    return values
 
 
 def effective_number_weights(
@@ -44,6 +59,8 @@ def hierarchical_supervision_loss(
     fine_to_coarse: Sequence[int],
     *,
     level_parents: Sequence[Sequence[int]] | None = None,
+    level_weights: Sequence[float] | None = None,
+    leaf_depths: Sequence[int] | None = None,
     ground_truth_weight: float = 1.0,
     weak_label_weight: float = 0.5,
     hierarchy_weight: float = 0.2,
@@ -66,6 +83,8 @@ def hierarchical_supervision_loss(
             outputs,
             batch,
             level_parents,
+            level_weights=level_weights,
+            leaf_depths=leaf_depths,
             ground_truth_weight=ground_truth_weight,
             weak_label_weight=weak_label_weight,
             hierarchy_weight=hierarchy_weight,
@@ -75,6 +94,7 @@ def hierarchical_supervision_loss(
             ignore_index=ignore_index,
         )
 
+    priorities = supervision_level_weights(level_weights, 2)
     mapping = torch.as_tensor(
         fine_to_coarse, dtype=torch.long, device=outputs["fine_logits"].device
     )
@@ -104,10 +124,10 @@ def hierarchical_supervision_loss(
             gamma=focal_gamma,
             ignore_index=ignore_index,
         )
-        source_losses[f"{source}_fine_loss"] = fine_loss
-        source_losses[f"{source}_coarse_loss"] = coarse_loss
-        total_fine = total_fine + source_weight * fine_loss
-        total_coarse = total_coarse + source_weight * coarse_loss
+        source_losses[f"{source}_fine_loss"] = priorities[1] * fine_loss
+        source_losses[f"{source}_coarse_loss"] = priorities[0] * coarse_loss
+        total_fine = total_fine + source_weight * priorities[1] * fine_loss
+        total_coarse = total_coarse + source_weight * priorities[0] * coarse_loss
     coarse_from_fine = outputs["fine_probability"].new_zeros(
         outputs["coarse_logits"].shape
     )
@@ -143,6 +163,8 @@ def multilevel_supervision_loss(
     batch,
     parents,
     *,
+    level_weights,
+    leaf_depths,
     ground_truth_weight,
     weak_label_weight,
     hierarchy_weight,
@@ -153,14 +175,23 @@ def multilevel_supervision_loss(
 ):
     """Supervise every level using ancestors of the observed leaf, never argmax."""
     logits = [
-        outputs[f"level_{i}_logits"] for i in range(3) if f"level_{i}_logits" in outputs
+        outputs[f"level_{i}_logits"] for i in range(4) if f"level_{i}_logits" in outputs
     ]
+    priorities = supervision_level_weights(level_weights, len(logits))
     if parents is None:
         if len(logits) != 1:
             raise ValueError("多层监督需要 level_parents 映射")
         parents = []
     if len(parents) != len(logits) - 1:
         raise ValueError("level_parents 与模型输出层数不一致")
+    active_classes = [None] * len(logits)
+    if leaf_depths is not None:
+        active_classes = [
+            torch.tensor(active, device=logits[0].device)
+            for active in active_level_classes(
+                [prediction.shape[1] for prediction in logits], parents, leaf_depths
+            )
+        ]
     edges = [
         torch.as_tensor(edge, device=logits[0].device, dtype=torch.long)
         for edge in parents
@@ -196,16 +227,41 @@ def multilevel_supervision_loss(
             ]
         losses = []
         for depth, (prediction, target) in enumerate(zip(logits, targets, strict=True)):
+            if active_classes[depth] is not None:
+                active = (
+                    target.ne(ignore_index) & active_classes[depth][target.clamp_min(0)]
+                )
+                target = target.masked_fill(~active, ignore_index)
+            loss_prediction, loss_target, sample_weight = prediction, target, None
+            observations = batch.get("ground_truth_observations")
+            if (
+                source == "ground_truth"
+                and observations is not None
+                and len(observations)
+            ):
+                positions, labels, weights, _, _ = mixed_level_observations(
+                    observations, target, valid, depth, active_classes[depth]
+                )
+                b, y, x = positions.unbind(1)
+                hard = target.ne(ignore_index)
+                loss_prediction = torch.cat(
+                    (prediction.movedim(1, -1)[hard], prediction[b, :, y, x]), dim=0
+                )
+                loss_target = torch.cat((target[hard], labels))
+                sample_weight = torch.cat(
+                    (torch.ones_like(target[hard], dtype=torch.float32), weights)
+                )
             loss = focal_cross_entropy(
-                prediction,
-                target,
+                loss_prediction,
+                loss_target,
                 gamma=focal_gamma,
                 weight=class_weights if depth == len(logits) - 1 else None,
                 weight_normalization=weight_normalization,
                 ignore_index=ignore_index,
+                sample_weight=sample_weight,
             )
-            losses.append(loss)
-            totals[depth] = totals[depth] + weight * loss
+            losses.append(priorities[depth] * loss)
+            totals[depth] = totals[depth] + weight * priorities[depth] * loss
             result[f"{source}_level_{depth}_loss"] = loss
         result[f"{source}_fine_loss"] = losses[-1]
         result[f"{source}_coarse_loss"] = sum(losses[:-1], zero)

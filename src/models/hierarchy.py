@@ -1,4 +1,4 @@
-"""Conditional classification for one or three root-to-leaf levels."""
+"""Conditional classification for one to four root-to-leaf levels."""
 
 from torch import nn
 
@@ -8,8 +8,8 @@ class MultiLevelHeads(nn.Module):
 
     def __init__(self, channels, counts, parents, head_factory=None):
         super().__init__()
-        if not 1 <= len(counts) <= 3 or len(parents) != len(counts) - 1:
-            raise ValueError("分类层级必须为 1、2 或 3 层")
+        if not 1 <= len(counts) <= 4 or len(parents) != len(counts) - 1:
+            raise ValueError("分类层级必须为 1～4 层")
         if any(type(count) is not int or count < 1 for count in counts):
             raise ValueError("每层类别数必须为正整数")
         self.parents = [tuple(edge) for edge in parents]

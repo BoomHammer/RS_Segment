@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from data.label_observations import supervision_items
+
 from .sample_index import WindowedSampleDataset
 
 
@@ -247,9 +249,7 @@ def build_spatial_split(
     block_classes: dict[tuple[int, int], Counter[str]] = {
         block: Counter() for block in grouped
     }
-    for (row, column), code in getattr(
-        dataset, "supervision_pixels", dataset.ground_truth_pixels
-    ).items():
+    for (row, column), code in supervision_items(dataset):
         block = (int(row) // block_size[1], int(column) // block_size[0])
         block_classes[block][str(code)] += 1
     split_blocks = _stratified_block_assignment(
@@ -267,9 +267,7 @@ def build_spatial_split(
 
     counts_by_split: dict[str, Counter[str]] = {name: Counter() for name in names}
     window_classes: dict[int, Counter[str]] = defaultdict(Counter)
-    for (row, column), code in getattr(
-        dataset, "supervision_pixels", dataset.ground_truth_pixels
-    ).items():
+    for (row, column), code in supervision_items(dataset):
         owner = split_blocks[(int(row) // block_size[1], int(column) // block_size[0])]
         counts_by_split[owner][str(code)] += 1
         window_ids = dataset.query_windows_for_pixel(row, column)

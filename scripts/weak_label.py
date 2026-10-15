@@ -6,6 +6,7 @@ import argparse
 import atexit
 import json
 import sys
+from contextlib import ExitStack
 from datetime import datetime
 from itertools import chain, zip_longest
 from pathlib import Path
@@ -29,6 +30,10 @@ from distributed_runtime import (  # noqa: E402
     shard_sequence,
 )
 from inference.sam2_backend import SAM2Inferencer  # noqa: E402
+from weak_label.conflicts import (  # noqa: E402
+    merge_candidate_window,
+    open_candidate_sources,
+)
 from weak_label.generation import (  # noqa: E402
     WeakLabelGenerationConfig,
     evaluate_label_quality_from_raster,
@@ -54,48 +59,19 @@ def _merge_weak_label_shards(
     nodata: int,
     conflict_margin: float,
 ) -> None:
-    """Merge per-GPU labels using the same confidence/conflict semantics."""
+    """Merge per-GPU candidates, retaining ambiguities within each shard."""
 
-    with rasterio.open(shards[0]["labels"]) as reference:
+    with ExitStack() as stack:
+        reference = stack.enter_context(rasterio.open(shards[0]["labels"]))
+        sources = open_candidate_sources(stack, shards, reference)
         profile = reference.profile.copy()
         output.parent.mkdir(parents=True, exist_ok=True)
         with rasterio.open(output, "w", **profile) as destination:
-            label_sources = [
-                rasterio.open(shard["labels"])  # noqa: SIM115
-                for shard in shards
-            ]
-            score_sources = [
-                rasterio.open(shard["scores"])  # noqa: SIM115
-                for shard in shards
-            ]
-            try:
-                for _, window in destination.block_windows(1):
-                    shape = (int(window.height), int(window.width))
-                    labels = np.full(shape, nodata, dtype=np.int32)
-                    scores = np.full(shape, -np.inf, dtype=np.float32)
-                    for label_source, score_source in zip(
-                        label_sources, score_sources, strict=True
-                    ):
-                        candidate_labels = label_source.read(1, window=window)
-                        candidate_scores = score_source.read(1, window=window)
-                        selected = candidate_labels > 0
-                        better = selected & (
-                            candidate_scores > scores + conflict_margin
-                        )
-                        tied = (
-                            selected
-                            & np.isfinite(scores)
-                            & (labels != candidate_labels)
-                            & (np.abs(candidate_scores - scores) <= conflict_margin)
-                        )
-                        labels[better] = candidate_labels[better]
-                        scores[better] = candidate_scores[better]
-                        labels[tied] = nodata
-                        scores[tied] = -np.inf
-                    destination.write(labels, 1, window=window)
-            finally:
-                for source in [*label_sources, *score_sources]:
-                    source.close()
+            for _, window in destination.block_windows(1):
+                labels = merge_candidate_window(
+                    sources, window, nodata=nodata, conflict_margin=conflict_margin
+                )
+                destination.write(labels, 1, window=window)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -250,7 +226,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"质量报告: {report}")
         return 0
     shard_output = output.with_name(f".{output.name}.rank{distributed.rank}")
-    shard_scores = output.with_name(f".{output.name}.rank{distributed.rank}.scores.tif")
+    shard_candidates = output.with_name(
+        f".{output.name}.rank{distributed.rank}.candidates.tif"
+    )
+    shard_candidate_scores = output.with_name(
+        f".{output.name}.rank{distributed.rank}.candidate_scores.tif"
+    )
     shard_outcomes = output.with_name(
         f".{output.name}.rank{distributed.rank}.outcomes.json"
     )
@@ -264,13 +245,14 @@ def main(argv: list[str] | None = None) -> int:
         keyframe_index=keyframe_index,
         composite_names=composite_names,
         resume=args.resume is not None,
-        score_output_path=shard_scores,
+        candidate_output_paths=(shard_candidates, shard_candidate_scores),
         sample_outcomes_path=shard_outcomes,
     )
     shards = gather_objects(
         {
             "labels": str(shard_output),
-            "scores": str(shard_scores),
+            "candidate_labels": str(shard_candidates),
+            "candidate_scores": str(shard_candidate_scores),
             "outcomes": str(shard_outcomes),
         },
         distributed,
@@ -302,9 +284,8 @@ def main(argv: list[str] | None = None) -> int:
             valid = preview != dataset.nodata
         write_label_quality_visualization(preview, visualization, valid_mask=valid)
         for shard in shards:
-            Path(shard["labels"]).unlink(missing_ok=True)
-            Path(shard["scores"]).unlink(missing_ok=True)
-            Path(shard["outcomes"]).unlink(missing_ok=True)
+            for path in shard.values():
+                Path(path).unlink(missing_ok=True)
         print(f"弱标签: {output}")
         print(f"质量报告: {report}")
     barrier(distributed)

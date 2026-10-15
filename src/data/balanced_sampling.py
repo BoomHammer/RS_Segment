@@ -30,6 +30,8 @@ class ClassBalancedPointSampler(Sampler[tuple[int, tuple[int, int]]]):
         self.epoch = 0
         index_set = set(indices)
         self.points = {}
+        available_codes = set()
+        memberships = getattr(dataset, "supervision_memberships", {})
         for pixel, code in getattr(
             dataset, "supervision_pixels", dataset.ground_truth_pixels
         ).items():
@@ -40,10 +42,10 @@ class ClassBalancedPointSampler(Sampler[tuple[int, tuple[int, int]]]):
             )
             if candidates:
                 self.points.setdefault(int(code), []).append((pixel, candidates))
-        if len(self.points) != len(manifest.class_counts.get("train", self.points)):
+                available_codes.update(memberships.get(pixel, (int(code),)))
+        if len(available_codes) != len(manifest.class_counts.get("train", self.points)):
             missing = sorted(
-                set(map(int, manifest.class_counts.get("train", {})))
-                - self.points.keys()
+                set(map(int, manifest.class_counts.get("train", {}))) - available_codes
             )
             if missing:
                 raise ValueError(f"类别没有可采样的独立训练点: {missing}")

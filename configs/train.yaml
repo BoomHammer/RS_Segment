@@ -9,6 +9,8 @@ training:
   gradient_accumulation_steps: 2
   # 随机种子，保证数据采样和增强可复现。
   seed: 42
+  # 验证与最佳模型选择以一级为准（从 0 开始）；仍记录所有层级指标。
+  selection_level: 0
   early_stopping:
     # 是否在验证损失长期不下降时提前结束训练。
     enabled: true
@@ -53,7 +55,7 @@ supervision_policy:
   # 每轮让训练划分中的全部独立真实点各作为锚点一次，并按类别交错排序；
   # 每个锚点随机选择一个覆盖窗口，训练伪标签也只保留训练块内像元。
   class_balanced_point_sampling: true
-  class_weighting: train_inverse_sqrt
+  # class_weighting: train_inverse_sqrt
 
 optimizer:
   # 优化器名称；当前训练入口使用 AdamW。

@@ -23,6 +23,7 @@ from inference.pointsam import (
     PointSAMInferencer,
     run_pointsam_with_npc,
 )
+from weak_label.conflicts import CandidateState
 from weak_label.quality import write_label_quality_visualization
 
 
@@ -47,7 +48,7 @@ class WeakLabelGenerationConfig:
     weighted_vote_threshold: float = 0.5
 
 
-_CHECKPOINT_VERSION = 1
+_CHECKPOINT_VERSION = 2
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -320,10 +321,13 @@ def generate_weak_labels(
     resume: bool = False,
     checkpoint_path: str | Path | None = None,
     score_output_path: str | Path | None = None,
+    candidate_output_paths: tuple[str | Path, str | Path] | None = None,
 ) -> dict[str, Any]:
     """Generate sparse, point-local labels from high-confidence SAM regions."""
 
     config = config or WeakLabelGenerationConfig()
+    if not np.isfinite(config.conflict_margin) or config.conflict_margin < 0:
+        raise ValueError("conflict_margin 必须是非负有限数")
     if image_paths and isinstance(image_paths[0], (str, Path)):
         video_frames = ((tuple(image_paths),),)
     elif image_paths and isinstance(image_paths[0][0], (str, Path)):
@@ -408,6 +412,8 @@ def generate_weak_labels(
         if not manifest_path.is_file():
             raise FileNotFoundError(f"弱标签断点不存在: {manifest_path}")
         saved_contract = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if saved_contract.get("version") != _CHECKPOINT_VERSION:
+            raise ValueError("旧版弱标签断点未保留冲突候选分数，请重新生成弱标签")
         if saved_contract != contract:
             raise ValueError("弱标签断点与当前网格、影像、标签或配置不匹配")
     else:
@@ -468,10 +474,14 @@ def generate_weak_labels(
         print("全局光谱拉伸统计量完成，开始加载视频帧并生成弱标签...")
         score = mapped_array("scores.bin", np.float32, -np.inf)
         labels = mapped_array("labels.bin", np.int32, config.output_nodata)
+        second_score = mapped_array("second_scores.bin", np.float32, -np.inf)
+        second_labels = mapped_array("second_labels.bin", np.int32, config.output_nodata)
 
         def save_completed_outcome(located_index: int, outcome: dict[str, Any]) -> None:
             score.flush()
             labels.flush()
+            second_score.flush()
+            second_labels.flush()
             if provenance is not None:
                 provenance.flush()
             _append_completed_outcome(completed_outcomes_path, located_index, outcome)
@@ -672,23 +682,18 @@ def generate_weak_labels(
             global_columns = slice(column_start, column_start + int(window.width))
             current_score = score[global_rows, global_columns]
             current_labels = labels[global_rows, global_columns]
-            better = selected & (
-                candidate_score > current_score + config.conflict_margin
+            candidates = CandidateState(
+                current_labels,
+                current_score,
+                second_labels[global_rows, global_columns],
+                second_score[global_rows, global_columns],
             )
-            tied = (
-                selected
-                & np.isfinite(current_score)
-                & (current_labels != record.alliance_code)
-                & (np.abs(candidate_score - current_score) <= config.conflict_margin)
+            better = candidates.update(
+                record.alliance_code, candidate_score, selected
             )
-            current_labels[better] = record.alliance_code
-            current_score[better] = candidate_score[better]
-            current_labels[tied] = config.output_nodata
-            current_score[tied] = -np.inf
             if provenance is not None:
                 current_seeds = provenance[global_rows, global_columns]
                 current_seeds[better] = outcome_index + 1
-                current_seeds[tied] = config.output_nodata
             save_completed_outcome(located_index, outcome)
         partial_output = output.with_name(f".{output.name}.partial")
         destination = stack.enter_context(
@@ -698,6 +703,7 @@ def generate_weak_labels(
         provenance_destination = None
         partial_score = None
         score_destination = None
+        candidate_destinations = []
         if provenance_path is not None:
             provenance_output = Path(provenance_path)
             provenance_output.parent.mkdir(parents=True, exist_ok=True)
@@ -720,24 +726,63 @@ def generate_weak_labels(
             score_destination = stack.enter_context(
                 rasterio.open(partial_score, "w", **score_profile)
             )
+        if candidate_output_paths is not None:
+            for candidate_path, dtype, nodata in zip(
+                candidate_output_paths,
+                ("int32", "float32"),
+                (config.output_nodata, -1.0),
+                strict=True,
+            ):
+                candidate_path = Path(candidate_path)
+                candidate_path.parent.mkdir(parents=True, exist_ok=True)
+                partial_candidate = candidate_path.with_name(f".{candidate_path.name}.partial")
+                candidate_profile = {**output_profile, "count": 2, "dtype": dtype, "nodata": nodata}
+                candidate_destination = stack.enter_context(
+                    rasterio.open(partial_candidate, "w", **candidate_profile)
+                )
+                candidate_destinations.append((candidate_destination, partial_candidate, candidate_path))
         for _, window in destination.block_windows(1):
             rows, columns = window.toslices()
-            destination.write(labels[rows, columns], 1, window=window)
+            candidates = CandidateState(
+                labels[rows, columns],
+                score[rows, columns],
+                second_labels[rows, columns],
+                second_score[rows, columns],
+            )
+            resolved = candidates.resolve(
+                nodata=config.output_nodata, conflict_margin=config.conflict_margin
+            )
+            accepted = resolved > 0
+            destination.write(resolved, 1, window=window)
             if provenance_destination is not None:
                 provenance_destination.write(
-                    provenance[rows, columns], 1, window=window
+                    np.where(accepted, provenance[rows, columns], config.output_nodata),
+                    1,
+                    window=window,
                 )
             if score_destination is not None:
                 score_values = np.where(
-                    np.isfinite(score[rows, columns]), score[rows, columns], -1.0
+                    accepted, score[rows, columns], -1.0
                 ).astype(np.float32)
                 score_destination.write(score_values, 1, window=window)
+            if candidate_destinations:
+                candidate_destinations[0][0].write(
+                    np.stack((candidates.best_labels, candidates.second_labels)),
+                    window=window,
+                )
+                candidate_scores = np.stack((candidates.best_scores, candidates.second_scores))
+                candidate_destinations[1][0].write(
+                    np.where(np.isfinite(candidate_scores), candidate_scores, -1.0),
+                    window=window,
+                )
 
     partial_output.replace(output)
     if partial_provenance is not None:
         partial_provenance.replace(Path(provenance_path))
     if partial_score is not None:
         partial_score.replace(Path(score_output_path))
+    for _, partial_candidate, candidate_path in candidate_destinations:
+        partial_candidate.replace(candidate_path)
 
     if sample_outcomes_path is not None:
         Path(sample_outcomes_path).write_text(
@@ -785,6 +830,8 @@ def generate_weak_labels(
         checkpoint / "seed_ids.bin",
         checkpoint / "scores.bin",
         checkpoint / "labels.bin",
+        checkpoint / "second_scores.bin",
+        checkpoint / "second_labels.bin",
         manifest_path,
     ):
         checkpoint_file.unlink(missing_ok=True)

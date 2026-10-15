@@ -15,6 +15,7 @@ def focal_cross_entropy(
     weight: Tensor | None = None,
     weight_normalization: str = "weighted_mean",
     ignore_index: int = -1,
+    sample_weight: Tensor | None = None,
 ) -> Tensor:
     """Return mean focal loss; ``gamma=0`` is weighted cross-entropy."""
 
@@ -32,6 +33,20 @@ def focal_cross_entropy(
     ).squeeze(1)
     target_probability = target_log_probability.exp()
     losses = -(1.0 - target_probability).pow(gamma) * target_log_probability
+    if sample_weight is not None:
+        if sample_weight.shape != labels.shape:
+            raise ValueError("sample_weight 与 labels 形状必须一致")
+        pixel_weights = sample_weight.to(logits.device)
+        denominator_weights = pixel_weights
+        if weight is not None:
+            if weight.ndim != 1 or weight.numel() != logits.shape[1]:
+                raise ValueError("类别权重长度必须等于 logits 类别数")
+            pixel_weights = pixel_weights * weight.to(logits.device)[safe_labels]
+            if weight_normalization == "weighted_mean":
+                denominator_weights = pixel_weights
+        return (losses[valid] * pixel_weights[valid]).sum() / denominator_weights[
+            valid
+        ].sum().clamp_min(torch.finfo(logits.dtype).eps)
     if weight is None:
         return losses[valid].mean()
     if weight.ndim != 1 or weight.numel() != logits.shape[1]:

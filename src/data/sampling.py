@@ -9,6 +9,8 @@ from typing import Any
 import torch
 from torch.utils.data import DataLoader, Sampler, get_worker_info
 
+from data.label_observations import supervision_items
+
 from .sample_index import WindowedSampleDataset, sample_collate_fn
 from .spatial_split import SpatialSplitManifest, load_spatial_split
 from .training_policy import point_owner
@@ -66,7 +68,7 @@ class SpatialWeightedSampler(Sampler[int]):
         block_size: tuple[int, int],
     ) -> torch.Tensor:
         window_classes: dict[int, Counter[str]] = {}
-        for (row, column), code in self.dataset.ground_truth_pixels.items():
+        for (row, column), code in supervision_items(self.dataset):
             if (
                 self.point_manifest is not None
                 and point_owner(row, column, self.point_manifest) != self.split

@@ -47,6 +47,11 @@ def validate_checkpoint_mapping(
         "num_classes": len(classes),
         "fine_to_coarse": [item["formation_code"] - 1 for item in classes],
     }
+    if mapping.get("optional_leaf_level") or "leaf_depths" in derived:
+        expected["optional_leaf_level"] = mapping.get("optional_leaf_level", False)
+        expected["leaf_depths"] = [item.get("terminal_level") for item in classes]
+    if "path_aliases" in mapping or "label_path_aliases" in derived:
+        expected["label_path_aliases"] = mapping.get("path_aliases")
     for key, value in expected.items():
         if derived.get(key) != value:
             raise ValueError(
@@ -74,6 +79,16 @@ def derive_model_contract(
                 mapping["classes"], key=lambda item: item["alliance_code"]
             )
         ]
+        if mapping.get("optional_leaf_level"):
+            hierarchy["optional_leaf_level"] = True
+            hierarchy["leaf_depths"] = [
+                item["terminal_level"]
+                for item in sorted(
+                    mapping["classes"], key=lambda item: item["alliance_code"]
+                )
+            ]
+            if "path_aliases" in mapping:
+                hierarchy["label_path_aliases"] = mapping["path_aliases"]
     assets = index.get("assets", [])
     dynamic_features = sorted(
         {_feature_name(asset) for asset in assets if asset.get("role") == "dynamic"}

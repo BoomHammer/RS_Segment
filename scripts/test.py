@@ -29,6 +29,7 @@ from distributed_runtime import (
 from evaluation import (
     collect_point_predictions,
     merge_point_prediction_shards,
+    mixed_point_metrics,
     point_metrics,
 )
 from models.architecture import SegFormerUtae
@@ -394,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
     fine_to_coarse = list(contract["derived"]["fine_to_coarse"])
     level_predictions = {}
     raw_predictions = {}
+    mixed_predictions = {}
     targets, probabilities, positions, occurrences = collect_point_predictions(
         model,
         loader,
@@ -402,13 +404,15 @@ def main(argv: list[str] | None = None) -> int:
         level_predictions=level_predictions,
         raw_predictions=raw_predictions,
         show_progress=distributed.is_main,
+        leaf_depths=contract["derived"].get("leaf_depths"),
+        mixed_predictions=mixed_predictions,
     )
     gathered = gather_objects(raw_predictions, distributed)
     if not distributed.is_main:
         return 0
     if distributed.distributed:
         (targets, probabilities, positions, occurrences), level_predictions = (
-            merge_point_prediction_shards(gathered)
+            merge_point_prediction_shards(gathered, mixed_predictions=mixed_predictions)
         )
     if targets.numel():
         summary = point_metrics(targets, probabilities, occurrences)
@@ -433,6 +437,10 @@ def main(argv: list[str] | None = None) -> int:
             for level, values in level_predictions.items()
         }
     report["class_coverage"] = manifest.class_coverage
+    report["mixed_pixels"] = {
+        level: mixed_point_metrics(values[0], values[1], values[3])
+        for level, values in mixed_predictions.items()
+    }
     report["metric_protocol"] = "owned_unique_points_mean_probability_v1"
     report["partial_evaluation"] = args.max_windows is not None
     report["point_predictions"] = [

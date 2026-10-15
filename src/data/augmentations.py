@@ -83,6 +83,12 @@ class SynchronizedAugmentation:
 
     @staticmethod
     def _flip(sample: dict[str, Any], *, dim: int) -> None:
+        observations = sample.get("ground_truth_observations")
+        if observations is not None:
+            axis = 1 if dim == -1 else 0
+            observations[:, axis] = (
+                sample["valid_mask"].shape[dim] - 1 - observations[:, axis]
+            )
         for key in SPATIAL_KEYS:
             value = sample.get(key)
             if isinstance(value, Tensor):
@@ -90,6 +96,13 @@ class SynchronizedAugmentation:
 
     @staticmethod
     def _rotate(sample: dict[str, Any], turns: int) -> None:
+        observations = sample.get("ground_truth_observations")
+        if observations is not None:
+            height, width = sample["valid_mask"].shape[-2:]
+            for _ in range(turns % 4):
+                row, column = observations[:, 0].clone(), observations[:, 1].clone()
+                observations[:, 0], observations[:, 1] = width - 1 - column, row
+                height, width = width, height
         for key in SPATIAL_KEYS:
             value = sample.get(key)
             if isinstance(value, Tensor):

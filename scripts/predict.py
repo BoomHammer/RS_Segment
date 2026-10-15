@@ -124,11 +124,15 @@ def _write_mapping(mapping: dict[str, Any], path: Path) -> None:
             for item in sorted(
                 mapping["classes"], key=lambda item: item["alliance_code"]
             ):
+                terminal = item.get("terminal_level", len(names))
+                padding = [""] * (len(names) - terminal)
                 writer.writerow(
                     [
                         item["alliance_code"],
-                        *item["level_names"],
-                        *item["level_names_zh"],
+                        *item["level_names"][:terminal],
+                        *padding,
+                        *item["level_names_zh"][:terminal],
+                        *padding,
                     ]
                 )
         return

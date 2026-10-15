@@ -21,6 +21,7 @@ from data.label_hierarchy import (
     leaf_aliases,
     mapping_path,
     prefix_codes,
+    resolve_category_path,
     validate_hierarchy,
 )
 from data.raster_alignment import TargetGrid, locate_points
@@ -56,6 +57,11 @@ class ValidationReport:
     class_counts: Counter[str] = field(default_factory=Counter)
     invalid_row_examples: list[dict[str, Any]] = field(default_factory=list)
     missing_hierarchy_rows: list[int] = field(default_factory=list)
+    partial_label_rows: list[int] = field(default_factory=list)
+    partial_depth_counts: Counter[str] = field(default_factory=Counter)
+    coarsened_rows: int = 0
+    mixed_coordinate_count: int = 0
+    mixed_coordinate_examples: list[dict[str, Any]] = field(default_factory=list)
     partial_rows: int = 0
 
     def to_dict(self) -> dict[str, Any]:
@@ -71,6 +77,19 @@ class ValidationReport:
             "invalid_row_examples": self.invalid_row_examples,
             "missing_hierarchy_rows": self.missing_hierarchy_rows,
             "partial_rows": self.partial_rows,
+            "partial_label_rows": self.partial_label_rows,
+            "partial_depth_counts": dict(self.partial_depth_counts),
+            "coarsened_rows": self.coarsened_rows,
+            "mixed_coordinate_count": self.mixed_coordinate_count,
+            "mixed_coordinate_examples": self.mixed_coordinate_examples,
+            "hierarchy_row_notes": {
+                "partial_label_rows": (
+                    "合法部分标签的 CSV 行号（包含表头）；只监督已知上级，不是错误"
+                ),
+                "missing_hierarchy_rows": (
+                    "无效层级缺失的 CSV 行号示例；不包含合法部分标签"
+                ),
+            },
         }
 
 
@@ -173,6 +192,11 @@ def build_label_mapping(
     """Build stable path-based IDs for the configured classification levels."""
 
     schema = schema or {}
+    optional_leaf_level = bool(
+        schema.get(
+            "optional_leaf_level", label_columns.get("optional_leaf_level", False)
+        )
+    )
     if int(schema.get("first_id", 1)) != 1:
         raise ValueError("训练标签 first_id 必须为 1")
     if (
@@ -193,7 +217,7 @@ def build_label_mapping(
                 label_crs=label_crs,
                 grid=sample_grid,
             )
-            if sample_grid is not None
+            if sample_grid is not None and not optional_leaf_level
             else None
         )
         return build_hierarchy(
@@ -201,12 +225,18 @@ def build_label_mapping(
             label_levels(label_columns),
             int(schema.get("version", 2)),
             schema.get("missing_policy", label_columns.get("missing_policy", "error")),
-            int(schema.get("min_samples_per_fine_class", 1)),
+            int(
+                schema.get(
+                    "min_samples_per_fine_class",
+                    label_columns.get("min_samples_per_fine_class", 1),
+                )
+            ),
             (
                 _field(label_columns, "x", "X"),
                 _field(label_columns, "y", "Y"),
             ),
             fine_class_counts,
+            optional_leaf_level=optional_leaf_level,
         )
     major_values: dict[str, tuple[str, str]] = {}
     pairs: dict[tuple[str, str], tuple[str, str]] = {}
@@ -332,7 +362,12 @@ def validate_labels(
         "missing_policy", label_columns.get("missing_policy")
     ) == "partial"
     prefixes = {path[:depth] for path in classes for depth in range(1, len(path) + 1)}
-    seen: dict[tuple[float, float], tuple[str, ...]] = {}
+    seen: dict[tuple[float, float], set[tuple[str, ...]]] = {}
+    mixed_coordinates = set()
+    coarsened = {
+        tuple(item["source_level_names"])
+        for item in (mapping or {}).get("coarsened_classes", [])
+    }
     for batch in iter_label_rows(
         path, label_columns=label_columns, batch_size=batch_size
     ):
@@ -344,28 +379,42 @@ def validate_labels(
                 lon, lat = to_wgs84.transform(x, y)
                 if not -180 <= lon <= 180 or not -90 <= lat <= 90:
                     raise ValueError("坐标超出 WGS84 范围")
-                names = category_path(row, levels)
-                if not all(names):
+                raw_names = category_path(row, levels)
+                try:
+                    raw_prefix = known_prefix(raw_names)
+                except ValueError:
                     if len(report.missing_hierarchy_rows) < 100:
                         report.missing_hierarchy_rows.append(report.total_rows + 1)
+                    raise
+                names = resolve_category_path(raw_names, mapping or {})
+                if not all(names):
                     if not partial:
+                        if len(report.missing_hierarchy_rows) < 100:
+                            report.missing_hierarchy_rows.append(report.total_rows + 1)
                         raise ValueError("类别为空")
                     names = known_prefix(names)
-                    report.partial_rows += 1
                 if classes and names not in prefixes and names not in aliases:
                     report.unknown_categories += 1
                     raise ValueError("类别不在标签映射中")
+                if len(raw_prefix) < len(levels) and not (
+                    (mapping or {}).get("optional_leaf_level") and len(raw_prefix) >= 3
+                ):
+                    report.partial_rows += 1
+                    report.partial_label_rows.append(report.total_rows + 1)
+                    report.partial_depth_counts[str(len(raw_prefix))] += 1
+                if raw_prefix in coarsened:
+                    report.coarsened_rows += 1
                 key = (round(x, 9), round(y, 9))
                 previous = seen.get(key)
                 if previous is not None:
                     report.duplicate_points += 1
-                    if (
-                        previous[: min(len(previous), len(names))]
-                        != names[: min(len(previous), len(names))]
+                    if any(
+                        p[: min(len(p), len(names))] != names[: min(len(p), len(names))]
+                        for p in previous
                     ):
                         report.conflicting_duplicate_points += 1
-                else:
-                    seen[key] = names
+                        mixed_coordinates.add(key)
+                seen.setdefault(key, set()).add(names)
                 report.class_counts["|".join(names)] += 1
                 report.valid_rows += 1
             except (KeyError, TypeError, ValueError) as exc:
@@ -383,6 +432,15 @@ def validate_labels(
                             "error": str(exc),
                         }
                     )
+    report.mixed_coordinate_count = len(mixed_coordinates)
+    report.mixed_coordinate_examples = [
+        {
+            "x": x,
+            "y": y,
+            "observed_paths": [list(path) for path in sorted(seen[(x, y)])],
+        }
+        for x, y in sorted(mixed_coordinates)[:100]
+    ]
     return report
 
 
@@ -408,7 +466,7 @@ def iter_encoded_labels(
         encoded: list[LabelRecord] = []
         for row in batch:
             try:
-                names = category_path(row, levels)
+                names = resolve_category_path(category_path(row, levels), mapping)
                 if not all(names) and mapping.get("missing_policy", "error") == "skip":
                     continue
                 major, minor = names[0], names[-1]
