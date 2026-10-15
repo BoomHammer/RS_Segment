@@ -126,17 +126,40 @@ def test_weak_label_shards_merge_scores_and_conflicts(tmp_path: Path) -> None:
         [([[1, 1]], [[0.9, 0.7]]), ([[2, 2]], [[0.6, 0.68]])]
     ):
         label_path = tmp_path / f"labels_{rank}.tif"
+        candidate_path = tmp_path / f"candidates_{rank}.tif"
         score_path = tmp_path / f"scores_{rank}.tif"
         with rasterio.open(label_path, "w", **profile) as destination:
             destination.write(np.asarray(labels, dtype=np.int32), 1)
         with rasterio.open(
-            score_path, "w", **{**profile, "dtype": "float32", "nodata": -1.0}
+            candidate_path, "w", **{**profile, "count": 2}
+        ) as destination:
+            destination.write(np.asarray(labels, dtype=np.int32), 1)
+            destination.write(np.full((1, 2), -9999, dtype=np.int32), 2)
+        with rasterio.open(
+            score_path,
+            "w",
+            **{**profile, "count": 2, "dtype": "float32", "nodata": -1.0},
         ) as destination:
             destination.write(np.asarray(scores, dtype=np.float32), 1)
-        shards.append({"labels": str(label_path), "scores": str(score_path)})
+            destination.write(np.full((1, 2), -1, dtype=np.float32), 2)
+        shards.append(
+            {
+                "labels": str(label_path),
+                "candidate_labels": str(candidate_path),
+                "candidate_scores": str(score_path),
+            }
+        )
 
     output = tmp_path / "merged.tif"
     _merge_weak_label_shards(shards, output, nodata=-9999, conflict_margin=0.05)
 
     with rasterio.open(output) as dataset:
         assert dataset.read(1).tolist() == [[1, -9999]]
+
+    with pytest.raises(ValueError, match="旧版"):
+        _merge_weak_label_shards(
+            [{"labels": str(label_path), "scores": str(score_path)}],
+            tmp_path / "legacy.tif",
+            nodata=-9999,
+            conflict_margin=0.05,
+        )

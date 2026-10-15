@@ -28,7 +28,7 @@ weak_label:
   logit_threshold: 0.5
   # 是否拒绝接触输入窗口边界的掩膜。
   reject_boundary_touch: true
-  # 冲突类别之间的最小置信度差。
+  # 最高与次高不同类别候选分数的最小差值；不超过此值时不生成伪标签。
   conflict_margin: 0.05
   # 输入影像拉伸前的固定值范围。(多光谱影像的有效值范围)
   input_range: [-100.0, 16000.0]

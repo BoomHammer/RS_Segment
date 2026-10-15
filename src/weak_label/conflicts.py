@@ -28,8 +28,12 @@ class CandidateState:
 
     def update(self, labels, scores, selected=None):
         """Merge one candidate per pixel; return where the best evidence changed."""
-        labels = np.broadcast_to(np.asarray(labels, dtype=np.int32), self.best_labels.shape)
-        scores = np.broadcast_to(np.asarray(scores, dtype=np.float32), self.best_scores.shape)
+        labels = np.broadcast_to(
+            np.asarray(labels, dtype=np.int32), self.best_labels.shape
+        )
+        scores = np.broadcast_to(
+            np.asarray(scores, dtype=np.float32), self.best_scores.shape
+        )
         valid = (labels > 0) & np.isfinite(scores) & (scores >= 0)
         if selected is not None:
             valid &= selected
@@ -38,9 +42,14 @@ class CandidateState:
             (scores > self.best_scores)
             | ((scores == self.best_scores) & (labels < self.best_labels))
         )
-        replace_second = valid & different & ~replace_best & (
-            (scores > self.second_scores)
-            | ((scores == self.second_scores) & (labels < self.second_labels))
+        replace_second = (
+            valid
+            & different
+            & ~replace_best
+            & (
+                (scores > self.second_scores)
+                | ((scores == self.second_scores) & (labels < self.second_labels))
+            )
         )
         demote = replace_best & different
         self.second_labels[demote] = self.best_labels[demote]
@@ -90,5 +99,12 @@ def merge_candidate_window(sources, window, *, nodata, conflict_margin):
     state = CandidateState.empty((int(window.height), int(window.width)), nodata)
     for labels, scores in sources:
         for band in (1, 2):
-            state.update(labels.read(band, window=window), scores.read(band, window=window))
+            candidate_labels = labels.read(band, window=window)
+            candidate_scores = scores.read(band, window=window)
+            if (
+                not np.isfinite(candidate_scores).all()
+                or ((candidate_labels > 0) & (candidate_scores < 0)).any()
+            ):
+                raise ValueError("弱标签候选分片包含无效分数，无法核验冲突")
+            state.update(candidate_labels, candidate_scores)
     return state.resolve(nodata=nodata, conflict_margin=conflict_margin)

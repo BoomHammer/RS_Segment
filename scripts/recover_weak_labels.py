@@ -22,7 +22,8 @@ def recover(run: Path, ranks: int, conflict_margin: float) -> dict:
         {
             "labels": run / f".weak_labels.tif.rank{rank}",
             "candidate_labels": run / f".weak_labels.tif.rank{rank}.candidates.tif",
-            "candidate_scores": run / f".weak_labels.tif.rank{rank}.candidate_scores.tif",
+            "candidate_scores": run
+            / f".weak_labels.tif.rank{rank}.candidate_scores.tif",
             "outcomes": run / f".weak_labels.tif.rank{rank}.outcomes.json",
         }
         for rank in range(ranks)
@@ -32,7 +33,9 @@ def recover(run: Path, ranks: int, conflict_margin: float) -> dict:
         for shard in shards
         for key in ("candidate_labels", "candidate_scores")
     ):
-        raise ValueError("候选分片缺失；旧版单类别分片无法恢复冲突证据，请重新生成弱标签")
+        raise ValueError(
+            "候选分片缺失；旧版单类别分片无法恢复冲突证据，请重新生成弱标签"
+        )
     outcomes = _load_shard_outcomes(shards)
     if not outcomes or any(item.get("status") == "pending" for item in outcomes):
         raise ValueError("Missing or unfinished sample outcomes")

@@ -1,4 +1,5 @@
 import json
+from itertools import permutations
 from pathlib import Path
 
 import numpy as np
@@ -183,3 +184,179 @@ def test_weak_label_resume_rejects_changed_contract(tmp_path: Path) -> None:
             config=WeakLabelGenerationConfig(window_size=(3, 3)),
             resume=True,
         )
+
+    manifest = output.with_name(f"{output.name}.checkpoint") / "manifest.json"
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["version"] = 1
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="旧版"):
+        generate_weak_labels(
+            records,
+            grid=grid,
+            image_paths=bands,
+            inferencer=FakeInferencer(),
+            output_path=output,
+            config=WeakLabelGenerationConfig(window_size=(4, 4)),
+            resume=True,
+        )
+
+
+@pytest.fixture
+def conflict_inputs(tmp_path):
+    bands = [tmp_path / f"conflict_band_{index}.tif" for index in range(3)]
+    for band in bands:
+        _write_band(band, np.ones((4, 4), dtype=np.float32))
+    return {
+        "grid": target_grid_from_raster(bands[0], target_crs="EPSG:4326", resolution=1),
+        "image_paths": bands,
+        "config": WeakLabelGenerationConfig(window_size=(4, 4)),
+    }
+
+
+def _conflicting_records(codes):
+    return [
+        LabelRecord(str(index), 1.5, 2.5, "F", str(code), "F", str(code), 1, code)
+        for index, code in enumerate(codes)
+    ]
+
+
+@pytest.mark.parametrize("codes", [(1, 2, 3), (1, 2, 1)])
+def test_generated_conflicts_survive_order_and_duplicates(
+    tmp_path, conflict_inputs, codes
+):
+    for case, order in enumerate(sorted(set(permutations(codes)))):
+        output = tmp_path / f"conflict_{case}.tif"
+        provenance = tmp_path / f"provenance_{case}.tif"
+        score = tmp_path / f"score_{case}.tif"
+        candidate_paths = (
+            tmp_path / f"candidates_{case}.tif",
+            tmp_path / f"candidate_scores_{case}.tif",
+        )
+        generate_weak_labels(
+            _conflicting_records(order),
+            **conflict_inputs,
+            inferencer=FakeInferencer(),
+            output_path=output,
+            provenance_path=provenance,
+            score_output_path=score,
+            candidate_output_paths=candidate_paths,
+        )
+        for path in (output, provenance, score):
+            with rasterio.open(path) as source:
+                assert source.read(1)[1, 1] == source.nodata
+        with rasterio.open(candidate_paths[0]) as source:
+            assert source.read()[:, 1, 1].tolist() == [1, 2]
+        with rasterio.open(candidate_paths[1]) as source:
+            assert source.read()[:, 1, 1].tolist() == [1.0, 1.0]
+
+
+def test_conflicting_evidence_survives_checkpoint_resume(tmp_path, conflict_inputs):
+    records = _conflicting_records((1, 2, 3, 1))
+    output = tmp_path / "conflict_resume.tif"
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        generate_weak_labels(
+            records,
+            **conflict_inputs,
+            inferencer=FailingInferencer(fail_after=2),
+            output_path=output,
+        )
+    checkpoint = output.with_name(f"{output.name}.checkpoint")
+    assert (checkpoint / "second_scores.bin").is_file()
+    inferencer = CountingInferencer()
+    generate_weak_labels(
+        records,
+        **conflict_inputs,
+        inferencer=inferencer,
+        output_path=output,
+        resume=True,
+    )
+    assert inferencer.calls == 2
+    assert not checkpoint.exists()
+    clean = tmp_path / "conflict_clean.tif"
+    generate_weak_labels(
+        records, **conflict_inputs, inferencer=FakeInferencer(), output_path=clean
+    )
+    with rasterio.open(output) as resumed, rasterio.open(clean) as fresh:
+        np.testing.assert_array_equal(resumed.read(), fresh.read())
+        assert resumed.read(1)[1, 1] == resumed.nodata
+
+
+class ScoredInferencer(FakeInferencer):
+    def __init__(self, scores):
+        self.scores = iter(scores)
+
+    def predict(self, request):
+        prediction = super().predict(request)
+        # Without mask logits the generator multiplies confidence by itself.
+        confidence = np.sqrt(next(self.scores))
+        return PointSAMPrediction(
+            mask=prediction.mask,
+            confidence=np.full(prediction.mask.shape, confidence, dtype=np.float32),
+        )
+
+
+@pytest.mark.parametrize(
+    "codes, scores, expected",
+    [
+        ((1, 2, 3, 1), (0.9, 0.92, 0.75, 0.96), -9999),
+        ((1, 2, 3), (0.9, 0.9, 0.99), 3),
+    ],
+)
+def test_generated_shards_and_recovery_match_single_run(
+    tmp_path, conflict_inputs, monkeypatch, codes, scores, expected
+):
+    import scripts.recover_weak_labels as recovery
+    from scripts.weak_label import _merge_weak_label_shards
+
+    records = _conflicting_records(codes)
+    single = tmp_path / "single.tif"
+    generate_weak_labels(
+        records,
+        **conflict_inputs,
+        inferencer=ScoredInferencer(scores),
+        output_path=single,
+    )
+    shards = []
+    # A locally ambiguous shard, another shard with new evidence, and an empty shard.
+    for rank, indices in enumerate((range(2), range(2, len(records)), ())):
+        shard = {
+            "labels": tmp_path / f".weak_labels.tif.rank{rank}",
+            "candidate_labels": tmp_path
+            / f".weak_labels.tif.rank{rank}.candidates.tif",
+            "candidate_scores": tmp_path
+            / f".weak_labels.tif.rank{rank}.candidate_scores.tif",
+            "outcomes": tmp_path / f".weak_labels.tif.rank{rank}.outcomes.json",
+        }
+        generate_weak_labels(
+            [records[index] for index in indices],
+            **conflict_inputs,
+            inferencer=ScoredInferencer([scores[index] for index in indices]),
+            output_path=shard["labels"],
+            candidate_output_paths=(
+                shard["candidate_labels"],
+                shard["candidate_scores"],
+            ),
+            sample_outcomes_path=shard["outcomes"],
+        )
+        shards.append(shard)
+    merged = tmp_path / "weak_labels.tif"
+    for ordered in (shards, list(reversed(shards))):
+        _merge_weak_label_shards(ordered, merged, nodata=-9999, conflict_margin=0.05)
+        with rasterio.open(single) as reference, rasterio.open(merged) as actual:
+            np.testing.assert_array_equal(actual.read(), reference.read())
+            assert actual.read(1)[1, 1] == expected
+    mapping = {"classes": [{"alliance_code": code} for code in sorted(set(codes))]}
+    (tmp_path / "label_mapping.json").write_text(json.dumps(mapping), encoding="utf-8")
+    monkeypatch.setattr(
+        recovery, "write_label_quality_visualization", lambda *a, **kw: None
+    )
+    report = recovery.recover(tmp_path, len(shards), 0.05)
+    assert report["recovery_audit"]["merge_mismatch_pixels"] == 0
+    with rasterio.open(merged, "r+") as raster:
+        raster.write(np.full((4, 4), 1, dtype=np.int32), 1)
+    with pytest.raises(ValueError, match="differs from rank merge"):
+        recovery.recover(tmp_path, len(shards), 0.05)
+    with rasterio.open(shards[0]["candidate_scores"], "r+") as raster:
+        raster.write(np.full((4, 4), np.nan, dtype=np.float32), 1)
+    with pytest.raises(ValueError, match="无效分数"):
+        _merge_weak_label_shards(shards, merged, nodata=-9999, conflict_margin=0.05)

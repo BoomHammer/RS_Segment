@@ -11,7 +11,6 @@ from datetime import datetime
 from itertools import chain, zip_longest
 from pathlib import Path
 
-import numpy as np
 import rasterio
 import yaml
 

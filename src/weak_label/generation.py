@@ -475,7 +475,9 @@ def generate_weak_labels(
         score = mapped_array("scores.bin", np.float32, -np.inf)
         labels = mapped_array("labels.bin", np.int32, config.output_nodata)
         second_score = mapped_array("second_scores.bin", np.float32, -np.inf)
-        second_labels = mapped_array("second_labels.bin", np.int32, config.output_nodata)
+        second_labels = mapped_array(
+            "second_labels.bin", np.int32, config.output_nodata
+        )
 
         def save_completed_outcome(located_index: int, outcome: dict[str, Any]) -> None:
             score.flush()
@@ -688,9 +690,7 @@ def generate_weak_labels(
                 second_labels[global_rows, global_columns],
                 second_score[global_rows, global_columns],
             )
-            better = candidates.update(
-                record.alliance_code, candidate_score, selected
-            )
+            better = candidates.update(record.alliance_code, candidate_score, selected)
             if provenance is not None:
                 current_seeds = provenance[global_rows, global_columns]
                 current_seeds[better] = outcome_index + 1
@@ -735,12 +735,21 @@ def generate_weak_labels(
             ):
                 candidate_path = Path(candidate_path)
                 candidate_path.parent.mkdir(parents=True, exist_ok=True)
-                partial_candidate = candidate_path.with_name(f".{candidate_path.name}.partial")
-                candidate_profile = {**output_profile, "count": 2, "dtype": dtype, "nodata": nodata}
+                partial_candidate = candidate_path.with_name(
+                    f".{candidate_path.name}.partial"
+                )
+                candidate_profile = {
+                    **output_profile,
+                    "count": 2,
+                    "dtype": dtype,
+                    "nodata": nodata,
+                }
                 candidate_destination = stack.enter_context(
                     rasterio.open(partial_candidate, "w", **candidate_profile)
                 )
-                candidate_destinations.append((candidate_destination, partial_candidate, candidate_path))
+                candidate_destinations.append(
+                    (candidate_destination, partial_candidate, candidate_path)
+                )
         for _, window in destination.block_windows(1):
             rows, columns = window.toslices()
             candidates = CandidateState(
@@ -761,16 +770,18 @@ def generate_weak_labels(
                     window=window,
                 )
             if score_destination is not None:
-                score_values = np.where(
-                    accepted, score[rows, columns], -1.0
-                ).astype(np.float32)
+                score_values = np.where(accepted, score[rows, columns], -1.0).astype(
+                    np.float32
+                )
                 score_destination.write(score_values, 1, window=window)
             if candidate_destinations:
                 candidate_destinations[0][0].write(
                     np.stack((candidates.best_labels, candidates.second_labels)),
                     window=window,
                 )
-                candidate_scores = np.stack((candidates.best_scores, candidates.second_scores))
+                candidate_scores = np.stack(
+                    (candidates.best_scores, candidates.second_scores)
+                )
                 candidate_destinations[1][0].write(
                     np.where(np.isfinite(candidate_scores), candidate_scores, -1.0),
                     window=window,
