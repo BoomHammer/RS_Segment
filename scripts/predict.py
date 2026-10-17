@@ -7,8 +7,10 @@ import atexit
 import csv
 import gc
 import json
+import logging
 import sys
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +32,7 @@ from distributed_runtime import (
     gather_objects,
     initialize,
 )
+from inference.elevation import ElevationConstraint
 from models.architecture import SegFormerUtae
 from precision import resolve_amp_dtype
 
@@ -180,6 +183,7 @@ def predict(
     output_predictor: int = 2,
     output_bigtiff: str = "IF_SAFER",
     write_row_block: int = 512,
+    elevation_constraint: dict[str, Any] | None = None,
     distributed: DistributedContext | None = None,
 ) -> tuple[Path, Path]:
     """Write classes, default confidence sidecar and mapping with bounded memory."""
@@ -212,6 +216,8 @@ def predict(
         raise ValueError(
             "batch_size 必须为正数，num_workers 不能为负数，prefetch_factor 必须为正数"
         )
+    if write_row_block < 1:
+        raise ValueError("write_row_block 必须为正数")
     if persistent_workers and num_workers == 0:
         raise ValueError("persistent_workers 需要 num_workers > 0")
     if cpu_threads is not None:
@@ -259,6 +265,13 @@ def predict(
         use_weak_labels=False,
     )
     grid = dataset.grid
+    constraint = (
+        ElevationConstraint(elevation_constraint, mapping, grid)
+        if elevation_constraint and elevation_constraint.get("enabled", False)
+        else None
+    )
+    if constraint is not None and constraint.path in output_paths:
+        raise ValueError("输出文件不能覆盖约束 DEM")
     ground_truth_by_row: dict[int, dict[int, int]] = {}
     for (pixel_row, pixel_column), code in dataset.ground_truth_pixels.items():
         ground_truth_by_row.setdefault(pixel_row, {})[pixel_column] = code
@@ -407,7 +420,11 @@ def predict(
             "BIGTIFF": output_bigtiff,
         }
         confidence_profile = {**profile, "dtype": "float32", "nodata": -9999.0}
+        skipped_overrides = 0
         with (
+            constraint.open()
+            if constraint is not None
+            else nullcontext() as dem_reader,
             rasterio.open(output_path, "w", **profile) as destination,
             rasterio.open(confidence_path, "w", **confidence_profile) as confidence_dst,
         ):
@@ -417,8 +434,16 @@ def predict(
                 valid_range="0,1",
                 ground_truth_override="Model probability of the overridden class",
             )
+            if constraint is not None:
+                destination.update_tags(**constraint.tags())
+                confidence_dst.update_tags(**constraint.tags())
             for row in range(0, grid.height, write_row_block):
                 end = min(row + write_row_block, grid.height)
+                dem_allowed = dem_missing = elevation = None
+                if constraint is not None:
+                    elevation, dem_allowed, dem_missing = constraint.read(
+                        dem_reader, Window(0, row, grid.width, end - row)
+                    )
                 denominator = np.zeros((end - row, grid.width), dtype=np.float32)
                 for shard_weights in weight_shards:
                     denominator += shard_weights[row:end]
@@ -428,6 +453,8 @@ def predict(
                     dtype=np.int32,
                 )
                 valid = denominator > 0
+                if constraint is not None and constraint.missing_dem == "nodata":
+                    valid &= ~dem_missing
                 confidence = np.full(result.shape, -9999.0, dtype=np.float32)
                 if valid.any():
                     best_class = np.zeros(result.shape, dtype=np.int32)
@@ -436,9 +463,16 @@ def predict(
                         class_score = np.zeros(result.shape, dtype=np.float32)
                         for shard_scores in score_shards:
                             class_score += shard_scores[class_index, row:end]
+                        if (
+                            constraint is not None
+                            and class_index + 1 in constraint.class_codes
+                        ):
+                            class_score[~dem_allowed] = -np.inf
                         better = class_score > best_score
                         best_score[better] = class_score[better]
                         best_class[better] = class_index + 1
+                    # If every class is prohibited, preserve NoData.
+                    valid &= np.isfinite(best_score)
                     result[valid] = best_class[valid]
                     confidence[valid] = best_score[valid] / denominator[valid]
                 if override_ground_truth:
@@ -446,8 +480,28 @@ def predict(
                         for column, code in ground_truth_by_row.get(
                             pixel_row, {}
                         ).items():
-                            result[pixel_row - row, column] = code
                             local_row = pixel_row - row
+                            if constraint is not None and (
+                                (
+                                    constraint.missing_dem == "nodata"
+                                    and dem_missing[local_row, column]
+                                )
+                                or (
+                                    code in constraint.class_codes
+                                    and not dem_allowed[local_row, column]
+                                )
+                            ):
+                                skipped_overrides += 1
+                                logging.getLogger(__name__).warning(
+                                    "海拔约束跳过实测点覆盖: "
+                                    "row=%s col=%s class=%s DEM=%s",
+                                    pixel_row,
+                                    column,
+                                    code,
+                                    elevation[local_row, column],
+                                )
+                                continue
+                            result[local_row, column] = code
                             if valid[local_row, column] and 1 <= code <= classes:
                                 confidence[local_row, column] = (
                                     sum(
@@ -464,6 +518,13 @@ def predict(
                 )
                 confidence_dst.write(
                     confidence, 1, window=Window(0, row, grid.width, end - row)
+                )
+            if constraint is not None:
+                destination.update_tags(
+                    skipped_ground_truth_overrides=skipped_overrides
+                )
+                confidence_dst.update_tags(
+                    skipped_ground_truth_overrides=skipped_overrides
                 )
         _write_mapping(mapping, mapping_path)
         for shard in [*score_shards, *weight_shards]:
@@ -516,6 +577,11 @@ def main(argv: list[str] | None = None) -> int:
     loader_config = dict(predict_config.get("dataloader", {}))
     amp_config = dict(predict_config.get("amp", {}))
     raster_config = dict(predict_config.get("output_raster", {}))
+    elevation_config = dict(predict_config.get("elevation_constraint") or {})
+    if elevation_config.get("dem_path"):
+        elevation_config["dem_path"] = str(
+            (args.config.resolve().parent / elevation_config["dem_path"]).resolve()
+        )
     checkpoint = args.checkpoint.resolve()
     window_size, stride, grid_offset = _load_training_window_config(checkpoint)
     output = args.output or predict_config.get("output")
@@ -561,6 +627,7 @@ def main(argv: list[str] | None = None) -> int:
         output_predictor=int(raster_config.get("predictor", 2)),
         output_bigtiff=str(raster_config.get("bigtiff", "IF_SAFER")),
         write_row_block=int(raster_config.get("write_row_block", 512)),
+        elevation_constraint=elevation_config,
         distributed=distributed,
     )
     if distributed.is_main:

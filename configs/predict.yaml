@@ -10,6 +10,24 @@ predict:
   output: null
   # 是否用所有地面实测标签覆盖结果图中的对应像素；false 表示保留模型预测。
   override_ground_truth: true
+  # 海拔硬约束在高斯融合后执行，优先于实测点覆盖；冲突点跳过覆盖并记录日志。
+  elevation_constraint:
+    enabled: true
+    # 相对本 predict.yaml 所在目录解析。使用未标准化的 DEM，物理单位必须是米。
+    # 读取时应用 GeoTIFF 自带的 scale/offset；无需与训练使用的 DEM 完全相同。
+    dem_path: ../data/raw/static/Copernicus_DEM_100m.tif
+    # 与 checkpoint 映射中任意层级的中/英文名称精确匹配，包含全部下属细类。
+    # 名称未匹配时直接报错，避免约束静默失效；不改变类别编号和图例。
+    classes: [高寒草原, 高寒草甸]
+    # 严格大于此海拔才允许上述类别，等于阈值也禁止；其余类别正常竞争。
+    min_elevation_m: 2300
+    # 先对齐到输出网格，再按海拔判断；可选 nearest、bilinear、average。
+    resampling: bilinear
+    # 源文件有 NoData 元数据时优先使用；否则使用此原始 DN 值，null 表示无。
+    dem_nodata: -9999
+    # nodata：DEM 缺失像元输出 NoData（包括实测点）。
+    # exclude_restricted：DEM 缺失处仅禁止受约束类别，从其余类别中选择。
+    missing_dem: nodata
   # 类别映射 CSV 输出文件；为空时根据 checkpoint 文件名自动生成。
   mapping_output: null
   # 是否允许覆盖已有输出文件；false 时发现同名文件会直接报错。
