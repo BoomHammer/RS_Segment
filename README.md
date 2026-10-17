@@ -110,6 +110,10 @@ uv run python scripts/predict.py experiments/<实验时间戳>/model_<实验时�
 
 各脚本的其他选项通过 `--help` 查看。
 
+已有模型需要在约束 Acc 下降的前提下减少细类准召率为零时，可单独运行
+`--refine-heads --init-checkpoint <原模型>` 第二阶段，操作方法和筛选规则见
+[分类头微调说明](docs/head_refinement.md)。
+
 ## 输出与预测
 
 中间数据保存在 `data/processed/<数据集时间戳>/`。实验目录通常包含：

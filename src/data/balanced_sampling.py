@@ -140,3 +140,67 @@ class CappedClassSampler(Sampler[int]):
         positions = list(range(len(self.indices))) + extra
         order = torch.randperm(len(positions), generator=generator).tolist()
         return iter(self.indices[positions[position]] for position in order)
+
+
+class CappedPointSampler(ClassBalancedPointSampler):
+    """Visit every training pixel, then supplement rare hard-label leaf pixels.
+
+    A pixel has at most ``max_point_repeats`` supervised visits per epoch.
+    Mixed/partial pixels retain their baseline visit, without multiplying their
+    observations into separate anchors. Frequencies come only from training.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        manifest,
+        indices,
+        *,
+        extra_fraction=0.25,
+        max_point_repeats=3,
+        seed=42,
+    ):
+        super().__init__(dataset, manifest, indices, seed=seed)
+        if not 0 <= extra_fraction <= 1:
+            raise ValueError("extra_fraction must be in [0, 1]")
+        if type(max_point_repeats) is not int or not 1 <= max_point_repeats <= 3:
+            raise ValueError("max_point_repeats must be 1, 2 or 3")
+        self.anchors = [point for points in self.points.values() for point in points]
+        hard_labels = dataset.ground_truth_pixels
+        counts = {}
+        for pixel, _ in self.anchors:
+            code = hard_labels.get(pixel, -1)
+            if code > 0:
+                counts[code] = counts.get(code, 0) + 1
+        largest = max(counts.values(), default=1)
+        slots, weights = [], []
+        for position, (pixel, _) in enumerate(self.anchors):
+            code = hard_labels.get(pixel, -1)
+            if code <= 0 or counts[code] == largest:
+                continue
+            for _ in range(max_point_repeats - 1):
+                slots.append(position)
+                weights.append(math.sqrt(largest / counts[code]) - 1)
+        self.slots = slots
+        self.weights = torch.tensor(weights, dtype=torch.double)
+        self.extra = min(math.floor(self._length * extra_fraction), len(slots))
+
+    def __len__(self):
+        return self._length + self.extra
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        self.epoch += 1
+        positions = list(range(self._length))
+        if self.extra:
+            selected = torch.multinomial(
+                self.weights, self.extra, replacement=False, generator=generator
+            ).tolist()
+            positions.extend(self.slots[index] for index in selected)
+        order = torch.randperm(len(positions), generator=generator).tolist()
+        selected = []
+        for index in order:
+            pixel, candidates = self.anchors[positions[index]]
+            choice = int(torch.randint(len(candidates), (1,), generator=generator))
+            selected.append((candidates[choice], pixel))
+        return iter(selected)

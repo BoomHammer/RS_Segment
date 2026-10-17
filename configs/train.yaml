@@ -1,4 +1,17 @@
 # 主训练配置。数据路径和数据集结构由 data.yaml 管理，模型结构由 model.yaml 管理。
+# 第二阶段：--refine-heads --init-checkpoint <原实验模型> 开启。
+# 此阶段覆盖 epochs/lr、EMA、类别权重、伪标签与 selection_level；普通训练不变。
+head_refinement:
+  enabled: false
+  epochs: 5
+  learning_rate: 0.00003
+  # 细类验证 Acc 的绝对下降上限，0.005 = 0.5 个百分点；不是测试集保证。
+  max_accuracy_drop: 0.005
+  # 每轮补充访问总量最多为原训练像素数的 25%。
+  extra_fraction: 0.25
+  # 包含首次访问在内，每个像素每轮最多参与三次实测监督。
+  max_point_repeats: 3
+
 training:
   # 训练轮数。
   epochs: 30

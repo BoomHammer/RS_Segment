@@ -260,6 +260,36 @@ def _metrics(
     return report
 
 
+def _add_level_summary(report: dict[str, Any]) -> dict[str, Any]:
+    """Put comparable hierarchy summaries before the large ROC detail arrays."""
+
+    summaries = {}
+    for name, metrics in [
+        *report.get("levels", {}).items(),
+        ("leaf", report.get("fine")),
+    ]:
+        if metrics is None:
+            continue
+        summaries[name] = {
+            "labeled_pixels": metrics["support"],
+            "accuracy": metrics["accuracy"]["micro"],
+            "macro_precision": metrics["precision"]["macro"],
+            "macro_recall": metrics["recall"]["macro"],
+            "macro_f1": metrics["f1_score"]["macro"],
+            "macro_iou": metrics["iou"]["macro"],
+        }
+    return {
+        "level_summary": summaries,
+        "metric_scope": {
+            "top_level_metrics": "leaf",
+            "leaf": "最终输出的叶子类别，包含不同终止层级，不等同于四级类",
+            "levels": "各层按该层有效标签独立评估，样本数可能不同",
+            "details": "各层详细指标见 levels；叶子类别详细指标见 fine",
+        },
+        **report,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="在空间测试集上评估分割模型")
     parser.add_argument(
@@ -463,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
             "created_at": datetime.now().isoformat(),
         }
     )
+    report = _add_level_summary(report)
     report_path = args.output or (experiment_dir / "test_metrics.json")
     report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"

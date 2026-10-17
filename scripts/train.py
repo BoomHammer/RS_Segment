@@ -22,7 +22,11 @@ from tqdm import tqdm
 
 from config import load_config
 from data.augmentations import SynchronizedAugmentation
-from data.balanced_sampling import CappedClassSampler, ClassBalancedPointSampler
+from data.balanced_sampling import (
+    CappedClassSampler,
+    CappedPointSampler,
+    ClassBalancedPointSampler,
+)
 from data.overlap import overlapping_view
 from data.sample_index import WindowedSampleDataset
 from data.sampling import SpatialWeightedSampler, build_dataloader
@@ -56,6 +60,14 @@ from evaluation import (
     evaluate_points as _evaluate,
 )
 from experiment_options import add_experiment_arguments, experiment_arguments
+from head_refinement import (
+    configure_refinement,
+    diagnostic_report,
+    freeze_for_refinement,
+    select_candidate,
+    selection_summary,
+    set_refinement_mode,
+)
 from losses.overlap import overlap_consistency_loss
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
@@ -98,6 +110,9 @@ def _initialize_weights(model, contract, path):
         "level_counts",
         "level_parents",
         "class_paths",
+        "optional_leaf_level",
+        "leaf_depths",
+        "label_path_aliases",
     ):
         if previous["derived"].get(key) != contract["derived"].get(key):
             raise ValueError(f"Initialization input/label mismatch: {key}")
@@ -278,6 +293,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", default=None)
     parser.add_argument("--resume", type=Path, help="完整训练断点 last.pt 的路径")
     parser.add_argument("--init-checkpoint", type=Path, help="新实验的初始模型权重")
+    parser.add_argument(
+        "--refine-heads",
+        action="store_true",
+        help="从初始权重仅微调下级分类头，按细类 Acc 下限选择模型",
+    )
     parser.add_argument("--region-fraction", type=float, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--window-size", type=int, nargs=2, default=None)
@@ -330,6 +350,17 @@ def main(argv: list[str] | None = None) -> int:
         policy["disable_weak_labels"] = True
     if args.train_on_test:
         policy["train_on_test"] = True
+    refinement = configure_refinement(train_config, args.refine_heads)
+    if refinement is not None:
+        if distributed.distributed:
+            raise ValueError(
+                "Head refinement currently requires --device cuda:0 (or cpu); "
+                "DDP padding would violate the per-pixel repeat cap"
+            )
+        if resume is None and args.init_checkpoint is None:
+            parser.error("--refine-heads requires --init-checkpoint")
+        if resume is not None and not resume["train_log"].get("head_refinement"):
+            parser.error("不能把普通训练断点转为微调续训；请使用 --init-checkpoint")
     training = dict(train_config.get("training", {}))
     profile_steps = int(
         os.environ.get("RS_PROFILE_STEPS", training.get("profile_steps", 0))
@@ -441,6 +472,17 @@ def main(argv: list[str] | None = None) -> int:
     experiment_split = output / "spatial_split.json"
     if resume is not None:
         _assert_resume_split_matches(experiment_split, manifest)
+    if refinement is not None and args.init_checkpoint is not None:
+        source_split = args.init_checkpoint.parent / "spatial_split.json"
+        source_log = args.init_checkpoint.parent / "train_log.json"
+        if not source_split.is_file() or not source_log.is_file():
+            raise ValueError("微调需要初始实验的 spatial_split.json 和 train_log.json")
+        _assert_resume_split_matches(source_split, manifest)
+        source_policy = json.loads(source_log.read_text(encoding="utf-8")).get(
+            "supervision_policy", {}
+        )
+        if source_policy.get("train_on_test", False):
+            raise ValueError("初始模型已使用测试集训练，不能用于独立测试的微调实验")
     supervision_audit = None
     if policy:
         supervision_audit = supervision_summary(dataset, manifest)
@@ -496,6 +538,7 @@ def main(argv: list[str] | None = None) -> int:
         pretrained_initialization = model.initialize_pretrained()
     device = distributed.device
     model.to(device)
+    conditional_heads = freeze_for_refinement(model) if refinement is not None else None
     loader_config = dict(train_config.get("dataloader", {}))
     configured_batch_size = int(loader_config.get("batch_size", 1))
     if configured_batch_size < 1:
@@ -511,7 +554,17 @@ def main(argv: list[str] | None = None) -> int:
     if num_workers == 0:
         persistent_workers = False
     sampling_config = dict(stage2.get("sampling", {}))
-    if policy.get("class_balanced_point_sampling", False):
+    if refinement is not None:
+        train_sampler = CappedPointSampler(
+            dataset,
+            manifest,
+            train_indices,
+            extra_fraction=refinement["extra_fraction"],
+            max_point_repeats=refinement["max_point_repeats"],
+            seed=int(training.get("seed", 42)),
+        )
+        train_loader_indices = None
+    elif policy.get("class_balanced_point_sampling", False):
         train_sampler = ClassBalancedPointSampler(
             dataset,
             manifest,
@@ -581,6 +634,27 @@ def main(argv: list[str] | None = None) -> int:
         drop_last=False,
         seed=int(training.get("seed", 42)),
     )
+    diagnostic_loader = None
+    if refinement is not None:
+        diagnostic_dataset = WindowedSampleDataset(
+            **{**dataset_kwargs, "use_weak_labels": False}, transforms=None
+        )
+        diagnostic_dataset.configure_supervision_split(
+            manifest, "train", mask_weak_labels=False
+        )
+        diagnostic_loader = build_dataloader(
+            diagnostic_dataset,
+            indices=train_indices,
+            batch_size=validation_batch_size,
+            num_workers=int(
+                loader_config.get("validation_num_workers", min(2, num_workers))
+            ),
+            pin_memory=False,
+            persistent_workers=False,
+            prefetch_factor=1,
+            drop_last=False,
+            seed=int(training.get("seed", 42)),
+        )
     optimizer_config = dict(train_config.get("optimizer", {}))
     accumulation_steps = int(training.get("gradient_accumulation_steps", 1))
     if accumulation_steps < 1:
@@ -589,7 +663,11 @@ def main(argv: list[str] | None = None) -> int:
         accumulation_steps *= configured_batch_size
         if distributed.is_main:
             print(f"halo={halo}，单窗口训练，梯度累积={accumulation_steps}")
-    parameters = model.parameters()
+    parameters = (
+        [parameter for parameter in model.parameters() if parameter.requires_grad]
+        if refinement is not None
+        else model.parameters()
+    )
     if model_config.get("architecture") in {
         "segformer_utae_pretrained",
         "segformer_utae_static_ablation",
@@ -623,7 +701,11 @@ def main(argv: list[str] | None = None) -> int:
                 ]
             },
             {
-                "params": model.core.parameters(),
+                "params": (
+                    [p for p in model.core.parameters() if p.requires_grad]
+                    if refinement is not None
+                    else model.core.parameters()
+                ),
                 "lr": float(optimizer_config.get("pretrained_learning_rate", 1e-5)),
             },
         ]
@@ -811,6 +893,72 @@ def main(argv: list[str] | None = None) -> int:
         if distributed.is_main:
             print(f"已恢复断点，完成 {start_epoch} 轮，目标共 {epochs} 轮")
         del resume
+    if refinement is not None:
+        if "head_refinement" not in train_log:
+            baseline = diagnostic_report(
+                _evaluate(
+                    raw_model,
+                    validation_loader,
+                    device,
+                    amp_dtype=amp_name,
+                    selection_level=None,
+                    leaf_depths=derived.get("leaf_depths"),
+                )
+            )
+            baseline_summary = selection_summary(baseline)
+            train_diagnostics = diagnostic_report(
+                _evaluate(
+                    raw_model,
+                    diagnostic_loader,
+                    device,
+                    amp_dtype=amp_name,
+                    selection_level=None,
+                    leaf_depths=derived.get("leaf_depths"),
+                )
+            )
+            for name, report in (
+                ("validation_baseline.json", baseline),
+                ("training_baseline.json", train_diagnostics),
+            ):
+                (output / name).write_text(
+                    json.dumps(report, indent=2), encoding="utf-8"
+                )
+            best_state = {
+                name: value.detach().cpu().clone()
+                for name, value in raw_model.state_dict().items()
+            }
+            best_validation_loss = float(baseline["loss"])
+            best_monitor_value = float(baseline["macro_f1"])
+            train_log["head_refinement"] = {
+                "settings": dict(refinement),
+                "baseline": baseline_summary,
+                "best": baseline_summary,
+                "accuracy_floor": baseline_summary["accuracy"]
+                - refinement["max_accuracy_drop"],
+                "selection": (
+                    "accuracy_floor_then_fewer_zero_recall_"
+                    "then_macro_f1_precision_accuracy"
+                ),
+                "unique_training_pixels": train_sampler._length,
+                "extra_training_visits": train_sampler.extra,
+                "trainable_parameters": sum(
+                    p.numel() for p in raw_model.parameters() if p.requires_grad
+                ),
+                "trainable_parameter_names": [
+                    name for name, p in raw_model.named_parameters() if p.requires_grad
+                ],
+            }
+            # The initial model is a real candidate and the safe fallback.
+            _atomic_save(
+                {"model": best_state, "contract": model_config},
+                output / checkpoint_name,
+            )
+        train_log["checkpoint_monitor"] = "leaf_accuracy_constrained_class_coverage"
+        print(
+            "Head refinement: leaf validation accuracy floor="
+            f"{train_log['head_refinement']['accuracy_floor']:.6f}; "
+            "only conditional heads are trainable"
+        )
     train_log["status"] = "running"
     train_log["precision"] = {
         "amp_dtype": amp_name,
@@ -845,6 +993,8 @@ def main(argv: list[str] | None = None) -> int:
         if early_stopping_enabled and stale_epochs >= patience:
             break
         model.train()
+        if refinement is not None:
+            set_refinement_mode(raw_model, conditional_heads)
         total = 0.0
         batches = 0
         correct_pixels = 0
@@ -1109,6 +1259,21 @@ def main(argv: list[str] | None = None) -> int:
                 selection_level=training.get("selection_level"),
                 leaf_depths=derived.get("leaf_depths"),
             )
+        if refinement is not None:
+            validation = diagnostic_report(validation)
+            train_diagnostics = diagnostic_report(
+                _evaluate(
+                    raw_model,
+                    diagnostic_loader,
+                    device,
+                    amp_dtype=amp_name,
+                    selection_level=None,
+                    leaf_depths=derived.get("leaf_depths"),
+                )
+            )
+            (output / f"training_epoch_{epoch + 1:03d}.json").write_text(
+                json.dumps(train_diagnostics, indent=2), encoding="utf-8"
+            )
         # Inference and training have different allocation patterns. Do not
         # carry unused validation allocations into the next training epoch.
         if device.type == "cuda":
@@ -1147,6 +1312,23 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "optimizer_steps": optimizer_steps,
         }
+        if refinement is not None:
+            candidate = selection_summary(validation)
+            refinement_log = train_log["head_refinement"]
+            eligible, refinement_improved = select_candidate(
+                candidate,
+                refinement_log["baseline"],
+                refinement_log["best"],
+                refinement["max_accuracy_drop"],
+            )
+            epoch_metrics.update(
+                val_zero_recall_count=candidate["zero_recall_count"],
+                val_supported_macro_precision=candidate["macro_precision"],
+                accuracy_eligible=eligible,
+                refinement_selected=refinement_improved,
+            )
+            if refinement_improved:
+                refinement_log["best"] = candidate
         metrics.append(epoch_metrics)
         _append_metrics_csv(
             output / "epoch_metrics.csv",
@@ -1173,7 +1355,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         if float(validation["loss"]) < best_validation_loss:
             best_validation_loss = float(validation["loss"])
-            if distributed.is_main:
+            if distributed.is_main and refinement is None:
                 _atomic_save(
                     {"model": selected_state, "contract": model_config},
                     output / "best_loss.pt",
@@ -1184,15 +1366,26 @@ def main(argv: list[str] | None = None) -> int:
             if minimize_monitor
             else value > best_monitor_value + min_delta
         )
+        if refinement is not None:
+            improved = refinement_improved
+            value = candidate["macro_f1"]
         if improved:
             best_monitor_value = value
             best_epoch = epoch + 1
             stale_epochs = 0
             best_state = selected_state
+            if refinement is not None:
+                _atomic_save(
+                    {"model": best_state, "contract": model_config},
+                    output / checkpoint_name,
+                )
         else:
             stale_epochs += 1
-        if distributed.is_main and float(validation["accuracy"]) > max(
-            (float(item["val_accuracy"]) for item in metrics[:-1]), default=-1.0
+        if (
+            refinement is None
+            and distributed.is_main
+            and float(validation["accuracy"])
+            > max((float(item["val_accuracy"]) for item in metrics[:-1]), default=-1.0)
         ):
             accuracy_state = (
                 {name: value.detach().cpu() for name, value in ema.shadow.items()}
@@ -1205,7 +1398,8 @@ def main(argv: list[str] | None = None) -> int:
             )
         unique_accuracy = validation.get("unique_point_accuracy")
         if (
-            distributed.is_main
+            refinement is None
+            and distributed.is_main
             and unique_accuracy is not None
             and unique_accuracy
             > max(
