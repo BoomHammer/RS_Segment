@@ -10,6 +10,16 @@ predict:
   output: null
   # 是否用所有地面实测标签覆盖结果图中的对应像素；false 表示保留模型预测。
   override_ground_truth: true
+  # 复用全图高斯融合结果评估独立测试点，在实测点覆盖前采集约束前/后的判定。
+  # 训练时的 validation 不变；测试集若已并入训练，报告标记跳过，不能视为独立精度。
+  evaluation:
+    enabled: true
+    # null：分类图同目录下的 <分类图文件名>_test_metrics.json。
+    # 自定义路径相对本 predict.yaml 所在目录解析，遵循 overwrite 设置。
+    output: null
+    # null 评估全部测试点；整数仅选择前 N 个测试窗口内的测试点用于快速诊断。
+    # 限制的是评估点，推理及高斯融合仍使用全图全部窗口。
+    max_windows: null
   # 海拔硬约束在高斯融合后执行，优先于实测点覆盖；冲突点跳过覆盖并记录日志。
   elevation_constraint:
     enabled: true

@@ -858,6 +858,14 @@ class WindowedSampleDataset(GeoDataset):
         }
 
     @property
+    def evaluation_observations(self):
+        """Return sparse original hierarchy observations, including mixed pixels."""
+        return {
+            pixel: tuple(self._mixed_observations.get(pixel, [codes]))
+            for pixel, codes in self._ground_truth_levels.items()
+        }
+
+    @property
     def supervision_pixels(self) -> dict[tuple[int, int], int]:
         """Sampling identities; negative keys identify partial classes, not labels."""
         result = dict(self._ground_truth)

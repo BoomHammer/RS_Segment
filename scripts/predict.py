@@ -33,6 +33,7 @@ from distributed_runtime import (
     initialize,
 )
 from inference.elevation import ElevationConstraint
+from inference.point_evaluation import PredictionPointEvaluation
 from models.architecture import SegFormerUtae
 from precision import resolve_amp_dtype
 
@@ -184,6 +185,7 @@ def predict(
     output_bigtiff: str = "IF_SAFER",
     write_row_block: int = 512,
     elevation_constraint: dict[str, Any] | None = None,
+    evaluation: dict[str, Any] | None = None,
     distributed: DistributedContext | None = None,
 ) -> tuple[Path, Path]:
     """Write classes, default confidence sidecar and mapping with bounded memory."""
@@ -195,8 +197,19 @@ def predict(
     confidence_path = output_path.with_name(f"{output_path.stem}_confidence.tif")
     mapping_path = Path(mapping_output).resolve()
     output_paths = (output_path, confidence_path, mapping_path)
+    evaluation_enabled = evaluation is not None and evaluation.get("enabled", True)
+    metrics_path = (
+        Path(
+            evaluation.get("output")
+            or output_path.with_name(f"{output_path.stem}_test_metrics.json")
+        ).resolve()
+        if evaluation_enabled
+        else None
+    )
+    if metrics_path is not None:
+        output_paths = (*output_paths, metrics_path)
     if len(set(output_paths)) != len(output_paths):
-        raise ValueError("分类图、Confidence 图和类别表的输出路径必须不同")
+        raise ValueError("分类图、Confidence 图、类别表和测试报告的输出路径必须不同")
     if any(path.exists() for path in output_paths) and not overwrite:
         raise FileExistsError("输出已存在；如需覆盖请指定 --overwrite")
     if (
@@ -276,6 +289,11 @@ def predict(
     for (pixel_row, pixel_column), code in dataset.ground_truth_pixels.items():
         ground_truth_by_row.setdefault(pixel_row, {})[pixel_column] = code
     classes = int(contract["derived"]["num_classes"])
+    evaluator = (
+        PredictionPointEvaluation(dataset, mapping, checkpoint_path, run, evaluation)
+        if evaluation_enabled
+        else None
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     mapping_path.parent.mkdir(parents=True, exist_ok=True)
     temp_files: list[Path] = []
@@ -330,6 +348,8 @@ def predict(
         collate_fn=sample_collate_fn,
     )
     denominator = result = valid = gaussian = probabilities = valid_masks = None
+    score_shards = []
+    weight_shards = []
     try:
         with torch.inference_mode():
             for batch in tqdm(
@@ -475,6 +495,19 @@ def predict(
                     valid &= np.isfinite(best_score)
                     result[valid] = best_class[valid]
                     confidence[valid] = best_score[valid] / denominator[valid]
+                if evaluator is not None:
+                    evaluator.capture(
+                        row,
+                        end,
+                        score_shards,
+                        denominator,
+                        result,
+                        valid,
+                        constraint,
+                        elevation,
+                        dem_allowed,
+                        dem_missing,
+                    )
                 if override_ground_truth:
                     for pixel_row in range(row, end):
                         for column, code in ground_truth_by_row.get(
@@ -526,11 +559,17 @@ def predict(
                 confidence_dst.update_tags(
                     skipped_ground_truth_overrides=skipped_overrides
                 )
+        if evaluator is not None:
+            report = evaluator.write(metrics_path, constraint)
+            print(f"融合后测试报告: {metrics_path} ({report['status']})")
         _write_mapping(mapping, mapping_path)
         for shard in [*score_shards, *weight_shards]:
             shard._mmap.close()
         barrier(runtime)
     finally:
+        for shard in [*score_shards, *weight_shards]:
+            if not shard._mmap.closed:
+                shard._mmap.close()
         # Windows keeps the backing file locked while any memmap view exists.
         # Clear the last row/output views before closing and deleting the files.
         denominator = result = valid = gaussian = None
@@ -564,6 +603,12 @@ def main(argv: list[str] | None = None) -> int:
         "--pin-memory", action=argparse.BooleanOptionalAction, default=None
     )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        "--evaluation-max-windows",
+        type=int,
+        default=None,
+        help="仅评估前 N 个测试窗口内的测试点；概率仍使用完整全图融合结果",
+    )
     args = parser.parse_args(argv)
     launch_result = auto_launch(
         __file__, sys.argv[1:] if argv is None else argv, device=args.device
@@ -578,6 +623,13 @@ def main(argv: list[str] | None = None) -> int:
     amp_config = dict(predict_config.get("amp", {}))
     raster_config = dict(predict_config.get("output_raster", {}))
     elevation_config = dict(predict_config.get("elevation_constraint") or {})
+    evaluation_config = dict(predict_config.get("evaluation") or {"enabled": True})
+    if evaluation_config.get("output"):
+        evaluation_config["output"] = str(
+            (args.config.resolve().parent / evaluation_config["output"]).resolve()
+        )
+    if args.evaluation_max_windows is not None:
+        evaluation_config["max_windows"] = args.evaluation_max_windows
     if elevation_config.get("dem_path"):
         elevation_config["dem_path"] = str(
             (args.config.resolve().parent / elevation_config["dem_path"]).resolve()
@@ -628,6 +680,7 @@ def main(argv: list[str] | None = None) -> int:
         output_bigtiff=str(raster_config.get("bigtiff", "IF_SAFER")),
         write_row_block=int(raster_config.get("write_row_block", 512)),
         elevation_constraint=elevation_config,
+        evaluation=evaluation_config,
         distributed=distributed,
     )
     if distributed.is_main:

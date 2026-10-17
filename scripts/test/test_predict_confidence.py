@@ -28,6 +28,28 @@ def test_default_confidence(
     spec.loader.exec_module(predict)
     checkpoint = tmp_path / "model.pt"
     checkpoint.touch()
+    (tmp_path / "train_log.json").write_text("{}")
+    (tmp_path / "spatial_split.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "seed": 42,
+                "block_size": [1, 1],
+                "ratios": [0.5, 0, 0.5],
+                "splits": {"train": [0], "test": [1]},
+                "blocks": {
+                    "0:0": "test",
+                    "0:1": "test",
+                    "0:2": "train",
+                    "1:0": "test",
+                    "1:2": "test",
+                },
+                "class_counts": {},
+                "class_weights": {},
+                "sampling_weights": {},
+            }
+        )
+    )
     for name in ("sample_index.json", "raster_stats.json"):
         (tmp_path / name).write_text("{}")
     (tmp_path / "label_mapping.json").write_text(
@@ -57,6 +79,10 @@ def test_default_confidence(
     dataset = Dataset()
     dataset.grid = grid
     dataset.ground_truth_pixels = {(0, 0): 2, (0, 1): 1, (1, 0): 1, (1, 2): 1}
+    dataset.evaluation_observations = {
+        **{pixel: ((1, code),) for pixel, code in dataset.ground_truth_pixels.items()},
+        (0, 2): ((1, 2),),  # Training-owned point must never enter test metrics.
+    }
     dem_path = tmp_path / "dem.tif"
     with rasterio.open(
         dem_path,
@@ -144,6 +170,7 @@ def test_default_confidence(
         write_row_block=row_block,
         override_ground_truth=override,
         elevation_constraint=constraint_config,
+        evaluation={"enabled": True},
     ) == (output, mapping)
     confidence = tmp_path / "vegetation_confidence.tif"
     with rasterio.open(output) as labels, rasterio.open(confidence) as scores:
@@ -171,8 +198,34 @@ def test_default_confidence(
             assert int(labels.tags()["skipped_ground_truth_overrides"]) == (
                 expected_skips if override else 0
             )
+    report_path = tmp_path / "vegetation_test_metrics.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "ok"
+    assert report["coverage"]["test_pixels"] == 4
+    assert report["before_constraint"]["leaf"]["accuracy"] == 0.5
+    assert report["before_constraint"]["leaf"]["coverage"] == 0.75
+    # These metrics must be independent of the subsequent ground-truth override.
+    after = report["after_constraint"]["leaf"]
+    assert after["accuracy"] == (
+        0.5
+        if constraint_mode == "disabled"
+        else 0
+        if constraint_mode == "all_restricted"
+        else 0.25
+    )
+    records = {(p["row"], p["column"]): p for p in report["point_predictions"]}
+    assert (0, 2) not in records
+    assert records[0, 0]["before_prediction"] == 1
+    assert records[1, 2]["after_prediction"] is None
+    np.testing.assert_allclose(records[0, 1]["fused_probabilities"], [0.55, 0.45])
+    if constraint_mode != "disabled":
+        assert records[0, 1]["label_constraint_conflict"]
+        assert report["coverage"]["dem_missing_pixels"] == 1
     # A leftover confidence sidecar must receive the same overwrite protection.
     output.unlink()
     mapping.unlink()
     with pytest.raises(FileExistsError):
         predict.predict(checkpoint, output, mapping)
+    confidence.unlink()
+    with pytest.raises(FileExistsError):
+        predict.predict(checkpoint, output, mapping, evaluation={"enabled": True})

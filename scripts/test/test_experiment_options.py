@@ -39,15 +39,14 @@ def test_retrain_routes_only_training_test_prediction(
             )
 
     monkeypatch.setattr(pipeline, "_run", stage)
-    args = ["--retrain", str(run), "--no-pseudo-labels"]
+    args = ["--retrain", str(run), "--no-pseudo-labels", "--max-windows", "3"]
     if model:
         args += ["--model", model]
     if merge:
         args += ["--train-on-test"]
     assert pipeline.main(args) == 0
-    assert [name for name, _ in calls] == (
-        ["train", "predict"] if merge else ["train", "test", "predict"]
-    )
+    assert [name for name, _ in calls] == ["train", "predict"]
+    assert calls[1][1][calls[1][1].index("--evaluation-max-windows") + 1] == "3"
     assert "--no-pseudo-labels" in calls[0][1]
     if model:
         assert calls[0][1][calls[0][1].index("--model") + 1] == model

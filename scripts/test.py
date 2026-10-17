@@ -1,4 +1,4 @@
-"""Evaluate a trained segmentation checkpoint on a spatial test split."""
+"""Diagnose raw model heads; final map evaluation runs inside predict.py."""
 
 from __future__ import annotations
 
@@ -291,7 +291,10 @@ def _add_level_summary(report: dict[str, Any]) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="在空间测试集上评估分割模型")
+    parser = argparse.ArgumentParser(
+        description="诊断原始模型输出（不含制图融合/硬约束）；"
+        "最终地图精度由 predict.py 评估"
+    )
     parser.add_argument(
         "checkpoint", type=Path, help="训练实验目录中的带时间戳 model_*.pt 路径"
     )

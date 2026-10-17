@@ -104,11 +104,16 @@ uv run python scripts/preprocess.py --config configs/data.yaml --skip-weak-label
 uv run python scripts/weak_label.py --data-config configs/data.yaml --run-dir data/processed/<数据集时间戳>
 uv run python scripts/datasets.py data/processed/<数据集时间戳>
 uv run python scripts/train.py data/processed/<数据集时间戳>
-uv run python scripts/test.py experiments/<实验时间戳>/model_<实验时间戳>.pt
 uv run python scripts/predict.py experiments/<实验时间戳>/model_<实验时间戳>.pt --config configs/predict.yaml
 ```
 
 各脚本的其他选项通过 `--help` 查看。
+
+`predict.py` 默认在高斯融合和海拔硬约束之后评估独立测试点，同时报告约束前后的精度；
+评估数据在实测标签覆盖前采集，不受 `override_ground_truth` 影响。一键工作流复用该评估，
+无需另跑一次模型。训练过程中的 validation 保持不变。
+需要诊断原始模型各分类头时，仍可单独运行 `scripts/test.py <checkpoint>`；它的均值融合指标
+不包含制图硬约束，不能作为最终地图精度。
 
 已有模型需要在约束 Acc 下降的前提下减少细类准召率为零时，可单独运行
 `--refine-heads --init-checkpoint <原模型>` 第二阶段，操作方法和筛选规则见
@@ -125,12 +130,21 @@ uv run python scripts/predict.py experiments/<实验时间戳>/model_<实验时�
 | `train_log.json` | 训练记录、来源数据集与监督策略 |
 | `data.yaml`、`model.yaml`、`train.yaml` | 生效配置快照 |
 | `spatial_split.json`、`supervision_audit.json` | 本次实验的空间划分视图与监督审计 |
-| `test_metrics.json` | 测试指标；跳过测试时不生成 |
+| `vegetation_*_test_metrics.json` | 最终制图在实测点覆盖前的约束前/后测试报告 |
+| `test_metrics.json` | 可选独立 `test.py` 生成的原始模型诊断指标 |
 | `vegetation_*.tif`、`vegetation_*.csv` | 植被分类 GeoTIFF 与类别映射表 |
 
 每次预测还会默认输出同目录下的 `<分类图文件名去掉扩展名>_confidence.tif`，无需增加参数。该图为 Float32，数值范围 0–1，表示重叠窗口高斯加权融合后，模型对最终输出类别的概率；越高表示模型越有把握，并不等同于实际分类准确率。空间范围、分辨率和坐标系与分类图一致，无有效预测的位置为 NoData（-9999）。实测标签覆盖的位置使用模型对覆盖后类别的概率，不人为设为 1。Confidence 图也遵循现有的 `overwrite` 设置。
 
 预测沿用训练记录中的窗口参数。当前 `configs/predict.yaml` 默认设置 `override_ground_truth: true`，会用实测标签覆盖输出图中的对应像元；如需保留纯模型预测，设为 `false`。该选项不改变训练或测试指标。默认禁止覆盖同名预测文件，重复出图需指定新输出路径或明确启用 `overwrite`。
+
+最终测试由 `predict.evaluation` 配置，默认输出 `<分类图文件名去掉扩展名>_test_metrics.json`，
+优先使用实验目录中保存的空间划分，仅评估归属 test 的像元。报告包含叶类与各层级的准确率、
+精确率、召回率、F1、IoU、混淆矩阵，以及测试点融合概率、约束前后判定、DEM 缺失和规则冲突。
+各层级判定来自最终选中叶类的祖先，确保与地图图例一致；混合标签单独报告观测标签一致度。
+NoData 在总准确率中按未正确分类计入，并另报有效预测覆盖率与有效预测上的准确率，
+不会通过删除 DEM 缺失或违反海拔规则的测试标签抬高精度。
+若测试集已用于训练，或没有测试点，报告明确记录跳过状态，不生成有效精度。
 
 ## 开发检查
 

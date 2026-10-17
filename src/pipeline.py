@@ -1,4 +1,4 @@
-"""Run data preparation, training, evaluation, and whole-grid prediction."""
+"""Run preparation, training, and prediction with fused-map evaluation."""
 
 from __future__ import annotations
 
@@ -72,7 +72,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--device", default=None)
-    parser.add_argument("--max-windows", type=int, default=None)
+    parser.add_argument(
+        "--max-windows",
+        type=int,
+        default=None,
+        help="仅评估前 N 个测试窗口内的测试点；全图预测仍使用全部窗口",
+    )
     parser.add_argument(
         "--resume",
         type=Path,
@@ -188,16 +193,11 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError("训练未生成新的 experiments 实验目录")
         experiment = experiment_candidates[-1]
     checkpoint = _experiment_checkpoint(experiment)
-    test_args = [str(checkpoint)]
-    if args.device is not None:
-        test_args.extend(["--device", args.device])
-    if args.max_windows is not None:
-        test_args.extend(["--max-windows", str(args.max_windows)])
-    metadata = json.loads((experiment / "train_log.json").read_text(encoding="utf-8"))
-    merged_test = metadata.get("supervision_policy", {}).get("train_on_test", False)
-    if not (args.train_on_test or merged_test):
-        _run(root, "test", test_args)
+    # Prediction evaluates held-out fused decisions before ground-truth overrides.
+    # It also checks the experiment metadata for tests merged into training.
     predict_args = [str(checkpoint), "--config", str(args.predict_config.resolve())]
+    if args.max_windows is not None:
+        predict_args.extend(["--evaluation-max-windows", str(args.max_windows)])
     if args.device is not None:
         predict_args.extend(["--device", args.device])
     _run(root, "predict", predict_args)
