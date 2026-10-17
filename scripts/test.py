@@ -266,6 +266,10 @@ def _add_level_summary(report: dict[str, Any]) -> dict[str, Any]:
     summaries = {}
     for name, metrics in [
         *report.get("levels", {}).items(),
+        (
+            "四级类（三级预测正确）",
+            report.get("fourth_level_given_third_correct"),
+        ),
         ("leaf", report.get("fine")),
     ]:
         if metrics is None:
@@ -284,10 +288,56 @@ def _add_level_summary(report: dict[str, Any]) -> dict[str, Any]:
             "top_level_metrics": "leaf",
             "leaf": "最终输出的叶子类别，包含不同终止层级，不等同于四级类",
             "levels": "各层按该层有效标签独立评估，样本数可能不同",
+            "fourth_level_given_third_correct": (
+                "仅在三级预测正确且有四级真实标签的样本上评估四级分类"
+            ),
             "details": "各层详细指标见 levels；叶子类别详细指标见 fine",
         },
         **report,
     }
+
+
+def _conditional_fourth_level_metrics(
+    level_predictions: dict[int, tuple],
+) -> dict[str, Any] | None:
+    """Evaluate level four only where the level-three prediction is correct."""
+
+    third = level_predictions.get(2)
+    fourth = level_predictions.get(3)
+    if third is None or fourth is None:
+        return None
+    third_targets, third_probabilities, third_positions, _ = third
+    fourth_targets, fourth_probabilities, fourth_positions, _ = fourth
+    third_predictions = third_probabilities.argmax(dim=1)
+    correct_positions = {
+        position
+        for position, correct in zip(
+            third_positions,
+            third_predictions.eq(third_targets).tolist(),
+            strict=True,
+        )
+        if correct
+    }
+    selected = torch.tensor(
+        [position in correct_positions for position in fourth_positions],
+        dtype=torch.bool,
+    )
+    if not selected.any():
+        return None
+    report = _classification_metrics(
+        fourth_targets[selected],
+        fourth_probabilities[selected],
+        fourth_probabilities.shape[1],
+    )
+    report.update(
+        {
+            "condition": "third_level_prediction_correct",
+            "third_level_correct_points": len(correct_positions),
+            "fourth_level_labeled_points": len(fourth_targets),
+            "evaluated_points": int(selected.sum()),
+        }
+    )
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -469,6 +519,9 @@ def main(argv: list[str] | None = None) -> int:
             }
             for level, values in level_predictions.items()
         }
+        conditional_fourth = _conditional_fourth_level_metrics(level_predictions)
+        if conditional_fourth is not None:
+            report["fourth_level_given_third_correct"] = conditional_fourth
     report["class_coverage"] = manifest.class_coverage
     report["mixed_pixels"] = {
         level: mixed_point_metrics(values[0], values[1], values[3])

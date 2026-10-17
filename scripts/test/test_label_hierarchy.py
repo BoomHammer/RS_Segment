@@ -114,6 +114,36 @@ def test_csv_contract_legend_and_metrics(tmp_path, depth):
     assert ("coarse" in report) == (depth > 1)
 
 
+def test_fourth_level_metrics_are_conditioned_on_correct_third_level() -> None:
+    spec = importlib.util.spec_from_file_location(
+        "conditional_hierarchy_metrics", Path(__file__).parents[1] / "test.py"
+    )
+    metrics = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(metrics)
+    positions = [(0, 0), (0, 1), (0, 2)]
+    levels = {
+        2: (
+            torch.tensor([0, 1, 1]),
+            torch.tensor([[0.9, 0.1], [0.8, 0.2], [0.1, 0.9]]),
+            positions,
+            3,
+        ),
+        3: (
+            torch.tensor([0, 1, 2]),
+            torch.tensor([[0.9, 0.05, 0.05], [0.1, 0.8, 0.1], [0.8, 0.1, 0.1]]),
+            positions,
+            3,
+        ),
+    }
+
+    report = metrics._conditional_fourth_level_metrics(levels)
+
+    assert report["third_level_correct_points"] == 2
+    assert report["fourth_level_labeled_points"] == 3
+    assert report["evaluated_points"] == 2
+    assert report["accuracy"]["micro"] == 0.5
+
+
 def test_mapping_rejects_wrong_middle_parent(tmp_path):
     path, columns = _csv(tmp_path, 3)
     mapping = build_label_mapping(path, label_columns=columns)

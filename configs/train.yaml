@@ -22,8 +22,8 @@ training:
   gradient_accumulation_steps: 2
   # 随机种子，保证数据采样和增强可复现。
   seed: 42
-  # 验证与最佳模型选择以一级为准（从 0 开始）；仍记录所有层级指标。
-  selection_level: 0
+  # 验证、早停与最佳模型选择以三级为准（从 0 开始）；仍记录所有层级指标。
+  selection_level: 2
   early_stopping:
     # 是否在验证损失长期不下降时提前结束训练。
     enabled: true

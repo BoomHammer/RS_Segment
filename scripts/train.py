@@ -1474,12 +1474,18 @@ def main(argv: list[str] | None = None) -> int:
             (output / "train_log.json").write_text(
                 json.dumps(train_log, indent=2), encoding="utf-8"
             )
+            selected_level = validation["selection_level"]
+            displayed_level = (
+                "leaf" if selected_level == "leaf" else str(int(selected_level) + 1)
+            )
             print(
                 f"epoch {epoch + 1}/{epochs}: loss={epoch_loss:.5f}, "
-                f"accuracy={epoch_accuracy:.4f}, "
+                f"train_leaf_accuracy={epoch_accuracy:.4f} "
+                f"({int(correct_pixels)}/{int(labeled_pixels)}), "
+                f"val_level={displayed_level}, "
                 f"val_loss={validation['loss']:.5f}, "
-                f"val_accuracy={validation['accuracy']:.4f} "
-                f"({int(correct_pixels)}/{int(labeled_pixels)})"
+                f"val_accuracy={validation['accuracy']:.4f}, "
+                f"val_macro_f1={validation['macro_f1']:.4f}"
             )
         if early_stopping_enabled and stale_epochs >= patience:
             if distributed.is_main:
