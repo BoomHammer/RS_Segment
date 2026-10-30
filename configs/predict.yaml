@@ -30,7 +30,7 @@ predict:
     # 名称未匹配时直接报错，避免约束静默失效；不改变类别编号和图例。
     classes: [高寒草原, 高寒草甸]
     # 严格大于此海拔才允许上述类别，等于阈值也禁止；其余类别正常竞争。
-    min_elevation_m: 2300
+    min_elevation_m: 1850
     # 先对齐到输出网格，再按海拔判断；可选 nearest、bilinear、average。
     resampling: bilinear
     # 源文件有 NoData 元数据时优先使用；否则使用此原始 DN 值，null 表示无。
