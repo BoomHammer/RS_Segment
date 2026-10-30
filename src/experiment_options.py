@@ -6,6 +6,9 @@ MODEL_CHOICES = {
     "segformer": "segformer",
     "maestro": "maestro_s",
     "anysat": "anysat",
+    "tsvit": "tsvit_adapted",
+    "segnext": "segnext_tiny",
+    "unet": "unet_resnet34",
     "lightweight": "lightweight_dual_branch",
 }
 

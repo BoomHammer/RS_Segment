@@ -16,7 +16,7 @@ from torch.utils.data import Sampler
 T = TypeVar("T")
 
 
-def wrap_training_model(model, context):
+def wrap_training_model(model, context, *, find_unused_parameters=True):
     """Allow unused branches in supervised and overlap-only backward passes."""
     if not context.distributed:
         return model
@@ -25,7 +25,7 @@ def wrap_training_model(model, context):
         model,
         device_ids=[context.local_rank] if cuda else None,
         output_device=context.local_rank if cuda else None,
-        find_unused_parameters=True,
+        find_unused_parameters=find_unused_parameters,
     )
 
 

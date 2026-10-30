@@ -100,6 +100,9 @@ def _initialize_weights(model, contract, path):
         "fusion",
         "maestro",
         "anysat",
+        "tsvit",
+        "segnext",
+        "unet",
     ):
         if previous.get(key) != contract.get(key):
             raise ValueError(f"Initialization architecture mismatch: {key}")
@@ -345,6 +348,7 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("断点续训须保持原目标 epochs，以保留原学习率计划")
     with args.train_config.open(encoding="utf-8") as stream:
         train_config = yaml.safe_load(stream) or {}
+    distributed_config = dict(train_config.get("distributed", {}))
     policy = train_config.setdefault("supervision_policy", {})
     if args.no_pseudo_labels:
         policy["disable_weak_labels"] = True
@@ -537,6 +541,12 @@ def main(argv: list[str] | None = None) -> int:
     elif resume is None and hasattr(model, "initialize_pretrained"):
         pretrained_initialization = model.initialize_pretrained()
     device = distributed.device
+    architecture = model_config.get("architecture")
+    default_sync_batch_norm = architecture in {"unet_resnet34", "segnext_tiny"}
+    if distributed.distributed and distributed_config.get(
+        "sync_batch_norm", default_sync_batch_norm
+    ):
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.to(device)
     conditional_heads = freeze_for_refinement(model) if refinement is not None else None
     loader_config = dict(train_config.get("dataloader", {}))
@@ -716,7 +726,16 @@ def main(argv: list[str] | None = None) -> int:
         betas=tuple(optimizer_config.get("betas", (0.9, 0.999))),
     )
     raw_model = model
-    model = wrap_training_model(raw_model, distributed)
+    model = wrap_training_model(
+        raw_model,
+        distributed,
+        find_unused_parameters=bool(
+            distributed_config.get(
+                "find_unused_parameters",
+                architecture not in {"unet_resnet34", "tsvit_adapted", "segnext_tiny"},
+            )
+        ),
+    )
     scheduler_config = dict(train_config.get("scheduler", {}))
     steps_per_epoch = math.ceil(len(loader) / accumulation_steps)
     total_steps = max(1, epochs * steps_per_epoch)

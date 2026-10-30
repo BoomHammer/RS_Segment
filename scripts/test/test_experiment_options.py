@@ -12,7 +12,18 @@ from models.config import load_model_contract
 
 
 @pytest.mark.parametrize(
-    "model", [None, "segformer-utae", "utae", "segformer", "maestro", "anysat"]
+    "model",
+    [
+        None,
+        "segformer-utae",
+        "utae",
+        "segformer",
+        "maestro",
+        "anysat",
+        "tsvit",
+        "segnext",
+        "unet",
+    ],
 )
 @pytest.mark.parametrize("merge", [False, True])
 def test_retrain_routes_only_training_test_prediction(

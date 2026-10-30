@@ -295,6 +295,18 @@ class SegFormerUtae(nn.Module):
             from models.maestro import MaestroS
 
             return MaestroS(contract)
+        if contract.get("architecture") == "tsvit_adapted":
+            from models.tsvit import TSViTAdapted
+
+            return TSViTAdapted(contract)
+        if contract.get("architecture") == "segnext_tiny":
+            from models.segnext import SegNeXtTiny
+
+            return SegNeXtTiny(contract)
+        if contract.get("architecture") == "unet_resnet34":
+            from models.unet_resnet import UNetResNet34
+
+            return UNetResNet34(contract)
         if contract.get("architecture") in {
             "segformer_utae_dynamic_ablation",
             "segformer_utae_static_ablation",

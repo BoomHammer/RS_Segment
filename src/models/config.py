@@ -182,7 +182,13 @@ def load_model_contract(
         grid = _read_json(sample_index_path).get("target_grid", {})
         derived["target_grid"] = grid
         model["anysat"]["resolution_m"] = resolve_resolution(model["anysat"], grid)
-    if model.get("architecture") in {"maestro_s", "anysat"}:
+    if model.get("architecture") in {
+        "maestro_s",
+        "anysat",
+        "tsvit_adapted",
+        "segnext_tiny",
+        "unet_resnet34",
+    }:
         # Keep legacy contract ordering unchanged for old checkpoint resumes.
         # MAESTRO binds static tokenizers to actual dataset/index channel order.
         derived["static_features"] = list(

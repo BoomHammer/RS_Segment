@@ -9,6 +9,9 @@ model:
   # - segformer_utae_static_ablation: replace the static branch with pretrained MiT.
   # - maestro_s: MAESTRO-S multimodal model.
   # - anysat: AnySat-based multimodal model.
+  # - tsvit_adapted: temporal-then-spatial TSViT baseline for E06.
+  # - segnext_tiny: MSCAN-T + LightHamHead spatial baseline for E07.
+  # - unet_resnet34: ResNet-34 U-Net spatial baseline for E05.
   architecture: lightweight_dual_branch
   backbone: mit_b1
   temporal:
@@ -41,6 +44,32 @@ model:
     pretrained_path: null
     # 自动按产品名绑定动态特征，静态特征作为独立模态。
     # 可配置 modalities: [{name, role, features}]，每个特征恰好覆盖一次。
+  tsvit:
+    # 320x320 含 halo 窗口对应 20x20 spatial tokens。
+    patch_size: 16
+    # 对齐官方 TSViT-S 的嵌入宽度与深度，使用项目层级输出头。
+    dim: 64
+    heads: 4
+    temporal_depth: 4
+    spatial_depth: 4
+    mlp_ratio: 4
+    # B=1、400 locations、46 frames、70 class tokens：46,400 / 28,000。
+    max_temporal_tokens: 65536
+    max_spatial_tokens: 32768
+    gradient_checkpointing: true
+  segnext:
+    # 官方 MSCAN-T: dims [32,64,160,256]、depths [3,3,5,2]、ratios [8,8,4,4]。
+    dropout: 0.0
+    drop_path: 0.1
+    decoder_channels: 256
+    decoder_dropout: 0.1
+    # 官方 LightHamHead Tiny 配置；固定初始基以保证滑窗推理可复现。
+    nmf_rank: 16
+    nmf_train_steps: 6
+    nmf_eval_steps: 7
+  unet:
+    decoder_channels: 64
+    dropout: 0.1
   regularization:
     # 解码器 dropout 概率。
     dropout: 0.2
