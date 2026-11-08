@@ -60,6 +60,8 @@ from evaluation import (
     evaluate_points as _evaluate,
 )
 from experiment_options import add_experiment_arguments, experiment_arguments
+from experiment_profiles import apply_model_profile, apply_training_profile
+from generated_weak_labels import GeneratedWeakLabelStore
 from head_refinement import (
     configure_refinement,
     diagnostic_report,
@@ -68,6 +70,7 @@ from head_refinement import (
     selection_summary,
     set_refinement_mode,
 )
+from losses.experiment import crgnet_loss, feature_region_labels, hssn_loss
 from losses.overlap import overlap_consistency_loss
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
@@ -103,6 +106,7 @@ def _initialize_weights(model, contract, path):
         "tsvit",
         "segnext",
         "unet",
+        "experiment",
     ):
         if previous.get(key) != contract.get(key):
             raise ValueError(f"Initialization architecture mismatch: {key}")
@@ -309,6 +313,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--grid-offset", type=int, nargs=2, default=(0, 0))
     add_experiment_arguments(parser)
     args = parser.parse_args(argv)
+    if args.experiment is not None and args.model is not None:
+        parser.error("--experiment E08-E15 已固定模型，不能同时指定 --model")
     if args.resume is not None and experiment_arguments(args):
         parser.error("续训自动恢复实验设置，不能覆盖实验参数")
     launch_result = auto_launch(
@@ -348,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("断点续训须保持原目标 epochs，以保留原学习率计划")
     with args.train_config.open(encoding="utf-8") as stream:
         train_config = yaml.safe_load(stream) or {}
+    if resume is None:
+        train_config = apply_training_profile(train_config, args.experiment)
     distributed_config = dict(train_config.get("distributed", {}))
     policy = train_config.setdefault("supervision_policy", {})
     if args.no_pseudo_labels:
@@ -531,6 +539,8 @@ def main(argv: list[str] | None = None) -> int:
     if not validation_indices:
         raise ValueError(f"空间划分中的 validation 集为空: {split_path}")
     model_config = load_model_contract(args.config, run, stage2, model_name=args.model)
+    if resume is None:
+        model_config = apply_model_profile(model_config, args.experiment)
     model = SegFormerUtae.from_contract(model_config)
     pretrained_initialization = None
     weight_initialization = None
@@ -782,7 +792,9 @@ def main(argv: list[str] | None = None) -> int:
     if policy.get("class_weighting") == "none":
         class_weights = None
     supervision = dict(model_config.get("supervision", {}))
-    if policy.get("disable_weak_labels", False):
+    if policy.get("disable_weak_labels", False) and not policy.get(
+        "generated_weak_labels", False
+    ):
         supervision["weak_label_weight"] = 0.0
     early_stopping = dict(training.get("early_stopping", {}))
     monitor = str(early_stopping.get("monitor", "val_loss"))
@@ -813,6 +825,15 @@ def main(argv: list[str] | None = None) -> int:
     if distributed.is_main:
         print(f"计算精度: {amp_name}，梯度缩放: {scaler.is_enabled()}")
     overlap = dict(train_config.get("overlap_consistency", {}))
+    region_growing = dict(train_config.get("region_growing", {}))
+    generated_label_store = None
+    experiment_id = policy.get("experiment")
+    if policy.get("persist_generated_weak_labels", False):
+        generated_label_store = GeneratedWeakLabelStore(
+            output,
+            rank=distributed.rank,
+            experiment=str(experiment_id),
+        )
     overlap_weight = float(overlap.get("weight", 0.0))
     overlap_interval = int(overlap.get("every_n_batches", 4))
     if overlap_weight < 0 or overlap_interval < 1:
@@ -839,6 +860,12 @@ def main(argv: list[str] | None = None) -> int:
         "metric_protocol": "owned_unique_points_mean_probability_v1",
         "checkpoint_monitor": monitor,
     }
+    if generated_label_store is not None:
+        train_log["generated_weak_labels"] = {
+            "path": "generated_weak_labels/latest",
+            "retention": "latest_epoch",
+            "format": "compressed_npz_per_batch",
+        }
     if resume is None and distributed.is_main:
         (output / "train.yaml").write_text(
             yaml.safe_dump(train_config, allow_unicode=True), encoding="utf-8"
@@ -1047,6 +1074,16 @@ def main(argv: list[str] | None = None) -> int:
                 else value
                 for key, value in batch.items()
             }
+            if region_growing.get("mode") == "feature":
+                labels, label_mask = feature_region_labels(
+                    tensor_batch,
+                    distance_threshold=float(
+                        region_growing.get("distance_threshold", 0.75)
+                    ),
+                    max_radius=int(region_growing.get("max_radius", 8)),
+                )
+                tensor_batch["weak_label"] = labels
+                tensor_batch["weak_label_mask"] = label_mask
             profiler.mark("transfer_s")
             with torch.autocast(
                 device_type=device.type,
@@ -1082,24 +1119,44 @@ def main(argv: list[str] | None = None) -> int:
                     or (tensor_batch["weak_label_mask"] & ~split_mask).any()
                 ):
                     raise AssertionError("实际训练监督越过了训练空间归属边界")
-                loss_components = combined_supervision_loss(
-                    prediction,
-                    tensor_batch,
-                    ground_truth_weight=float(
-                        supervision.get("ground_truth_weight", 1.0)
-                    ),
-                    weak_label_weight=float(supervision.get("weak_label_weight", 0.5)),
-                    focal_gamma=float(supervision.get("focal_gamma", 0.0)),
-                    fine_to_coarse=derived["fine_to_coarse"],
-                    level_parents=derived.get("level_parents"),
-                    level_weights=supervision.get("level_weights"),
-                    leaf_depths=derived.get("leaf_depths"),
-                    class_weights=class_weights,
-                    weight_normalization=str(
-                        supervision.get("weight_normalization", "weighted_mean")
-                    ),
-                    ignore_index=int(supervision.get("ignore_index", -1)),
-                )
+                if prediction.get("head_mode") == "crgnet":
+                    loss_components = crgnet_loss(
+                        prediction, tensor_batch, region_growing, epoch=epoch
+                    )
+                elif prediction.get("head_mode") == "hssn":
+                    loss_components = hssn_loss(
+                        prediction,
+                        tensor_batch,
+                        derived,
+                        gamma=float(supervision.get("focal_gamma", 2.0)),
+                        triplet_weight=float(
+                            supervision.get("tree_triplet_weight", 0.5)
+                        ),
+                    )
+                else:
+                    loss_components = combined_supervision_loss(
+                        prediction,
+                        tensor_batch,
+                        ground_truth_weight=float(
+                            supervision.get("ground_truth_weight", 1.0)
+                        ),
+                        weak_label_weight=float(
+                            supervision.get("weak_label_weight", 0.5)
+                        ),
+                        hierarchy_weight=float(
+                            supervision.get("hierarchy_weight", 0.2)
+                        ),
+                        focal_gamma=float(supervision.get("focal_gamma", 0.0)),
+                        fine_to_coarse=derived["fine_to_coarse"],
+                        level_parents=derived.get("level_parents"),
+                        level_weights=supervision.get("level_weights"),
+                        leaf_depths=derived.get("leaf_depths"),
+                        class_weights=class_weights,
+                        weight_normalization=str(
+                            supervision.get("weight_normalization", "weighted_mean")
+                        ),
+                        ignore_index=int(supervision.get("ignore_index", -1)),
+                    )
                 loss = loss_components["loss"]
             ground_truth_mask = (
                 tensor_batch["ground_truth_mask"] & tensor_batch["valid_mask"]
@@ -1180,6 +1237,12 @@ def main(argv: list[str] | None = None) -> int:
             loss_value = float(loss.detach())
             total += loss_value
             batches += 1
+            if generated_label_store is not None:
+                generated_label_store.write_batch(
+                    tensor_batch,
+                    epoch=epoch + 1,
+                    batch_index=batches,
+                )
             # Release the previous forward's outputs before fetching/transferring
             # another window. Backward has already consumed the saved tensors.
             del (
@@ -1206,6 +1269,8 @@ def main(argv: list[str] | None = None) -> int:
             batch_finished_at = perf_counter()
         if batches % accumulation_steps:
             optimizer_step()
+        if generated_label_store is not None:
+            generated_label_store.finish_epoch(epoch=epoch + 1, batches=batches)
         if distributed.distributed:
             totals = torch.tensor(
                 [

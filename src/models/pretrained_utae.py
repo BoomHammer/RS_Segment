@@ -10,9 +10,52 @@ from torch.utils.checkpoint import checkpoint
 from transformers import SegformerConfig, SegformerModel
 from transformers.models.segformer.modeling_segformer import SegformerDecodeHead
 
-from models.architecture import GatedScaleFusion, HierarchicalHeads
+from models.architecture import GatedScaleFusion
+from models.experiment_heads import build_experiment_heads
 from models.input_adapter import TemporalAttentionEncoder, sanitize_batch
 from models.utae.utae import UTAE
+
+
+class ConcatenationFusion(nn.Module):
+    """E12: concatenate aligned branches and reduce with a single 1x1 conv."""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.projection = nn.Conv2d(2 * channels, channels, 1)
+
+    def forward(self, spatial, temporal):
+        return self.projection(torch.cat((spatial, temporal), dim=1))
+
+
+class ConvolutionalStaticEncoder(nn.Module):
+    """E13 four-scale convolutional encoder with MiT-compatible widths."""
+
+    def __init__(self, input_channels):
+        super().__init__()
+        stages = []
+        source = input_channels
+        for index, target in enumerate([64, 128, 320, 512]):
+            stride = 4 if index == 0 else 2
+            stages.append(
+                nn.Sequential(
+                    nn.Conv2d(source, target, 3, stride=stride, padding=1),
+                    nn.GroupNorm(min(8, target), target),
+                    nn.GELU(),
+                    nn.Conv2d(target, target, 3, padding=1),
+                    nn.GroupNorm(min(8, target), target),
+                    nn.GELU(),
+                )
+            )
+            source = target
+        self.stages = nn.ModuleList(stages)
+
+    def forward(self, inputs):
+        output = inputs
+        features = []
+        for stage in self.stages:
+            output = stage(output)
+            features.append(output)
+        return features
 
 
 class MaskedUTAE(UTAE):
@@ -140,29 +183,36 @@ class PretrainedSegFormerUTAE(nn.Module):
         super().__init__()
         self.contract = contract
         derived = contract["derived"]
+        experiment = dict(contract.get("experiment", {}))
         settings = contract.get("pretrained", {})
         self.freeze_stages = int(settings.get("freeze_stages", 2))
         if not 0 <= self.freeze_stages <= 4:
             raise ValueError("freeze_stages 必须位于 [0, 4]")
-        self.static_stem = nn.Conv2d(2 * derived["static_features_count"], 3, 1)
-        self.static_encoder = SegformerModel(
-            SegformerConfig(
-                depths=[2, 2, 2, 2],
-                hidden_sizes=[64, 128, 320, 512],
-                num_attention_heads=[1, 2, 5, 8],
-                sr_ratios=[8, 4, 2, 1],
-                drop_path_rate=float(
-                    contract.get("regularization", {}).get("drop_path", 0.1)
-                ),
+        self.convolutional_static = experiment.get("static_encoder") == "convolutional"
+        static_input_channels = 2 * derived["static_features_count"]
+        if self.convolutional_static:
+            self.static_stem = nn.Identity()
+            self.static_encoder = ConvolutionalStaticEncoder(static_input_channels)
+        else:
+            self.static_stem = nn.Conv2d(static_input_channels, 3, 1)
+            self.static_encoder = SegformerModel(
+                SegformerConfig(
+                    depths=[2, 2, 2, 2],
+                    hidden_sizes=[64, 128, 320, 512],
+                    num_attention_heads=[1, 2, 5, 8],
+                    sr_ratios=[8, 4, 2, 1],
+                    drop_path_rate=float(
+                        contract.get("regularization", {}).get("drop_path", 0.1)
+                    ),
+                )
             )
-        )
-        for group in (
-            self.static_encoder.encoder.patch_embeddings,
-            self.static_encoder.encoder.block,
-            self.static_encoder.encoder.layer_norm,
-        ):
-            for stage in list(group)[: self.freeze_stages]:
-                stage.requires_grad_(False)
+            for group in (
+                self.static_encoder.encoder.patch_embeddings,
+                self.static_encoder.encoder.block,
+                self.static_encoder.encoder.layer_norm,
+            ):
+                for stage in list(group)[: self.freeze_stages]:
+                    stage.requires_grad_(False)
         self.dynamic_encoder = MaskedUTAE(
             2 * derived["dynamic_features_count"],
             chunk_size=int(contract.get("temporal", {}).get("frame_chunk_size", 2)),
@@ -175,7 +225,12 @@ class PretrainedSegFormerUTAE(nn.Module):
             nn.Conv2d(source, target, 1)
             for source, target in zip([64, 128, 320, 512], widths, strict=True)
         )
-        self.fusions = nn.ModuleList(GatedScaleFusion(width) for width in widths)
+        fusion_factory = (
+            ConcatenationFusion
+            if experiment.get("fusion") == "concat"
+            else GatedScaleFusion
+        )
+        self.fusions = nn.ModuleList(fusion_factory(width) for width in widths)
         decoder_width = int(contract.get("fusion", {}).get("output_channels", 64))
         self.decoder = SegformerDecodeHead(
             SegformerConfig(
@@ -209,9 +264,11 @@ class PretrainedSegFormerUTAE(nn.Module):
                 nn.Conv2d(decoder_width * 2, decoder_width, kernel_size=1),
                 nn.GELU(),
             )
-        self.heads = HierarchicalHeads.from_derived(decoder_width, derived)
+        self.heads = build_experiment_heads(decoder_width, derived, experiment)
 
     def initialize_pretrained(self):
+        if self.convolutional_static:
+            return None
         if not self.contract.get("pretrained", {}).get("path"):
             if self.freeze_stages:
                 raise ValueError("随机初始化不能冻结 MiT 阶段；设置 freeze_stages: 0")
@@ -246,8 +303,9 @@ class PretrainedSegFormerUTAE(nn.Module):
     def train(self, mode=True):
         super().train(mode)
         # Keep stochastic depth disabled in frozen pretrained stages.
-        for stage in list(self.static_encoder.encoder.block)[: self.freeze_stages]:
-            stage.eval()
+        if not self.convolutional_static:
+            for stage in list(self.static_encoder.encoder.block)[: self.freeze_stages]:
+                stage.eval()
         return self
 
     def forward(self, batch):
@@ -292,6 +350,8 @@ class PretrainedSegFormerUTAE(nn.Module):
         stem = self.static_stem(static)
 
         def spatial(value):
+            if self.convolutional_static:
+                return tuple(self.static_encoder(value))
             return tuple(
                 self.static_encoder(value, output_hidden_states=True).hidden_states
             )

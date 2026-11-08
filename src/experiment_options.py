@@ -12,9 +12,17 @@ MODEL_CHOICES = {
     "lightweight": "lightweight_dual_branch",
 }
 
+EXPERIMENT_CHOICES = tuple(f"E{number:02d}" for number in range(8, 16))
+
 
 def add_experiment_arguments(parser):
     parser.add_argument("--model", choices=MODEL_CHOICES, default=None)
+    parser.add_argument(
+        "--experiment",
+        choices=EXPERIMENT_CHOICES,
+        default=None,
+        help="运行 E08-E15 的固定实验变体（自动使用 SegFormer+U-TAE）",
+    )
     parser.add_argument(
         "--no-pseudo-labels", action="store_true", help="仅使用真实标签监督"
     )
@@ -29,6 +37,8 @@ def experiment_arguments(args):
     result = []
     if args.model is not None:
         result.extend(["--model", args.model])
+    if args.experiment is not None:
+        result.extend(["--experiment", args.experiment])
     for name in ("no_pseudo_labels", "train_on_test"):
         if getattr(args, name):
             result.append("--" + name.replace("_", "-"))

@@ -54,6 +54,31 @@ def combined_supervision_loss(
     """Use ground truth and weak labels as two masked supervision sources."""
 
     if isinstance(logits, dict):
+        if logits.get("head_mode") == "flat":
+            ground_truth_loss = masked_cross_entropy(
+                logits["fine_logits"],
+                batch["ground_truth"].long(),
+                batch["ground_truth_mask"] & batch["valid_mask"],
+                ignore_index=ignore_index,
+                focal_gamma=focal_gamma,
+                class_weights=class_weights,
+                weight_normalization=weight_normalization,
+            )
+            weak_label_loss = masked_cross_entropy(
+                logits["fine_logits"],
+                batch["weak_label"].long(),
+                batch["weak_label_mask"] & batch["valid_mask"],
+                ignore_index=ignore_index,
+                focal_gamma=focal_gamma,
+                class_weights=class_weights,
+                weight_normalization=weight_normalization,
+            )
+            return {
+                "loss": ground_truth_weight * ground_truth_loss
+                + weak_label_weight * weak_label_loss,
+                "ground_truth_loss": ground_truth_loss,
+                "weak_label_loss": weak_label_loss,
+            }
         if fine_to_coarse is None and "level_0_logits" not in logits:
             raise ValueError("层级输出需要 fine_to_coarse 映射")
         return hierarchical_supervision_loss(
