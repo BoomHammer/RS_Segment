@@ -65,6 +65,9 @@ uv run rs-pipeline --retrain data/processed/20261021_153250 --experiment E08
 # E09：CRGNet adapted，预测区域生长＋双分类头一致性
 uv run rs-pipeline --retrain data/processed/20261021_153250 --experiment E09
 
+# E09.1：E01 骨干＋SAM 伪标签＋双四级分类头、区域损失和一致性
+uv run rs-pipeline --retrain data/processed/20261021_153250 --experiment E09.1
+
 # E10：平坦叶类分类头
 uv run rs-pipeline --retrain data/processed/20261021_153250 --experiment E10
 
@@ -126,6 +129,29 @@ E08 若获准开展，只能从训练划分的点生成新伪标签，并另存�
 不向 E01–E04 回填。验证和测试点不得参与生成。
 E09 保留 CRGNet 的共享骨干双分类头、高置信 8 邻域生长、扩展标签 Lovász-Softmax、双头一致性和
 后期自训练；不移植面向 VHR RGB 边界细化的 dCRF，因为本任务是 250m 多源时序输入，需另立后处理协议。
+
+### E09.1：SAM 监督的双四级分类头（新增，未正式训练）
+
+复用 E01 的数据版本、SAM 栅格、骨干、融合、解码器和四级条件分类结构；
+分类头复制为基础头与扩展头，推理使用两头概率平均。单独保存实验产物，
+不续训或覆盖 E01/E09，不修改现有伪标签，不改变层级/类别权重和验证选模规则。
+
+- 两个头均使用 E01 原层级损失学习真实样点，取两头真实监督损失均值。
+- 仅扩展头学习 SAM：保留原层级弱监督，再增加终止叶类 Lovasz-Softmax。
+- 真实标签权重沿用 `1.0`；SAM 层级损失与 Lovasz 之和沿用 `0.5`。
+- 双头概率平方差权重为 `1.0`；保留原重叠窗口一致性（默认 `0.1`）。
+- SAM 监督和双头一致性仅作用于有效、核心、训练归属像元。SAM 不覆盖
+  当前批次的真实样点、部分标签或混合观察位置；未知层级不补造标签。
+- 不执行预测区域生长或后期自训练，唯一伪标签来源仍为已有 SAM 栅格。
+- 空监督返回可反传的零损失；非有限总损失立即报错，避免静默记录 NaN。
+
+总目标为 `L = w_gt*(L_gt_base+L_gt_expanded)/2
++ w_sam*(L_sam_hierarchy+L_sam_lovasz)
++ w_hierarchy*(L_hierarchy_base+L_hierarchy_expanded)/2
++ L_dual_consistency + w_overlap*L_overlap`。
+其中层级/Focal/类别权重、部分标签和混合像元处理复用 E01 实现。
+继续使用流式读取、AMP、梯度累积与 halo；新增的仅是分类头及损失计算，
+不增加一次骨干前向。显存峰值仍需在正式机器上核实。
 
 ## 第三组：层级分类与融合消融
 

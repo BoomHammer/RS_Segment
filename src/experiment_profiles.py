@@ -36,6 +36,15 @@ def apply_training_profile(config: dict, experiment: str | None) -> dict:
             "self_training_threshold": 0.95,
             "self_training_weight": 0.5,
         }
+    elif experiment == "E09.1":
+        policy["disable_weak_labels"] = False
+        policy["generated_weak_labels"] = False
+        policy["persist_generated_weak_labels"] = False
+        result.pop("region_growing", None)
+        result["sam_dual_head"] = {
+            "consistency_weight": 1.0,
+            "lovasz_weight": 1.0,
+        }
     elif experiment == "E14":
         result.setdefault("overlap_consistency", {})["weight"] = 0.0
     return result
@@ -54,6 +63,8 @@ def apply_model_profile(contract: dict, experiment: str | None) -> dict:
     settings["id"] = experiment
     if experiment == "E09":
         settings["classification_head"] = "crgnet"
+    elif experiment == "E09.1":
+        settings["classification_head"] = "sam_crgnet"
     elif experiment == "E10":
         settings["classification_head"] = "flat"
     elif experiment == "E11":

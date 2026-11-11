@@ -72,6 +72,7 @@ from head_refinement import (
 )
 from losses.experiment import crgnet_loss, feature_region_labels, hssn_loss
 from losses.overlap import overlap_consistency_loss
+from losses.sam_dual_head import sam_dual_head_loss
 from losses.supervision import combined_supervision_loss
 from models.architecture import SegFormerUtae
 from models.config import load_model_contract
@@ -314,7 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     add_experiment_arguments(parser)
     args = parser.parse_args(argv)
     if args.experiment is not None and args.model is not None:
-        parser.error("--experiment E08-E15 已固定模型，不能同时指定 --model")
+        parser.error("--experiment 已固定模型，不能同时指定 --model")
     if args.resume is not None and experiment_arguments(args):
         parser.error("续训自动恢复实验设置，不能覆盖实验参数")
     launch_result = auto_launch(
@@ -1122,6 +1123,15 @@ def main(argv: list[str] | None = None) -> int:
                 if prediction.get("head_mode") == "crgnet":
                     loss_components = crgnet_loss(
                         prediction, tensor_batch, region_growing, epoch=epoch
+                    )
+                elif prediction.get("head_mode") == "sam_crgnet":
+                    loss_components = sam_dual_head_loss(
+                        prediction,
+                        tensor_batch,
+                        derived,
+                        supervision,
+                        train_config.get("sam_dual_head", {}),
+                        class_weights=class_weights,
                     )
                 elif prediction.get("head_mode") == "hssn":
                     loss_components = hssn_loss(

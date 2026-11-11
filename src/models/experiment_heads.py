@@ -101,6 +101,15 @@ class CRGNetHeads(nn.Module):
         return output
 
 
+class SAMDualHeads(CRGNetHeads):
+    """E09.1: two conditional hierarchies with the same averaged inference API."""
+
+    def forward(self, features):
+        output = super().forward(features)
+        output["head_mode"] = "sam_crgnet"
+        return output
+
+
 class HSSNHeads(nn.Module):
     """All-node multilabel scores and projection head following HSSN."""
 
@@ -155,6 +164,8 @@ def build_experiment_heads(channels, derived, settings):
         return IndependentLevelHeads(channels, derived)
     if mode == "crgnet":
         return CRGNetHeads(channels, derived)
+    if mode == "sam_crgnet":
+        return SAMDualHeads(channels, derived)
     if mode == "hssn":
         return HSSNHeads(
             channels,

@@ -64,7 +64,9 @@ def test_profiles_are_isolated_and_disable_dataset_weak_labels(experiment):
     assert "experiment" not in model
 
 
-@pytest.mark.parametrize("mode", ["flat", "independent", "crgnet", "hssn"])
+@pytest.mark.parametrize(
+    "mode", ["flat", "independent", "crgnet", "sam_crgnet", "hssn"]
+)
 def test_experiment_heads_have_normalized_leaf_output_and_gradients(mode):
     head = build_experiment_heads(8, DERIVED, {"classification_head": mode})
     features = torch.randn(2, 8, 7, 7, requires_grad=True)
@@ -151,7 +153,9 @@ def test_hssn_tree_min_and_projection_receive_gradients():
     assert head.projection[0].weight.grad is not None
 
 
-@pytest.mark.parametrize("experiment", ["E09", "E10", "E11", "E12", "E13", "E15"])
+@pytest.mark.parametrize(
+    "experiment", ["E09", "E09.1", "E10", "E11", "E12", "E13", "E15"]
+)
 def test_profiles_build_the_real_hybrid_variant(experiment):
     contract = apply_model_profile(
         {

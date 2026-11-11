@@ -93,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
     add_experiment_arguments(parser)
     args = parser.parse_args(argv)
     if args.experiment is not None and args.model is not None:
-        parser.error("--experiment E08-E15 已固定模型，不能同时指定 --model")
+        parser.error("--experiment 已固定模型，不能同时指定 --model")
     if experiment_arguments(args) and args.retrain is None:
         parser.error("实验参数仅用于 --retrain；续训自动恢复实验设置")
     if args.resume is not None and args.retrain is not None:
